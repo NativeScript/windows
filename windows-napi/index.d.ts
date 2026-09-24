@@ -98,12 +98,12 @@ export declare function nsUuid(): string
 /**
  * Create and show a plain Win32 top-level window; returns its `HWND` as an opaque handle.
  * `pumpMessages`/`enableAutoPump` (already used for WinRT async completions) pump its message
- * queue for free — they peek messages for the whole calling thread, not a specific window.
+ * queue for free. They peek messages for the whole calling thread, not a specific window.
  */
 export declare function createWindow(title: string, width: number, height: number): unknown
 /**
  * Attach a `Windows.UI.Composition.Compositor` instance to a window from `createWindow` and
- * return the resulting `DesktopWindowTarget` as a normal WinRT proxy — set its `.Root` to a
+ * return the resulting `DesktopWindowTarget` as a normal WinRT proxy. Set its `.Root` to a
  * visual to render into the window.
  */
 export declare function attachCompositorToWindow(compositor: unknown, hwnd: unknown): object
