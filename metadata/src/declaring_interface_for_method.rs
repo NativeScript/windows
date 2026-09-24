@@ -475,6 +475,20 @@ impl Metadata {
                     )
                 };
                 let method_signature = unsafe { PCCOR_SIGNATURE(method_sig_ptr.offset(1)) };
+                // Param count, decoded straight from the signature blob (the compressed integer
+                // right after the calling-convention byte skipped above). Used below so the
+                // name-only fallback can't cross-match a same-named overload with a different
+                // arity from a sibling statics interface (e.g. `Launcher.LaunchUriAsync` exists
+                // on `ILauncherStatics`/`2`/`3` with 1/2/3 args; a name-only match with no arity
+                // guard non-deterministically picks whichever one metadata enumerates first,
+                // computing that overload's vtable slot on the WRONG interface. A clean IID
+                // mismatch on our side, but the callee has no way to know that, so it reads
+                // whatever garbage argument landed where a real parameter should be: an
+                // access-violation inside the WinRT DLL, not a catchable JS error).
+                let target_param_count = unsafe {
+                    let mut p = method_signature;
+                    cor_sig_uncompress_data(&mut p)
+                };
                 let class_token =
                     Metadata::get_method_containing_class_token(metadata, method_token);
                 debug_assert!(
@@ -540,10 +554,17 @@ impl Metadata {
                         };
                         debug_assert!(result.is_ok());
 
+                        let candidate_param_count = unsafe {
+                            let mut p = PCCOR_SIGNATURE(static_signature.offset(1));
+                            cor_sig_uncompress_data(&mut p)
+                        };
+
                         if static_signature_size != method_sig_size {
                             // Signature sizes differ; fall back to name-based
-                            // matching (if available).
-                            if !target_method_name.is_empty() {
+                            // matching (if available). Arity must still match. A same-named
+                            // overload on a sibling statics interface (see comment above
+                            // `target_param_count`) is a false positive here, not a fallback hit.
+                            if !target_method_name.is_empty() && candidate_param_count == target_param_count {
                                 let mut name_length = 0_u32;
                                 let mut name_buf = [0_u16; MAX_IDENTIFIER_LENGTH];
                                 let _ = unsafe {
@@ -590,8 +611,9 @@ impl Metadata {
 
                         if a != b {
                             // Signature bytes didn't match; attempt a name-based
-                            // fallback in case metadata signature encodings differ.
-                            if !target_method_name.is_empty() {
+                            // fallback in case metadata signature encodings differ. Arity must
+                            // still match (see comment above `target_param_count`).
+                            if !target_method_name.is_empty() && candidate_param_count == target_param_count {
                                 let mut name_length = 0_u32;
                                 let mut name_buf = [0_u16; MAX_IDENTIFIER_LENGTH];
                                 let _ = unsafe {

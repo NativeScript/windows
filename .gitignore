@@ -1,6 +1,7 @@
 # Rust build artifacts (root + nested workspace/package crates)
 /target
 target/
+/target-prof
 /**/*.rs.bk
 /Cargo.lock
 

@@ -4,6 +4,7 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod class_helpers;
+pub mod esm_http;
 pub(crate) mod dotnet;
 mod error;
 mod ffi;
@@ -32,6 +33,8 @@ mod value;
 pub(crate) mod win32;
 pub(crate) mod win32_fast;
 pub(crate) mod win32_known_fns;
+mod websocket;
+mod winhttp;
 mod worker_support;
 mod worker_threads;
 
@@ -397,18 +400,36 @@ pub(crate) fn com_identity(unk: &IUnknown) -> Option<usize> {
 #[inline]
 pub(crate) fn maybe_request_gc_nudge(cache_size: usize, isolate: &mut v8::Isolate) {
     GC_NUDGE_NEXT_AT.with(|next| {
-        if cache_size >= next.get() {
-            isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
-            next.set(
-                cache_size
-                    .saturating_mul(2)
-                    .max(INSTANCE_CACHE_GC_THRESHOLD),
-            );
+        let at = next.get();
+        if cache_size >= at {
+            // Each nudge is a full collection. Under churn the cache refills to the threshold
+            // every few milliseconds (and the shrink branch below re-arms it), so an unthrottled
+            // nudge ran a full GC per few hundred wraps. Short-lived wrappers die in ordinary
+            // scavenges anyway; the nudge only backstops COM memory V8 can't see, so a time
+            // bound is enough: with a high-water override that keeps growth bounded.
+            let now = std::time::Instant::now();
+            let due = GC_NUDGE_LAST.with(|last| {
+                last.get()
+                    .map_or(true, |t| now.duration_since(t) >= GC_NUDGE_MIN_INTERVAL)
+            });
+            if due || cache_size >= at.saturating_mul(8) {
+                isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
+                GC_NUDGE_LAST.with(|last| last.set(Some(now)));
+                next.set(
+                    cache_size
+                        .saturating_mul(2)
+                        .max(INSTANCE_CACHE_GC_THRESHOLD),
+                );
+            }
         } else if cache_size < INSTANCE_CACHE_GC_THRESHOLD {
             next.set(INSTANCE_CACHE_GC_THRESHOLD);
         }
     });
 }
+
+const GC_NUDGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+thread_local!(static GC_NUDGE_LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
 
 pub(crate) fn proxy_manifests() -> &'static Mutex<Vec<String>> {
     PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -1213,6 +1234,11 @@ pub fn set_log_dir(dir: String) {
     let _ = LOG_DIR.set(dir);
 }
 
+#[cfg(test)]
+pub(crate) fn log_dir_for_tests() -> Option<String> {
+    LOG_DIR.get().cloned()
+}
+
 /// Disk path for a chunk's V8 bytecode cache, keyed by filename + a hash of the source. A livesync
 /// edit changes the source → different hash → cache miss → recompile (never stale bytecode). Lives
 /// under the app's writable local folder (LOG_DIR). Returns None before that folder is known.
@@ -1357,11 +1383,115 @@ fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
     candidate
 }
 
-/// Resolve a module specifier to an absolute path given the referrer's absolute path.
-/// Only handles relative (`./`, `../`) and absolute specifiers — bare specifiers are
-/// treated as already-absolute paths (webpack bundles only emit relative imports).
+fn js_path_exists(p: &Path) -> bool {
+    p.exists() || crate::source_protect::contains(&p.to_string_lossy())
+}
+
+/// Find the entry module a host asked to run. Hosts pass either an absolute path or just a
+/// file name ("bundle.mjs"); a bare name is looked up in the app directories the templates use
+/// (`<app_root>/app`, `<app_root>/../app`, …) rather than the process working directory.
+fn locate_entry_module(filename: &str, app_root: &str) -> PathBuf {
+    let p = normalize_js_path(filename);
+    if p.is_absolute() {
+        return try_resolve_with_known_extensions(p);
+    }
+    let root = PathBuf::from(app_root);
+    let parent = root.parent().map(Path::to_path_buf);
+    let bases = [
+        Some(root.join("app")),
+        Some(root.join("App")),
+        parent.as_ref().map(|d| d.join("app")),
+        parent.as_ref().map(|d| d.join("App")),
+        Some(root.clone()),
+        std::env::current_dir().ok(),
+    ];
+    for base in bases.into_iter().flatten() {
+        let candidate = try_resolve_with_known_extensions(base.join(&p));
+        if js_path_exists(&candidate) {
+            return candidate;
+        }
+    }
+    try_resolve_with_known_extensions(p)
+}
+
+thread_local! {
+    // Directory of the entry module: what `~/…` and root-absolute (`/…`) specifiers resolve
+    // against, matching the iOS/Android runtimes' app-root mapping.
+    static ESM_APP_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+fn esm_app_dir() -> Option<PathBuf> {
+    ESM_APP_DIR.with(|d| d.borrow().clone())
+}
+
+thread_local! {
+    // Canonical HTTP registry key → the URL it was last requested as (the fetch keeps the query the
+    // canonical key may drop).
+    static ESM_HTTP_URLS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    // Registry key → why loading it failed, so the resolve callback can report the real cause.
+    static ESM_LOAD_ERRORS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+const NS_MODULE_BUILTIN: &str = "ns:module";
+
+/// Resolve a module specifier to its registry key: `ns:module` for the builtin, a canonical URL
+/// for modules served over HTTP(S), otherwise an absolute file path.
+///
+/// Order follows the iOS/Android runtimes: builtins, then the `configureLoader` import map, then
+/// absolute URLs, then relative/root-absolute specifiers from an HTTP referrer (resolved as URLs,
+/// the way a browser does), then files.
 fn resolve_esm_path(specifier: &str, referrer_path: Option<&str>) -> String {
-    let candidate = if specifier.starts_with("./") || specifier.starts_with("../") {
+    if specifier == NS_MODULE_BUILTIN {
+        return specifier.to_string();
+    }
+    let mut spec = crate::esm_http::repair_collapsed_scheme(specifier);
+    if let Some(mapped) = crate::esm_http::lookup_import_map(&spec, referrer_path.unwrap_or("")) {
+        spec = mapped;
+        if spec == NS_MODULE_BUILTIN {
+            return spec;
+        }
+    }
+    let referrer_is_http = referrer_path.is_some_and(crate::esm_http::is_http);
+    let url = if crate::esm_http::is_http(&spec) {
+        Some(spec.clone())
+    } else if referrer_is_http && (spec.starts_with('.') || spec.starts_with('/')) {
+        url::Url::parse(referrer_path.unwrap_or(""))
+            .ok()
+            .and_then(|base| base.join(&spec).ok())
+            .map(|u| u.to_string())
+    } else {
+        None
+    };
+    if let Some(url) = url {
+        let key = crate::esm_http::canonicalize_http_url_key(&url);
+        ESM_HTTP_URLS.with(|m| m.borrow_mut().insert(key.clone(), url));
+        return key;
+    }
+    resolve_file_specifier(&spec, referrer_path.filter(|r| !crate::esm_http::is_http(r)))
+}
+
+/// File resolution: relative (`./`, `../`), `file://`, app-rooted (`~/`, `/`) and absolute
+/// specifiers. Query strings and fragments are dropped (bundlers use them as cache busters). Bare
+/// specifiers resolve against the app directory. Bundled output only emits relative imports,
+/// so a bare one is either an app-root path or unresolvable either way.
+fn resolve_file_specifier(specifier: &str, referrer_path: Option<&str>) -> String {
+    let specifier = if specifier.starts_with("file:") || !specifier.contains("://") {
+        specifier.split(['?', '#']).next().unwrap_or(specifier)
+    } else {
+        specifier
+    };
+    let app_rooted = specifier
+        .strip_prefix("~/")
+        .or_else(|| specifier.strip_prefix('/').filter(|s| !s.starts_with('/')));
+    let is_bare = !specifier.starts_with('.')
+        && !specifier.contains(':')
+        && !specifier.starts_with('/')
+        && !specifier.starts_with('\\');
+    let candidate = if let Some(rest) = app_rooted.filter(|_| esm_app_dir().is_some()) {
+        esm_app_dir().unwrap_or_default().join(rest)
+    } else if is_bare && esm_app_dir().is_some() {
+        esm_app_dir().unwrap_or_default().join(specifier)
+    } else if specifier.starts_with("./") || specifier.starts_with("../") {
         let parent = referrer_path
             .map(normalize_js_path)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -1402,36 +1532,393 @@ fn resolve_module_callback<'s>(
     let referrer_path = ESM_HASH_TO_PATH.with(|m| m.borrow().get(&referrer_hash).cloned());
     let resolved = resolve_esm_path(&spec, referrer_path.as_deref());
 
-    ESM_MODULE_REGISTRY.with(|registry| {
+    let found = ESM_MODULE_REGISTRY.with(|registry| {
         let registry = registry.borrow();
         registry
             .get(&resolved)
             .map(|global| v8::Local::new(scope, global))
-    })
+    });
+    if found.is_none() {
+        // V8 requires a pending exception when resolution fails; returning empty without one
+        // is a fatal CHECK in instantiate_module.
+        let msg = module_not_found_message(&spec, referrer_path.as_deref(), &resolved);
+        if let Some(s) = v8::String::new(scope, &msg) {
+            let err = v8::Exception::error(scope, s);
+            scope.throw_exception(err);
+        }
+    }
+    found
+}
+
+fn module_not_found_message(spec: &str, referrer: Option<&str>, resolved: &str) -> String {
+    let from = referrer.map(|r| format!(" imported from {r}")).unwrap_or_default();
+    match ESM_LOAD_ERRORS.with(|m| m.borrow().get(resolved).cloned()) {
+        Some(reason) => format!("{reason}{from}"),
+        None => format!("Cannot find module '{spec}'{from} (resolved to {resolved})"),
+    }
+}
+
+/// `import.meta` for modules loaded through `compile_module_graph`: `url` (a `file:///` URL, as
+/// the iOS/Android runtimes and bundlers' `new URL(x, import.meta.url)` expect), `filename` and
+/// `dirname`.
+unsafe extern "C" fn esm_import_meta(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    let hash = module.get_identity_hash().get();
+    let Some(path) = ESM_HASH_TO_PATH.with(|m| m.borrow().get(&hash).cloned()) else {
+        return;
+    };
+    if crate::esm_http::is_http(&path) || path == NS_MODULE_BUILTIN {
+        // A served module's identity is its URL; it has no file name or directory.
+        if let (Some(k), Some(v)) = (v8::String::new(scope, "url"), v8::String::new(scope, &path)) {
+            let _ = meta.create_data_property(scope, k.into(), v.into());
+        }
+        return;
+    }
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path).to_string();
+    let url = format!("file:///{}", path.replace('\\', "/"));
+    let dirname = Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for (k, v) in [("url", url.as_str()), ("filename", path.as_str()), ("dirname", dirname.as_str())] {
+        if let (Some(k), Some(v)) = (v8::String::new(scope, k), v8::String::new(scope, v)) {
+            let _ = meta.create_data_property(scope, k.into(), v.into());
+        }
+    }
+}
+
+/// Message + stack for a thrown/rejected JS value (the `stack` property when it's an Error).
+fn js_exception_report(scope: &mut v8::PinScope<'_, '_>, exc: v8::Local<v8::Value>) -> String {
+    if exc.is_object() {
+        if let (Some(obj), Some(key)) = (exc.to_object(scope), v8::String::new(scope, "stack")) {
+            if let Some(stack) = obj.get(scope, key.into()).filter(|s| s.is_string()) {
+                return stack.to_rust_string_lossy(scope);
+            }
+        }
+    }
+    exc.to_rust_string_lossy(scope)
+}
+
+fn report_module_error(scope: &mut v8::PinScope<'_, '_>, exc: v8::Local<v8::Value>) {
+    let report = js_exception_report(scope, exc);
+    debug_output(&format!("[NativeScript] Uncaught error evaluating module: {report}\n"));
+    crate::store_last_js_error(report);
+}
+
+/// With top-level await, `Module::evaluate` returns a promise and an exception thrown while the
+/// graph evaluates *rejects* it instead of throwing. Nothing reaches a TryCatch. Surface it: a
+/// settled rejection now, a pending (TLA) graph whenever it rejects.
+fn report_module_evaluation(scope: &mut v8::PinScope<'_, '_>, result: v8::Local<v8::Value>) {
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(result) else {
+        return;
+    };
+    match promise.state() {
+        v8::PromiseState::Rejected => {
+            let exc = promise.result(scope);
+            report_module_error(scope, exc);
+        }
+        v8::PromiseState::Pending => {
+            let on_reject = v8::Function::new(
+                scope,
+                |scope: &mut v8::PinScope<'_, '_>,
+                 args: v8::FunctionCallbackArguments,
+                 _rv: v8::ReturnValue| {
+                    report_module_error(scope, args.get(0));
+                },
+            );
+            if let Some(on_reject) = on_reject {
+                let _ = promise.catch(scope, on_reject);
+            }
+        }
+        v8::PromiseState::Fulfilled => {}
+    }
+}
+
+fn js_error_value<'s>(scope: &mut v8::PinScope<'s, '_>, msg: &str) -> v8::Local<'s, v8::Value> {
+    match v8::String::new(scope, msg) {
+        Some(s) => v8::Exception::error(scope, s),
+        None => v8::undefined(scope).into(),
+    }
+}
+
+/// Source of the `ns:module` builtin: the dev-loader control surface (`configureLoader`,
+/// `invalidateModules`, `getLoadedModuleUrls`, `createRequire`) the HELPER_SOURCE installs as
+/// `__nsModuleBuiltin`, re-exported for `import … from "ns:module"`.
+const NS_MODULE_SOURCE: &str = "const m = globalThis.__nsModuleBuiltin;\n\
+export default m;\n\
+export const configureLoader = m.configureLoader, invalidateModules = m.invalidateModules, \
+getLoadedModuleUrls = m.getLoadedModuleUrls, createRequire = m.createRequire;\n";
+
+/// Registry key for a URL handed in by JS (`invalidateModules`): canonical for HTTP, a path for
+/// `file://`, verbatim otherwise.
+fn registry_key_for(url: &str) -> String {
+    if crate::esm_http::is_http(url) || url.starts_with("file://http") || url.starts_with("http:/") || url.starts_with("https:/") {
+        return crate::esm_http::canonicalize_http_url_key(url);
+    }
+    if url.starts_with("file://") {
+        let p = normalize_js_path(url);
+        return p.canonicalize().unwrap_or(p).to_string_lossy().into_owned();
+    }
+    url.to_string()
+}
+
+/// Drop a module from the registry so the next import compiles (and, over HTTP, fetches) it anew.
+/// Importers already linked keep the old record. The HMR client re-imports the graph above it.
+fn evict_module_key(key: &str) -> bool {
+    let removed = ESM_MODULE_REGISTRY.with(|r| r.borrow_mut().remove(key)).is_some();
+    ESM_HASH_TO_PATH.with(|m| m.borrow_mut().retain(|_, v| v != key));
+    ESM_LOAD_ERRORS.with(|m| m.borrow_mut().remove(key));
+    removed
+}
+
+fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, msg: &str) {
+    if let Some(s) = v8::String::new(scope, msg) {
+        let err = v8::Exception::type_error(scope, s);
+        scope.throw_exception(err);
+    }
+}
+
+/// `ns:module` `configureLoader`: called by the JS wrapper with the config as a JSON string.
+pub(crate) fn handle_ns_module_configure_loader(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let json = args.get(0).to_rust_string_lossy(scope);
+    if let Err(e) = crate::esm_http::configure_loader(&json) {
+        throw_type_error(scope, &e);
+    }
+}
+
+/// `ns:module` `invalidateModules(urls)`: registry eviction plus a one-shot cache-bust nonce on
+/// each evicted URL's next fetch. Returns the number of registry entries removed.
+pub(crate) fn handle_ns_module_invalidate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(0)) else {
+        throw_type_error(scope, "invalidateModules expects an array of URL strings");
+        return;
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for i in 0..array.length() {
+        let Some(value) = array.get_index(scope, i) else {
+            return;
+        };
+        if !value.is_string() {
+            throw_type_error(scope, &format!("invalidateModules: urls[{i}] must be a string"));
+            return;
+        }
+        let key = registry_key_for(&value.to_rust_string_lossy(scope));
+        if !key.is_empty() && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    let removed = keys.iter().filter(|k| evict_module_key(k)).count();
+    let http_keys: Vec<String> = keys.into_iter().filter(|k| crate::esm_http::is_http(k)).collect();
+    crate::esm_http::mark_keys_for_cache_bust(&http_keys);
+    rv.set(v8::Integer::new(scope, removed as i32).into());
+}
+
+/// `ns:module` `getLoadedModuleUrls()`: the URL-keyed (served) modules currently registered.
+pub(crate) fn handle_ns_module_loaded_urls(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let mut urls: Vec<String> = ESM_MODULE_REGISTRY.with(|r| {
+        r.borrow().keys().filter(|k| k.contains("://")).cloned().collect()
+    });
+    urls.sort();
+    let array = v8::Array::new(scope, urls.len() as i32);
+    for (i, url) in urls.iter().enumerate() {
+        if let Some(s) = v8::String::new(scope, url) {
+            array.set_index(scope, i as u32, s.into());
+        }
+    }
+    rv.set(array.into());
+}
+
+fn http_fetch_url(key: &str) -> String {
+    ESM_HTTP_URLS.with(|m| m.borrow().get(key).cloned()).unwrap_or_else(|| key.to_string())
+}
+
+fn http_module_source(fetched: crate::esm_http::FetchedModule) -> String {
+    match fetched.kind {
+        crate::esm_http::ModuleKind::JavaScript => fetched.body,
+        crate::esm_http::ModuleKind::Json => crate::esm_http::json_module_source(&fetched.body),
+    }
+}
+
+fn record_load_error(key: &str, reason: String) {
+    debug_output(&format!("[NativeScript] ESM: {reason}\n"));
+    ESM_LOAD_ERRORS.with(|m| m.borrow_mut().insert(key.to_string(), reason));
+}
+
+/// Source text for a registry key: the builtin, an HTTP module (fetched now), or a file.
+fn read_module_source(key: &str) -> Option<String> {
+    if key == NS_MODULE_BUILTIN {
+        return Some(NS_MODULE_SOURCE.to_string());
+    }
+    if crate::esm_http::is_http(key) {
+        return match crate::esm_http::fetch_module(&http_fetch_url(key), key) {
+            Ok(fetched) => Some(http_module_source(fetched)),
+            Err(reason) => {
+                record_load_error(key, reason);
+                None
+            }
+        };
+    }
+    crate::source_protect::read_text(key).or_else(|| fs::read_to_string(key).ok())
+}
+
+/// Load, link and evaluate the module graph rooted at `resolved` (`source` when the caller
+/// already has the root's text). `Ok` carries the root module and `evaluate`'s result (a promise
+/// under TLA); `Err` the value to throw/reject with. The real exception (SyntaxError, link
+/// error, …), not a stringified summary. Globals, since the TryCatch scope is internal.
+type EsmEvaluated = (v8::Global<v8::Module>, v8::Global<v8::Value>);
+
+fn esm_load_and_evaluate(
+    scope: &mut v8::PinScope<'_, '_>,
+    spec: &str,
+    referrer: Option<&str>,
+    resolved: &str,
+    source: Option<&str>,
+) -> Result<EsmEvaluated, v8::Global<v8::Value>> {
+    v8::tc_scope!(tc, scope);
+    let fail = |tc: &mut v8::PinScope<'_, '_>, exc: Option<v8::Local<v8::Value>>, what: &str| {
+        let exc = exc.unwrap_or_else(|| js_error_value(tc, &format!("ESM: failed to {what} {resolved}")));
+        v8::Global::new(tc, exc)
+    };
+    let existing = ESM_MODULE_REGISTRY.with(|r| r.borrow().get(resolved).cloned());
+    let module = match existing {
+        Some(g) => v8::Local::new(tc, &g),
+        None => {
+            let owned = match source {
+                Some(s) => s.to_string(),
+                None => match read_module_source(resolved) {
+                    Some(s) => s,
+                    None => {
+                        let msg = module_not_found_message(spec, referrer, resolved);
+                        let exc = js_error_value(tc, &msg);
+                        return Err(v8::Global::new(tc, exc));
+                    }
+                },
+            };
+            compile_module_graph(tc, &owned, resolved);
+            if tc.has_caught() {
+                let exc = tc.exception();
+                return Err(fail(tc, exc, "compile"));
+            }
+            match ESM_MODULE_REGISTRY.with(|r| r.borrow().get(resolved).cloned()) {
+                Some(g) => v8::Local::new(tc, &g),
+                None => return Err(fail(tc, None, "compile")),
+            }
+        }
+    };
+    if module.instantiate_module(tc, resolve_module_callback).is_none() {
+        let exc = tc.exception();
+        return Err(fail(tc, exc, "link"));
+    }
+    match module.evaluate(tc) {
+        Some(result) => Ok((v8::Global::new(tc, module), v8::Global::new(tc, result))),
+        None => {
+            let exc = tc.exception();
+            Err(fail(tc, exc, "evaluate"))
+        }
+    }
+}
+
+thread_local! {
+    // Modules compiled without a usable code cache, awaiting `flush_module_code_caches`.
+    static PENDING_MODULE_CODE_CACHES: RefCell<Vec<(v8::Global<v8::Module>, PathBuf)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Write code caches for modules compiled this run. Called after the entry graph evaluates, so
+/// the cache also covers the functions startup compiled lazily, not just top-level code.
+fn flush_module_code_caches(scope: &mut v8::PinScope<'_, '_>) {
+    let pending = PENDING_MODULE_CODE_CACHES.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    for (module, path) in pending {
+        let module = v8::Local::new(scope, &module);
+        if module.get_status() == v8::ModuleStatus::Errored {
+            continue;
+        }
+        if let Some(cached) = module.get_unbound_module_script(scope).create_code_cache() {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&path, &**cached);
+        }
+    }
 }
 
 /// Walk and pre-compile the entire transitive module graph starting from `path`.
 /// Compiled modules are stored in `ESM_MODULE_REGISTRY` and `ESM_HASH_TO_PATH`.
 /// Must be called before `instantiate_module`.
-fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &str) {
+fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &str) -> bool {
     if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(path)) {
-        return;
+        return true;
     }
 
     let Some(source_str) = v8::String::new(scope, source) else {
-        return;
+        return false;
     };
     let Some(name_str) = v8::String::new(scope, path) else {
-        return;
+        return false;
     };
     let name_val: v8::Local<v8::Value> = name_str.into();
     let origin = v8::ScriptOrigin::new(
         scope, name_val, 0, 0, false, -1, None, false, false, true, None,
     );
-    let mut compiler_source = v8::script_compiler::Source::new(source_str, Some(&origin));
-    let Some(module) = v8::script_compiler::compile_module(scope, &mut compiler_source) else {
-        return;
+    // Bytecode-cache large modules (Vite's bundle.mjs / vendor.mjs), as run_script does for
+    // classic chunks. Keyed by content hash, so an edited module just misses and recompiles.
+    let cache_path = if source.len() >= 65536 && !crate::esm_http::is_http(path) {
+        code_cache_path(path, source)
+    } else {
+        None
     };
+    let cached_bytes = cache_path.as_ref().and_then(|p| fs::read(p).ok());
+    let (compiled, needs_cache) = match cached_bytes.as_ref() {
+        Some(bytes) => {
+            let cached = v8::script_compiler::CachedData::new(bytes);
+            let mut compiler_source =
+                v8::script_compiler::Source::new_with_cached_data(source_str, Some(&origin), cached);
+            let module = v8::script_compiler::compile_module2(
+                scope,
+                &mut compiler_source,
+                v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                v8::script_compiler::NoCacheReason::NoReason,
+            );
+            let rejected = compiler_source
+                .get_cached_data()
+                .map_or(true, |d| d.rejected());
+            (module, rejected)
+        }
+        None => {
+            let mut compiler_source = v8::script_compiler::Source::new(source_str, Some(&origin));
+            (
+                v8::script_compiler::compile_module(scope, &mut compiler_source),
+                cache_path.is_some(),
+            )
+        }
+    };
+    // A SyntaxError leaves an exception pending: stop the whole walk rather than compile more
+    // modules on top of it.
+    let Some(module) = compiled else {
+        return false;
+    };
+    if needs_cache {
+        if let Some(p) = cache_path {
+            let global = v8::Global::new(scope, module);
+            PENDING_MODULE_CODE_CACHES.with(|q| q.borrow_mut().push((global, p)));
+        }
+    }
 
     let identity_hash = module.get_identity_hash().get();
 
@@ -1450,23 +1937,49 @@ fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &s
     ESM_MODULE_REGISTRY.with(|r| r.borrow_mut().insert(path.to_string(), global));
     ESM_HASH_TO_PATH.with(|m| m.borrow_mut().insert(identity_hash, path.to_string()));
 
-    // Recurse into each dependency.
-    for spec in child_specifiers {
-        let child_path = resolve_esm_path(&spec, Some(path));
-        if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(&child_path)) {
-            continue;
-        }
-        if let Some(content) = crate::source_protect::read_text(&child_path) {
-            compile_module_graph(scope, &content, &child_path);
-            continue;
-        }
-        match fs::read_to_string(&child_path) {
-            Ok(content) => compile_module_graph(scope, &content, &child_path),
-            Err(e) => debug_output(&format!(
-                "[NativeScript] ESM: cannot read dependency {child_path}: {e}\n"
-            )),
+    // Resolve every dependency first so the ones served over HTTP can be fetched concurrently
+    // (a dev-server boot walks hundreds of modules), then compile them in import order.
+    let mut children: Vec<String> = Vec::with_capacity(child_specifiers.len());
+    for spec in &child_specifiers {
+        let key = resolve_esm_path(spec, Some(path));
+        let known = ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(&key));
+        if !known && !children.contains(&key) {
+            children.push(key);
         }
     }
+    let http_children: Vec<(String, String)> = children
+        .iter()
+        .filter(|k| crate::esm_http::is_http(k))
+        .map(|k| (http_fetch_url(k), k.clone()))
+        .collect();
+    let mut fetched: HashMap<String, Result<crate::esm_http::FetchedModule, String>> = http_children
+        .iter()
+        .map(|(_, k)| k.clone())
+        .zip(crate::esm_http::fetch_modules(&http_children))
+        .collect();
+
+    for key in children {
+        // A module compiled meanwhile (reached through a sibling's subtree) is done.
+        if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(&key)) {
+            continue;
+        }
+        // An unloadable child stays out of the registry; linking then throws a proper
+        // error from resolve_module_callback.
+        let content = match fetched.remove(&key) {
+            Some(Ok(module)) => Some(http_module_source(module)),
+            Some(Err(reason)) => {
+                record_load_error(&key, reason);
+                None
+            }
+            None => read_module_source(&key),
+        };
+        if let Some(content) = content {
+            if !compile_module_graph(scope, &content, &key) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn create_ns_object<'a>(
@@ -2265,6 +2778,8 @@ fn create_ns_ctor_instance_object<'a>(
                     }
 
                     if let Some(method) = find_class_method(clazz, &name) {
+
+                        crate::class_helpers::register_overload_siblings(clazz, &name, &method);
                         let declaration = Arc::new(RwLock::new(method.clone()));
                         let declaration = Box::into_raw(Box::new(
                             DeclarationFFI::new_with_instance(declaration, dec.instance.clone()),
@@ -2291,7 +2806,11 @@ fn create_ns_ctor_instance_object<'a>(
                                     return;
                                 };
                                 let mut method =
-                                    MethodCall::new(method, method.is_sealed(), ns_instance, false);
+                                    {
+                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let method = alt.as_ref().unwrap_or(method);
+                                    MethodCall::new(method, method.is_sealed(), ns_instance, false)
+                                };
                                 let (ret, result, outs) = method.call(scope, &args);
 
                                 if ret.is_err() {
@@ -2728,7 +3247,11 @@ fn create_ns_ctor_instance_object<'a>(
                             return;
                         };
                         let mut method =
-                            MethodCall::new(method, method.is_sealed(), ns_instance, false);
+                            {
+                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let method = alt.as_ref().unwrap_or(method);
+                                    MethodCall::new(method, method.is_sealed(), ns_instance, false)
+                                };
 
                         let (ret, result, outs) = method.call(scope, &args);
 
@@ -3992,7 +4515,11 @@ fn create_ns_ctor_instance_object<'a>(
                                 return;
                             };
                             let mut method =
-                                MethodCall::new(method, method.is_sealed(), ns_instance, false);
+                                {
+                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let method = alt.as_ref().unwrap_or(method);
+                                    MethodCall::new(method, method.is_sealed(), ns_instance, false)
+                                };
 
                             let (ret, result, outs) = method.call(scope, &args);
 
@@ -5265,6 +5792,8 @@ fn create_ns_ctor_object<'a>(
                     }
 
                     if let Some(method) = find_class_method(clazz, &name) {
+
+                        crate::class_helpers::register_overload_siblings(clazz, &name, &method);
                         let declaration = Arc::new(RwLock::new(method.clone()));
                         let declaration = Box::into_raw(Box::new(
                             DeclarationFFI::new_with_instance(declaration, dec.instance.clone()),
@@ -5291,7 +5820,11 @@ fn create_ns_ctor_object<'a>(
                                     return;
                                 };
                                 let mut method =
-                                    MethodCall::new(method, method.is_sealed(), ns_instance, false);
+                                    {
+                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let method = alt.as_ref().unwrap_or(method);
+                                    MethodCall::new(method, method.is_sealed(), ns_instance, false)
+                                };
                                 let (ret, result, outs) = method.call(scope, &args);
 
                                 if ret.is_err() {
@@ -6755,6 +7288,7 @@ fn handle_named_property_getter(
 
                 if let Some(clazz_dec) = clazz_dec {
                     if let Some(method) = find_class_method(clazz_dec, name.as_str()) {
+                        crate::class_helpers::register_overload_siblings(clazz_dec, name.as_str(), &method);
                         let declaration = Arc::new(RwLock::new(method));
 
                         let declaration = Box::into_raw(Box::new(
@@ -6791,7 +7325,11 @@ fn handle_named_property_getter(
                                 };
 
                                 let mut method =
-                                    MethodCall::new(method, method.is_sealed(), ns_instance, false);
+                                    {
+                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let method = alt.as_ref().unwrap_or(method);
+                                    MethodCall::new(method, method.is_sealed(), ns_instance, false)
+                                };
 
                                 let (_ret, _result, _outs) = method.call(scope, &args);
                             },
@@ -7609,11 +8147,10 @@ impl Runtime {
         // that drain to a DispatcherQueue work item outside the walk.
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
-        // Provide a host callback for dynamic `import()` so embedders and
-        // tests that use `import(modulePath)` work. The callback compiles
-        // the requested module (and its transitive graph), instantiates
-        // and evaluates it, then resolves the returned Promise with the
-        // module namespace object.
+        // Dynamic `import()`: load + link + evaluate the requested graph, then settle the returned
+        // promise with the module namespace. After the graph's own evaluation promise (TLA) settles,
+        // and with the real exception on failure.
+        isolate.set_host_initialize_import_meta_object_callback(esm_import_meta);
         isolate.set_host_import_module_dynamically_callback(
             |scope: &mut v8::PinScope<'_, '_>,
              _host_defined_options: v8::Local<v8::Data>,
@@ -7621,68 +8158,48 @@ impl Runtime {
              specifier: v8::Local<v8::String>,
              _import_attributes: v8::Local<v8::FixedArray>|
              -> Option<v8::Local<v8::Promise>> {
-                // Create a promise resolver to return to JS.
-                let resolver = match v8::PromiseResolver::new(scope) {
-                    Some(r) => r,
-                    None => return None,
-                };
-
+                let resolver = v8::PromiseResolver::new(scope)?;
                 let spec = specifier.to_rust_string_lossy(scope);
                 let referrer_path = value_to_string(scope, resource_name);
                 let resolved = resolve_esm_path(&spec, referrer_path.as_deref());
+                // Volatile URLs (configureLoader) are re-fetched on every import.
+                if crate::esm_http::is_http(&resolved) && crate::esm_http::is_volatile(&resolved) {
+                    evict_module_key(&resolved);
+                }
 
-                if let Some(content) = crate::source_protect::read_text(&resolved) {
-                    compile_module_graph(scope, &content, &resolved);
-                } else {
-                    match std::fs::read_to_string(&resolved) {
-                        Ok(content) => compile_module_graph(scope, &content, &resolved),
-                        Err(e) => {
-                            if let Some(err_str) = v8::String::new(
-                                scope,
-                                &format!("ESM: cannot read {resolved}: {e}"),
-                            ) {
-                                resolver.reject(scope, err_str.into());
+                match esm_load_and_evaluate(scope, &spec, referrer_path.as_deref(), &resolved, None) {
+                    Err(exc) => {
+                        let exc = v8::Local::new(scope, &exc);
+                        resolver.reject(scope, exc);
+                    }
+                    Ok((module, result)) => {
+                        let module = v8::Local::new(scope, &module);
+                        let result = v8::Local::new(scope, &result);
+                        let ns = module.get_module_namespace();
+                        match v8::Local::<v8::Promise>::try_from(result) {
+                            Ok(p) if p.state() == v8::PromiseState::Rejected => {
+                                let exc = p.result(scope);
+                                resolver.reject(scope, exc);
                             }
-                            return Some(resolver.get_promise(scope));
+                            Ok(p) if p.state() == v8::PromiseState::Pending => {
+                                let to_ns = v8::Function::builder(
+                                    |_scope: &mut v8::PinScope<'_, '_>,
+                                     args: v8::FunctionCallbackArguments,
+                                     mut rv: v8::ReturnValue| {
+                                        rv.set(args.data());
+                                    },
+                                )
+                                .data(ns)
+                                .build(scope)?;
+                                let chained = p.then(scope, to_ns)?;
+                                resolver.resolve(scope, chained.into());
+                            }
+                            _ => {
+                                resolver.resolve(scope, ns);
+                            }
                         }
                     }
                 }
-
-                let root_global = ESM_MODULE_REGISTRY.with(|r| r.borrow().get(&resolved).cloned());
-                let Some(root_global) = root_global else {
-                    if let Some(err_str) =
-                        v8::String::new(scope, "ESM: root module was not compiled")
-                    {
-                        resolver.reject(scope, err_str.into());
-                    }
-                    return Some(resolver.get_promise(scope));
-                };
-
-                let module = v8::Local::new(scope, &root_global);
-
-                if module
-                    .instantiate_module(scope, resolve_module_callback)
-                    .is_none()
-                {
-                    if let Some(err_str) =
-                        v8::String::new(scope, "ESM: module instantiation failed")
-                    {
-                        resolver.reject(scope, err_str.into());
-                    }
-                    return Some(resolver.get_promise(scope));
-                }
-
-                if module.evaluate(scope).is_none() {
-                    if let Some(err_str) = v8::String::new(scope, "ESM: module evaluation failed") {
-                        resolver.reject(scope, err_str.into());
-                    }
-                    return Some(resolver.get_promise(scope));
-                }
-
-                scope.perform_microtask_checkpoint();
-
-                let ns = module.get_module_namespace();
-                resolver.resolve(scope, ns);
                 Some(resolver.get_promise(scope))
             },
         );
@@ -7761,10 +8278,13 @@ impl Runtime {
         v8::tc_scope!(tc, scope);
 
         let resolved_path = {
-            let p = normalize_js_path(filename);
-            let p = try_resolve_with_known_extensions(p);
+            let p = locate_entry_module(filename, &self.app_root);
             p.canonicalize().unwrap_or(p).to_string_lossy().into_owned()
         };
+        if let Some(dir) = Path::new(&resolved_path).parent() {
+            ESM_APP_DIR.with(|d| *d.borrow_mut() = Some(dir.to_path_buf()));
+            crate::esm_http::init_security_from_app_dir(dir);
+        }
 
         macro_rules! check_exception {
             ($tc:ident) => {
@@ -7830,13 +8350,15 @@ impl Runtime {
             return;
         }
 
-        if module.evaluate(tc).is_none() {
+        let Some(result) = module.evaluate(tc) else {
             check_exception!(tc);
             return;
-        }
+        };
 
         check_exception!(tc);
         tc.perform_microtask_checkpoint();
+        report_module_evaluation(tc, result);
+        flush_module_code_caches(tc);
     }
 
     pub fn run_script(&mut self, script: &str, filename: &str) {
@@ -8048,9 +8570,14 @@ impl Drop for Runtime {
         EVENT_REGISTRY.with(|m| m.borrow_mut().clear());
         ESM_MODULE_REGISTRY.with(|m| m.borrow_mut().clear());
         ESM_HASH_TO_PATH.with(|m| m.borrow_mut().clear());
+        PENDING_MODULE_CODE_CACHES.with(|q| q.borrow_mut().clear());
+        ESM_HTTP_URLS.with(|m| m.borrow_mut().clear());
+        ESM_LOAD_ERRORS.with(|m| m.borrow_mut().clear());
+        crate::esm_http::clear_thread_vocabulary();
         DOTNET_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         DOTNET_ONESHOT_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         crate::timers::clear_thread_tasks();
+        crate::websocket::clear_thread_sockets();
         crate::globals::url::clear_thread_url_ctor();
         crate::inspector::clear_thread_dispatchers();
         crate::global_fns::clear_thread_dispatchers();
@@ -8214,6 +8741,12 @@ mod error_handling_test;
 
 #[cfg(test)]
 mod module_load_test;
+
+#[cfg(test)]
+mod esm_test;
+
+#[cfg(test)]
+mod esm_http_test;
 
 #[cfg(test)]
 mod instance_cache_test;

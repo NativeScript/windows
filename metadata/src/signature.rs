@@ -2,6 +2,7 @@
 
 use crate::prelude::*;
 use std::mem::MaybeUninit;
+use windows::core::Interface;
 use windows::Win32::System::WinRT::Metadata::{
     mdtTypeDef, mdtTypeRef, CorElementType, CorTokenType, IMetaDataImport2, ELEMENT_TYPE_BOOLEAN,
     ELEMENT_TYPE_BYREF, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_GENERICINST,
@@ -21,19 +22,25 @@ fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
 
     // For TypeRef tokens, resolve to the TypeDef in the external metadata scope first.
     if token_kind == mdtTypeRef {
+        let key = (metadata.as_raw() as usize, token.0);
+        if let Some(hit) = TYPE_REF_IS_ENUM_CACHE.with(|c| c.borrow().get(&key).copied()) {
+            return hit;
+        }
         // resolve_type_ref opens the metadata file that owns the referenced type and
         // returns both the external IMetaDataImport2 scope and the TypeDef token within it.
         let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
         let mut ext_token = token;
-        if resolve_type_ref(
+        let is_enum = resolve_type_ref(
             Some(metadata),
             token,
             unsafe { ext_metadata.assume_init_mut() },
             &mut ext_token,
-        ) {
-            return is_enum_type(unsafe { ext_metadata.assume_init_ref() }, ext_token);
-        }
-        return false;
+        ) && {
+            let ext_metadata = unsafe { ext_metadata.assume_init() };
+            is_enum_type(&ext_metadata, ext_token)
+        };
+        TYPE_REF_IS_ENUM_CACHE.with(|c| c.borrow_mut().insert(key, is_enum));
+        return is_enum;
     }
 
     if token_kind != mdtTypeDef {
@@ -61,10 +68,24 @@ fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
     name == SYSTEM_ENUM
 }
 
+thread_local! {
+    // (metadata scope, TypeRef token) → resolved name. Resolving a TypeRef goes through
+    // RoGetMetaDataFile (a winmd lookup), and signatures are re-stringified on hot paths such as
+    // wrapping every returned WinRT object, so this dominated those calls uncached.
+    static TYPE_REF_NAME_CACHE: std::cell::RefCell<ahash::AHashMap<(usize, i32), String>> =
+        std::cell::RefCell::new(ahash::AHashMap::new());
+    static TYPE_REF_IS_ENUM_CACHE: std::cell::RefCell<ahash::AHashMap<(usize, i32), bool>> =
+        std::cell::RefCell::new(ahash::AHashMap::new());
+}
+
 /// Returns the fully qualified name (namespace + type name) for the given token.
 fn get_fully_qualified_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String {
     let token_kind = CorTokenType(type_from_token(token));
     if token_kind == mdtTypeRef {
+        let key = (metadata.as_raw() as usize, token.0);
+        if let Some(name) = TYPE_REF_NAME_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+            return name;
+        }
         let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
         let mut ext_token = token;
         if resolve_type_ref(
@@ -73,7 +94,11 @@ fn get_fully_qualified_type_name(metadata: &IMetaDataImport2, token: CorTokenTyp
             unsafe { ext_metadata.assume_init_mut() },
             &mut ext_token,
         ) {
-            return get_type_name(unsafe { ext_metadata.assume_init_ref() }, ext_token);
+            // RoGetMetaDataFile handed us an owned reference: take it so it is released.
+            let ext_metadata = unsafe { ext_metadata.assume_init() };
+            let name = get_type_name(&ext_metadata, ext_token);
+            TYPE_REF_NAME_CACHE.with(|c| c.borrow_mut().insert(key, name.clone()));
+            return name;
         }
     }
     get_type_name(metadata, token)

@@ -1,4 +1,5 @@
 mod interop;
+mod sampler;
 
 use crate::interop::create_dispatcher_queue_controller_for_current_thread;
 use std::env;
@@ -69,7 +70,11 @@ fn run_js_app() {
     let app_root_cstr = CString::new(app_root).unwrap();
     let rt = nativescript::runtime_init(app_root_cstr.as_ptr());
     let cscript = CString::new(script).unwrap();
+    let sampler = sampler::start_if_requested();
     nativescript::runtime_runscript(rt, cscript.as_ptr(), std::ptr::null());
+    if let Some(sampler) = sampler {
+        sampler.finish();
+    }
     nativescript::runtime_deinit(rt);
 
     unsafe { RoUninitialize() };

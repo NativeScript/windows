@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 metadata = { path = "../metadata" }
 nativescript = { path = "../nativescript" }
+backtrace = "0.3"
 
 [dependencies.windows]
 workspace = true
@@ -15,6 +16,9 @@ features = [
     "Foundation_Numerics",
     "System",
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
     "Win32_System_WinRT",
     "Win32_UI_WindowsAndMessaging",
 ]

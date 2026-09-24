@@ -44,6 +44,16 @@ pub(crate) fn set_com_teardown(value: bool) {
     COM_TEARDOWN.with(|c| c.set(value));
 }
 
+/// Drop `value` (releasing any COM references it owns), or leak it while the apartment is being
+/// torn down: see `COM_TEARDOWN`.
+pub(crate) fn drop_unless_com_teardown<T>(value: T) {
+    if COM_TEARDOWN.with(|c| c.get()) {
+        std::mem::forget(value);
+    } else {
+        drop(value);
+    }
+}
+
 /// Drop cached inspector dispatcher handles (isolate-tied `v8::Global`s).
 /// Called from `Runtime::drop` while the isolate is still alive.
 pub(crate) fn clear_thread_dispatchers() {
@@ -1212,6 +1222,164 @@ const HELPER_SOURCE: &str = r#"
                 };
             }
 
+            // WHATWG TextEncoder/TextDecoder (UTF-8), which the iOS/Android runtimes provide natively
+            // and bundled libraries assume exist.
+            if (typeof globalThis.TextEncoder !== 'function') {
+                var TextEncoder = function TextEncoder() {};
+                TextEncoder.prototype.encoding = 'utf-8';
+                TextEncoder.prototype.encodeInto = function (input, dest) {
+                    var s = String(input), read = 0, written = 0, n = dest.length;
+                    for (var i = 0; i < s.length; i++) {
+                        var c = s.charCodeAt(i), units = 1;
+                        if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+                            var d = s.charCodeAt(i + 1);
+                            if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); units = 2; }
+                        }
+                        if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd; // lone surrogate
+                        var len = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+                        if (written + len > n) break;
+                        if (len === 1) dest[written++] = c;
+                        else if (len === 2) { dest[written++] = 0xc0 | (c >> 6); dest[written++] = 0x80 | (c & 63); }
+                        else if (len === 3) { dest[written++] = 0xe0 | (c >> 12); dest[written++] = 0x80 | ((c >> 6) & 63); dest[written++] = 0x80 | (c & 63); }
+                        else { dest[written++] = 0xf0 | (c >> 18); dest[written++] = 0x80 | ((c >> 12) & 63); dest[written++] = 0x80 | ((c >> 6) & 63); dest[written++] = 0x80 | (c & 63); }
+                        read += units;
+                        i += units - 1;
+                    }
+                    return { read: read, written: written };
+                };
+                TextEncoder.prototype.encode = function (input) {
+                    var s = input === undefined ? '' : String(input);
+                    var buf = new Uint8Array(s.length * 3);
+                    return buf.slice(0, this.encodeInto(s, buf).written);
+                };
+                globalThis.TextEncoder = TextEncoder;
+            }
+            if (typeof globalThis.TextDecoder !== 'function') {
+                var TextDecoder = function TextDecoder(label, options) {
+                    var enc = label === undefined ? 'utf-8' : String(label).trim().toLowerCase();
+                    if (enc !== 'utf-8' && enc !== 'utf8' && enc !== 'unicode-1-1-utf-8') {
+                        throw new RangeError('TextDecoder: unsupported encoding "' + label + '" (only utf-8 is available)');
+                    }
+                    this.encoding = 'utf-8';
+                    this.fatal = !!(options && options.fatal);
+                    this.ignoreBOM = !!(options && options.ignoreBOM);
+                    this._pending = null;
+                    this._bomSeen = false;
+                };
+                TextDecoder.prototype.decode = function (input, options) {
+                    var bytes = input === undefined ? new Uint8Array(0)
+                        : input instanceof ArrayBuffer ? new Uint8Array(input)
+                        : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+                    if (this._pending) {
+                        var joined = new Uint8Array(this._pending.length + bytes.length);
+                        joined.set(this._pending); joined.set(bytes, this._pending.length);
+                        bytes = joined; this._pending = null;
+                    }
+                    var stream = !!(options && options.stream), out = '', chunk = [], i = 0, n = bytes.length;
+                    var fatal = this.fatal;
+                    function bad() { if (fatal) throw new TypeError('TextDecoder: invalid utf-8'); chunk.push(0xfffd); }
+                    while (i < n) {
+                        var b = bytes[i], need = b < 0x80 ? 0 : (b & 0xe0) === 0xc0 ? 1 : (b & 0xf0) === 0xe0 ? 2 : (b & 0xf8) === 0xf0 ? 3 : -1;
+                        if (need < 0) { bad(); i++; continue; }
+                        if (i + need >= n + (need ? 0 : 1)) {
+                            if (stream) { this._pending = bytes.slice(i); break; }
+                            bad(); break;
+                        }
+                        var c = need === 0 ? b : b & (0x3f >> need), ok = true;
+                        for (var k = 1; k <= need; k++) {
+                            var cb = bytes[i + k];
+                            if ((cb & 0xc0) !== 0x80) { ok = false; break; }
+                            c = (c << 6) | (cb & 63);
+                        }
+                        if (!ok || (need === 1 && c < 0x80) || (need === 2 && (c < 0x800 || (c >= 0xd800 && c <= 0xdfff))) || (need === 3 && (c < 0x10000 || c > 0x10ffff))) {
+                            bad(); i++; continue;
+                        }
+                        i += need + 1;
+                        if (c === 0xfeff && !this.ignoreBOM && !this._bomSeen && out.length === 0 && chunk.length === 0) { this._bomSeen = true; continue; }
+                        this._bomSeen = true;
+                        if (c > 0xffff) { c -= 0x10000; chunk.push(0xd800 + (c >> 10), 0xdc00 + (c & 1023)); }
+                        else chunk.push(c);
+                        if (chunk.length > 8192) { out += String.fromCharCode.apply(null, chunk); chunk = []; }
+                    }
+                    if (!stream) this._bomSeen = false;
+                    return out + String.fromCharCode.apply(null, chunk);
+                };
+                globalThis.TextDecoder = TextDecoder;
+            }
+
+            // WHATWG WebSocket over the native WinHTTP socket (runtime/src/websocket.rs). Events are
+            // delivered on the JS thread by the runtime pump.
+            if (typeof globalThis.WebSocket !== 'function' && typeof globalThis.__nsWebSocketOpen === 'function') {
+                var WebSocket = function WebSocket(url, protocols) {
+                    if (!(this instanceof WebSocket)) throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator");
+                    var href = String(url);
+                    if (!/^wss?:\/\//i.test(href)) {
+                        if (/^https?:\/\//i.test(href)) href = href.replace(/^http/i, 'ws');
+                        else throw new SyntaxError("Failed to construct 'WebSocket': The URL '" + href + "' is invalid.");
+                    }
+                    var list = protocols === undefined ? [] : (Array.isArray(protocols) ? protocols : [protocols]).map(String);
+                    this.url = href;
+                    this.protocol = '';
+                    this.extensions = '';
+                    this.readyState = 0;
+                    this.bufferedAmount = 0;
+                    this.binaryType = 'arraybuffer';
+                    this.onopen = null;
+                    this.onmessage = null;
+                    this.onerror = null;
+                    this.onclose = null;
+                    this._listeners = {};
+                    var self = this;
+                    this._id = globalThis.__nsWebSocketOpen(href, list, function (type, a, b, c) {
+                        if (type === 'open') {
+                            self.readyState = 1;
+                            self.protocol = a || '';
+                            self._emit({ type: 'open', target: self });
+                        } else if (type === 'message') {
+                            if (self.readyState === 1) self._emit({ type: 'message', data: a, origin: self.url, target: self });
+                        } else if (type === 'error') {
+                            self._emit({ type: 'error', message: a, target: self });
+                        } else if (type === 'close') {
+                            self.readyState = 3;
+                            self._emit({ type: 'close', code: a, reason: b || '', wasClean: !!c, target: self });
+                        }
+                    });
+                };
+                WebSocket.CONNECTING = WebSocket.prototype.CONNECTING = 0;
+                WebSocket.OPEN = WebSocket.prototype.OPEN = 1;
+                WebSocket.CLOSING = WebSocket.prototype.CLOSING = 2;
+                WebSocket.CLOSED = WebSocket.prototype.CLOSED = 3;
+                WebSocket.prototype._emit = function (event) {
+                    var handler = this['on' + event.type];
+                    if (typeof handler === 'function') handler.call(this, event);
+                    var list = (this._listeners[event.type] || []).slice();
+                    for (var i = 0; i < list.length; i++) {
+                        try { list[i].call(this, event); } catch (e) { setTimeout(function () { throw e; }, 0); }
+                    }
+                };
+                WebSocket.prototype.addEventListener = function (type, listener) {
+                    if (typeof listener !== 'function') return;
+                    var list = this._listeners[type] || (this._listeners[type] = []);
+                    if (list.indexOf(listener) < 0) list.push(listener);
+                };
+                WebSocket.prototype.removeEventListener = function (type, listener) {
+                    var list = this._listeners[type];
+                    if (list) { var i = list.indexOf(listener); if (i >= 0) list.splice(i, 1); }
+                };
+                WebSocket.prototype.dispatchEvent = function (event) { this._emit(event); return true; };
+                WebSocket.prototype.send = function (data) {
+                    if (this.readyState === 0) throw new Error("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.");
+                    if (this.readyState !== 1) return;
+                    globalThis.__nsWebSocketSend(this._id, data);
+                };
+                WebSocket.prototype.close = function (code, reason) {
+                    if (this.readyState >= 2) return;
+                    this.readyState = 2;
+                    globalThis.__nsWebSocketClose(this._id, code === undefined ? 1000 : code, reason === undefined ? '' : String(reason));
+                };
+                globalThis.WebSocket = WebSocket;
+            }
+
             var defaultTimeoutMs = 0;
             var statusEnum =
                 (globalThis.Windows &&
@@ -2327,6 +2495,37 @@ const HELPER_SOURCE: &str = r#"
                         __extends_winrt(d, b);
                     } else {
                         __extends_ts_inner(d, b);
+                    }
+                };
+            }
+
+            // TypeScript decorator helpers, as the iOS/Android runtimes provide them: compiled
+            // (`experimentalDecorators`) code calls a bare `__decorate(...)`. Core's globals module
+            // binds tslib's copies too, but an ES-module bundle can evaluate decorated core modules
+            // before it runs.
+            if (typeof globalThis.__decorate !== 'function') {
+                globalThis.__decorate = function (decorators, target, key, desc) {
+                    var c = arguments.length;
+                    var r = c < 3 ? target : desc === null ? (desc = Object.getOwnPropertyDescriptor(target, key)) : desc, d;
+                    if (typeof Reflect === 'object' && typeof Reflect.decorate === 'function') {
+                        r = Reflect.decorate(decorators, target, key, desc);
+                    } else {
+                        for (var i = decorators.length - 1; i >= 0; i--) {
+                            if ((d = decorators[i])) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+                        }
+                    }
+                    return c > 3 && r && Object.defineProperty(target, key, r), r;
+                };
+            }
+            if (typeof globalThis.__param !== 'function') {
+                globalThis.__param = function (paramIndex, decorator) {
+                    return function (target, key) { decorator(target, key, paramIndex); };
+                };
+            }
+            if (typeof globalThis.__metadata !== 'function') {
+                globalThis.__metadata = function (metadataKey, metadataValue) {
+                    if (typeof Reflect === 'object' && typeof Reflect.metadata === 'function') {
+                        return Reflect.metadata(metadataKey, metadataValue);
                     }
                 };
             }
@@ -3527,6 +3726,7 @@ const HELPER_SOURCE: &str = r#"
 
             function makeRequire(callerFile) {
                 return function require(specifier) {
+                    if (specifier === 'ns:module' && globalThis.__nsModuleBuiltin) return globalThis.__nsModuleBuiltin;
                     var resolved = resolveSpecifier(specifier, callerFile);
                     if (!resolved) throw new Error('Cannot find module: ' + specifier);
 
@@ -3564,6 +3764,38 @@ const HELPER_SOURCE: &str = r#"
             }
 
             globalThis.require = makeRequire(null);
+
+            // The `ns:module` builtin (require/import/import()): the dev-loader control surface
+            // @nativescript/vite's HMR client drives, as on iOS/Android. Members are frozen and
+            // non-throwing to feature-detect.
+            if (!globalThis.__nsModuleBuiltin && typeof globalThis.__nsModuleConfigureLoader === 'function') {
+                var nsModule = {
+                    configureLoader: function configureLoader(config) {
+                        if (!config || typeof config !== 'object') throw new TypeError('configureLoader expects a config object');
+                        globalThis.__nsModuleConfigureLoader(JSON.stringify(config));
+                    },
+                    invalidateModules: function invalidateModules(urls) {
+                        return globalThis.__nsModuleInvalidate(urls);
+                    },
+                    getLoadedModuleUrls: function getLoadedModuleUrls() {
+                        return globalThis.__nsModuleLoadedUrls();
+                    },
+                    createRequire: function createRequire(filenameOrURL) {
+                        var value = filenameOrURL && typeof filenameOrURL === 'object' ? filenameOrURL.href : filenameOrURL;
+                        if (typeof value !== 'string') {
+                            throw new TypeError("The argument 'filename' must be a file URL object, file URL string, or absolute path string.");
+                        }
+                        if (/^https?:/.test(value)) {
+                            throw new TypeError('createRequire() cannot take an http(s) URL (' + value + '): use import() for remote modules.');
+                        }
+                        if (value.indexOf('file:') === 0) {
+                            value = decodeURIComponent(value.replace(/^file:\/\/(localhost)?/, '').replace(/[?#].*$/, '')).replace(/^\/([A-Za-z]:)/, '$1');
+                        }
+                        return makeRequire(value);
+                    },
+                };
+                Object.defineProperty(globalThis, '__nsModuleBuiltin', { value: Object.freeze(nsModule), enumerable: false });
+            }
 
             // Top-level CJS globals for scripts executed outside a factory wrapper
             // (e.g., when the host calls runtime_runscript directly with a CJS file).
@@ -4895,6 +5127,12 @@ pub(crate) fn init_async_helpers(
     register!("__nsTypedValue", handle_typed_value);
     register!("__nsCreateReference", handle_create_reference);
     register!("__nsMsAppxResolve", handle_ms_appx_resolve);
+    register!("__nsWebSocketOpen", crate::websocket::handle_open);
+    register!("__nsWebSocketSend", crate::websocket::handle_send);
+    register!("__nsWebSocketClose", crate::websocket::handle_close);
+    register!("__nsModuleConfigureLoader", crate::handle_ns_module_configure_loader);
+    register!("__nsModuleInvalidate", crate::handle_ns_module_invalidate);
+    register!("__nsModuleLoadedUrls", crate::handle_ns_module_loaded_urls);
 
     // DevTools host hooks: allow JS to register domain dispatchers and
     // post events/timestamps to the DevTools server when enabled.

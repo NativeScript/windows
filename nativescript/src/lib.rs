@@ -207,6 +207,8 @@ pub extern "C" fn runtime_set_bundle_key(key_hex: *const c_char) -> c_int {
 #[no_mangle]
 pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
     install_veh();
+    // Debug (devtools) hosts may load ES modules from a dev server (Vite HMR).
+    runtime::esm_http::set_debug_build(cfg!(feature = "devtools"));
     let result = std::panic::catch_unwind(|| {
         let mut boxed = if app_root.is_null() {
             Box::new(Runtime::new(""))

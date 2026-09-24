@@ -465,6 +465,7 @@ pub(crate) fn handle_named_property_getter(
 
                 if let Some(clazz_dec) = clazz_dec {
                     if let Some(method) = find_class_method(clazz_dec, &name) {
+                        crate::class_helpers::register_overload_siblings(clazz_dec, &name, &method);
                         {
                             let declaration = Arc::new(RwLock::new(method));
                             let declaration =
@@ -485,6 +486,8 @@ pub(crate) fn handle_named_property_getter(
                                     let method =
                                         lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                     let instance = dec.instance.clone().unwrap();
+                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let method = alt.as_ref().unwrap_or(method);
                                     let mut method = MethodCall::new(
                                         method,
                                         method.is_sealed(),
@@ -816,6 +819,8 @@ fn instance_method_dispatch(
             }
         },
     };
+    let alt = crate::class_helpers::overload_for_argc(method_decl, args.length() as usize);
+    let method_decl = alt.as_ref().unwrap_or(method_decl);
     let mut method = MethodCall::new(method_decl, method_decl.is_sealed(), instance, false);
     let (ret, result, _outs) = method.call(scope, &args);
 
@@ -1188,6 +1193,8 @@ pub(crate) fn handle_instance_property_getter(
     }
 
     if let Some(method) = find_class_method(clazz, &name) {
+
+        crate::class_helpers::register_overload_siblings(clazz, &name, &method);
         let key = format!("{}::{}", clazz.full_name(), name);
         if let Some(func) =
             SHARED_METHOD_FNS.with(|c| c.borrow().get(&key).map(|g| v8::Local::new(scope, g)))
@@ -2967,10 +2974,17 @@ pub(crate) fn finish_instance_object<'a>(
         } else {
             v8::null(scope).into()
         };
-        object.set(scope, handle_key.into(), handle_value);
+        // Define, don't Set: a Set on an object with named interceptors runs the WinRT setter
+        // interceptor (a metadata lookup for a property called `handle`) and the prototype-chain
+        // setter walk: a measurable share of every instance wrap.
+        object.create_data_property(scope, handle_key.into(), handle_value);
     }
 
     if let Some(key) = identity_key {
+        // Internal field 0 owns `declaration_ffi` (and through it an AddRef'd IUnknown); only
+        // callbacks on this object read it, so it dies with the wrapper. Without this every
+        // wrapped WinRT object was leaked (never Released) for the life of the process.
+        let ffi_addr = declaration_ffi as usize;
         let weak = v8::Weak::with_guaranteed_finalizer(
             scope.as_mut(),
             object,
@@ -2978,6 +2992,8 @@ pub(crate) fn finish_instance_object<'a>(
                 crate::INSTANCE_CACHE.with(|cache| {
                     cache.borrow_mut().remove(&key);
                 });
+                let ffi = unsafe { Box::from_raw(ffi_addr as *mut DeclarationFFI) };
+                crate::global_fns::drop_unless_com_teardown(ffi);
             }),
         );
         let new_size = crate::INSTANCE_CACHE.with(|cache| {

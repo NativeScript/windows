@@ -96,6 +96,28 @@ export declare function getNamespace(name: string): object
 /** Generate a fresh UUID string (CoCreateGuid). */
 export declare function nsUuid(): string
 /**
+ * Create and show a plain Win32 top-level window; returns its `HWND` as an opaque handle.
+ * `pumpMessages`/`enableAutoPump` (already used for WinRT async completions) pump its message
+ * queue for free — they peek messages for the whole calling thread, not a specific window.
+ */
+export declare function createWindow(title: string, width: number, height: number): unknown
+/**
+ * Attach a `Windows.UI.Composition.Compositor` instance to a window from `createWindow` and
+ * return the resulting `DesktopWindowTarget` as a normal WinRT proxy — set its `.Root` to a
+ * visual to render into the window.
+ */
+export declare function attachCompositorToWindow(compositor: unknown, hwnd: unknown): object
+/**
+ * Drain the input/lifecycle events queued for a `createWindow` window since the last poll:
+ * `pointerdown {x, y, button}`, `pointerup {x, y}`, `pointermove {x, y}` (latest position only),
+ * `resize {width, height}`, `close`. Coordinates are client-area pixels. Poll after `pumpMessages`.
+ */
+export declare function pollWindowEvents(hwnd: unknown): object
+/** Client-area size of a `createWindow` window as `{ width, height }`, or `null` once closed. */
+export declare function getWindowSize(hwnd: unknown): unknown
+/** Set the title-bar text of a `createWindow` window. */
+export declare function setWindowTitle(hwnd: unknown, title: string): void
+/**
  * Whether the WinRT class `name` is sealed (metadata flag). Test hook: lets suites assert
  * they are really covering the composable (non-sealed, null-outer) constructor path.
  */

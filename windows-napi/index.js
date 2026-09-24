@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, init, runScript, pumpTimers, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet, deinit } = nativeBinding
+const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, init, runScript, pumpTimers, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet, deinit } = nativeBinding
 
 module.exports.formatValue = formatValue
 module.exports.tableFor = tableFor
@@ -338,6 +338,11 @@ module.exports.lastError = lastError
 module.exports.installGlobals = installGlobals
 module.exports.getNamespace = getNamespace
 module.exports.nsUuid = nsUuid
+module.exports.createWindow = createWindow
+module.exports.attachCompositorToWindow = attachCompositorToWindow
+module.exports.pollWindowEvents = pollWindowEvents
+module.exports.getWindowSize = getWindowSize
+module.exports.setWindowTitle = setWindowTitle
 module.exports.classIsSealed = classIsSealed
 module.exports.registerWinmd = registerWinmd
 module.exports.scanWinmdDir = scanWinmdDir

@@ -6,7 +6,9 @@
 //! on any host/engine that implements it (Node/Deno = V8, Bun = JSC, and standalone QuickJS/
 //! Hermes/V8 via vendored shims).
 
+pub mod composition_window;
 pub mod console;
+pub mod crash_reporter;
 pub mod delegate;
 pub mod dotnet;
 pub mod event_loop;

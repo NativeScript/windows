@@ -240,7 +240,11 @@ namespace NativeScriptWindowsDemo
 
             var dir = Path.GetDirectoryName(Path.GetFullPath(entryPath));
             var chunks = new List<string>();
-            foreach (var chunkName in new[] { "runtime.js", "vendor.js" })
+            // An ES-module entry (Vite's bundle.mjs) imports its own chunks; webpack's classic
+            // runtime.js/vendor.js prelude must not run in front of it (a stale pair can be left
+            // in app/ after switching bundlers).
+            var isModuleEntry = entryPath.EndsWith(".mjs", StringComparison.OrdinalIgnoreCase);
+            foreach (var chunkName in isModuleEntry ? Array.Empty<string>() : new[] { "runtime.js", "vendor.js" })
             {
                 var chunkPath = Path.Combine(dir, chunkName);
                 if (VExists(chunkPath) &&
@@ -256,7 +260,11 @@ namespace NativeScriptWindowsDemo
                 var script = VReadAllText(Path.GetFullPath(scriptPath));
                 try
                 {
-                    runtime_runscript(_runtime, script, Path.GetFileName(scriptPath));
+                    // Modules resolve their imports (chunks, ~/ paths) relative to their own
+                    // location, so they need the full path; classic scripts keep the short name
+                    // their stack traces and code-cache keys have always used.
+                    var name = isModuleEntry ? Path.GetFullPath(scriptPath) : Path.GetFileName(scriptPath);
+                    runtime_runscript(_runtime, script, name);
                 }
                 catch (Exception ex)
                 {

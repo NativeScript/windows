@@ -65,6 +65,60 @@ pub(crate) fn extend_class_methods(
     }
 }
 
+/// Like `extend_class_methods`, but keeps every overload under its public name instead of only
+/// the first-seen one. The callers that build actually-callable closures (`ns_hostobject`'s host
+/// ctor/prototype) need every arity so they can pick the one matching the call's argument count;
+/// `extend_class_methods`'s one-per-name view is only correct for enumeration (member listing).
+pub(crate) fn extend_class_methods_grouped(
+    class_declaration: &ClassDeclaration,
+    out: &mut std::collections::HashMap<String, Vec<MethodDeclaration>>,
+) {
+    // Same method can legitimately appear in both `methods()` and `default_interface()`/an
+    // implemented interface (WinRT class methods are usually declared via their interface); a
+    // per-name+arity dedup keeps those from producing duplicate candidates without dropping
+    // genuinely distinct overloads that happen to share an arity across interfaces (rare, but
+    // arity is the only signal callers select on, so name+arity is the right dedup key here).
+    let mut push = |key: &str, m: &MethodDeclaration| {
+        let bucket = out.entry(key.to_string()).or_default();
+        if !bucket.iter().any(|existing: &MethodDeclaration| {
+            existing.number_of_parameters() == m.number_of_parameters()
+        }) {
+            bucket.push(m.clone());
+        }
+    };
+    let mut all: Vec<&MethodDeclaration> = class_declaration.methods().iter().collect();
+    if let Some(default_interface) = class_declaration.default_interface() {
+        all.extend(default_interface.methods().iter());
+    }
+    for interface in class_declaration.implemented_interfaces() {
+        all.extend(interface.methods().iter());
+    }
+    // Same-interface overloads carry an `[Overload]` metadata name (`CreateColorBrush(Color)` is
+    // `CreateColorBrushWithColor`); that name stays callable as-is. The public name must also
+    // reach every overload, or `CreateColorBrush(color)` resolves to the 0-arg method and the
+    // argument is silently dropped. Second pass, so a default overload wins an arity tie.
+    for m in &all {
+        let on = m.overload_name();
+        push(if on.is_empty() { m.name() } else { on }, m);
+    }
+    for m in &all {
+        let on = m.overload_name();
+        if !on.is_empty() && on != m.name() {
+            push(m.name(), m);
+        }
+    }
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_declaration) =
+            MetadataReader::find_by_name(class_declaration.base_full_name())
+        {
+            let base_lock = base_declaration.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                extend_class_methods_grouped(base_class, out);
+            }
+        }
+    }
+}
+
 pub(crate) fn extend_class_properties(
     class_declaration: &ClassDeclaration,
     properties: &mut Vec<PropertyDeclaration>,
@@ -195,6 +249,126 @@ pub(crate) fn find_class_method(
         }
     }
     None
+}
+
+/// Collect every method named `name` (matching the overload name when present, else the plain
+/// name) across the class's own methods, default interface, implemented interfaces, and base
+/// class chain. Unlike `find_class_method`, does not stop at the first match: WinRT overloads
+/// sharing one public name (e.g. `Launcher.LaunchUriAsync(uri)` / `(uri, options)` /
+/// `(uri, options, data)`) are each a distinct ABI method on a distinct interface, so a caller
+/// needs every candidate to pick the one matching the arguments actually supplied.
+pub(crate) fn find_class_methods(
+    class_declaration: &ClassDeclaration,
+    name: &str,
+) -> Vec<MethodDeclaration> {
+    let matches = |m: &MethodDeclaration| {
+        let on = m.overload_name();
+        (!on.is_empty() && on == name) || m.name() == name
+    };
+    let mut out: Vec<MethodDeclaration> = Vec::new();
+    out.extend(
+        class_declaration
+            .methods()
+            .iter()
+            .filter(|m| matches(m))
+            .cloned(),
+    );
+    if let Some(di) = class_declaration.default_interface() {
+        out.extend(di.methods().iter().filter(|m| matches(m)).cloned());
+    }
+    for iface in class_declaration.implemented_interfaces() {
+        out.extend(iface.methods().iter().filter(|m| matches(m)).cloned());
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_declaration) =
+            MetadataReader::find_by_name(class_declaration.base_full_name())
+        {
+            let base_lock = base_declaration.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                return find_class_methods(base_class, name);
+            }
+        }
+    }
+    out
+}
+
+/// Pick the overload matching the supplied argument count from every method named `name`.
+/// Falls back to the first name match when no candidate's arity matches exactly (e.g. the
+/// metadata-reported arity is off, or `name` isn't a method at all) so callers can still surface
+/// a normal WinRT-call error instead of silently doing nothing.
+pub(crate) fn find_class_method_by_arity(
+    class_declaration: &ClassDeclaration,
+    name: &str,
+    argc: usize,
+) -> Option<MethodDeclaration> {
+    let candidates = find_class_methods(class_declaration, name);
+    candidates
+        .iter()
+        .find(|m| m.number_of_parameters() == argc)
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+thread_local! {
+    // Bound method (metadata scope, token) → every overload sharing its public name, for methods
+    // whose overloads differ in arity. See `register_overload_siblings`.
+    static OVERLOAD_SIBLINGS: std::cell::RefCell<ahash::AHashMap<(usize, i32), std::rc::Rc<[MethodDeclaration]>>> =
+        std::cell::RefCell::new(ahash::AHashMap::new());
+}
+
+fn method_identity(m: &MethodDeclaration) -> (usize, i32) {
+    use windows::core::Interface;
+    (m.metadata().map(|md| md.as_raw() as usize).unwrap_or(0), m.token().0)
+}
+
+/// The classic engine binds one `MethodDeclaration` per JS function when a member is first read,
+/// before any arguments exist. WinRT same-interface overloads carry distinct `[Overload]` names
+/// (`CreateColorBrush(Color)` is `CreateColorBrushWithColor`), so a lookup of the public name binds
+/// only one of them. Record the others so the call can switch arity (`overload_for_argc`).
+/// Only public-name lookups register; an `[Overload]`-name lookup stays bound to exactly that method.
+pub(crate) fn register_overload_siblings(
+    class_declaration: &ClassDeclaration,
+    js_name: &str,
+    bound: &MethodDeclaration,
+) {
+    if bound.name() != js_name {
+        return;
+    }
+    let key = method_identity(bound);
+    if OVERLOAD_SIBLINGS.with(|m| m.borrow().contains_key(&key)) {
+        return;
+    }
+    let mut siblings: Vec<MethodDeclaration> = vec![bound.clone()];
+    for m in find_class_methods(class_declaration, js_name) {
+        if m.name() == js_name
+            && m.is_static() == bound.is_static()
+            && !siblings
+                .iter()
+                .any(|s| s.number_of_parameters() == m.number_of_parameters())
+        {
+            siblings.push(m);
+        }
+    }
+    if siblings.len() > 1 {
+        OVERLOAD_SIBLINGS.with(|m| m.borrow_mut().insert(key, siblings.into()));
+    }
+}
+
+/// The overload of `bound` matching `argc`, when `bound` itself doesn't (see
+/// `register_overload_siblings`). `None` means call `bound` as-is.
+#[inline]
+pub(crate) fn overload_for_argc(bound: &MethodDeclaration, argc: usize) -> Option<MethodDeclaration> {
+    if bound.number_of_parameters() == argc {
+        return None;
+    }
+    OVERLOAD_SIBLINGS.with(|m| {
+        m.borrow()
+            .get(&method_identity(bound))
+            .and_then(|s| s.iter().find(|c| c.number_of_parameters() == argc).cloned())
+    })
 }
 
 pub(crate) fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {

@@ -26,7 +26,7 @@ use ahash::AHashMap;
 use napi::{CallContext, Env, JsFunction, JsObject, JsUnknown, NapiRaw, NapiValue};
 use windows::core::{IInspectable, IUnknown, Interface};
 
-use crate::class_helpers::{extend_class_methods, extend_class_properties};
+use crate::class_helpers::{extend_class_methods_grouped, extend_class_properties};
 use crate::napi_engine::invoke::invoke_property;
 use crate::napi_engine::ns_proxy::{
     activate_instance, construct_with_args, evict_instance, read_winrt_event_napi,
@@ -294,29 +294,36 @@ fn class_prototype(env: &Env, class_name: &str) -> napi::Result<JsObject> {
     let mut proto = env.create_object()?;
 
     // Snapshot metadata under the read lock, then build closures without holding it.
-    let (methods, properties, events, is_sealed): (Vec<_>, Vec<_>, Vec<_>, bool) = {
+    let (methods_by_name, properties, events, is_sealed): (
+        std::collections::HashMap<String, Vec<_>>,
+        Vec<_>,
+        Vec<_>,
+        bool,
+    ) = {
         let lock = declaration.read();
         let class = lock
             .as_any()
             .downcast_ref::<ClassDeclaration>()
             .ok_or_else(|| napi::Error::from_reason(format!("{class_name} is not a class")))?;
-        let mut methods = Vec::new();
-        extend_class_methods(class, &mut methods, &mut std::collections::HashSet::new());
+        let mut methods = std::collections::HashMap::new();
+        extend_class_methods_grouped(class, &mut methods);
         let mut props = Vec::new();
         extend_class_properties(class, &mut props, &mut std::collections::HashSet::new());
         (methods, props, collect_events(class), class.is_sealed())
     };
 
-    // Methods (instance) → prototype functions. Each closure captures its resolved
-    // MethodDeclaration so the call path skips the per-call name→metadata walk.
-    for m in &methods {
-        if m.is_static() {
+    // Methods (instance) → prototype functions. Each closure captures every overload sharing
+    // this public name (usually one) and, at call time, picks the one matching the argument
+    // count actually supplied: WinRT overloads sharing a name are distinct ABI methods on
+    // distinct interfaces (e.g. `IAsyncOperation`-returning methods with an options parameter),
+    // so calling the wrong one is a wrong vtable slot, not just wrong behavior: it can crash
+    // inside the WinRT-side DLL instead of raising a catchable JS error.
+    for (js_name, overloads) in &methods_by_name {
+        if overloads.iter().all(|m| m.is_static()) {
             continue;
         }
-        let on = m.overload_name();
-        let js_name = if on.is_empty() { m.name() } else { on }.to_string();
-        let method = m.clone();
-        let f = env.create_function_from_closure(&js_name, move |ctx: CallContext| {
+        let overloads: Vec<_> = overloads.iter().filter(|m| !m.is_static()).cloned().collect();
+        let f = env.create_function_from_closure(js_name, move |ctx: CallContext| {
             let env = &ctx.env;
             let inst = this_instance(&ctx)?;
             let ptr = inst.as_raw();
@@ -324,10 +331,14 @@ fn class_prototype(env: &Env, class_name: &str) -> napi::Result<JsObject> {
             for i in 0..ctx.length {
                 args.push(ctx.get::<JsUnknown>(i)?);
             }
-            crate::napi_engine::invoke::invoke_instance_method(env, ptr, &method, is_sealed, &args)
+            let method = overloads
+                .iter()
+                .find(|m| m.number_of_parameters() == args.len())
+                .unwrap_or(&overloads[0]);
+            crate::napi_engine::invoke::invoke_instance_method(env, ptr, method, is_sealed, &args)
                 .map_err(napi_err)
         })?;
-        proto.set_named_property(&js_name, f)?;
+        proto.set_named_property(js_name, f)?;
     }
 
     // Properties (instance) → accessors.
@@ -527,38 +538,53 @@ pub fn build_host_ctor(env: &Env, class_name: &str, declaration: Decl) -> napi::
     ctor_obj.set_named_property("__typeName__", env.create_string(class_name)?)?;
 
     // Static members.
-    let (static_methods, static_props, is_sealed): (Vec<_>, Vec<_>, bool) = {
+    let (static_methods_by_name, static_props, is_sealed): (
+        std::collections::HashMap<String, Vec<_>>,
+        Vec<_>,
+        bool,
+    ) = {
         let lock = declaration.read();
         if let Some(class) = lock.as_any().downcast_ref::<ClassDeclaration>() {
-            let mut methods = Vec::new();
-            extend_class_methods(class, &mut methods, &mut std::collections::HashSet::new());
+            let mut methods = std::collections::HashMap::new();
+            extend_class_methods_grouped(class, &mut methods);
+            for overloads in methods.values_mut() {
+                overloads.retain(|m| m.is_static());
+            }
+            methods.retain(|_, overloads| !overloads.is_empty());
             let mut props = Vec::new();
             extend_class_properties(class, &mut props, &mut std::collections::HashSet::new());
             (
-                methods.into_iter().filter(|m| m.is_static()).collect(),
+                methods,
                 props.into_iter().filter(|p| p.is_static()).collect(),
                 class.is_sealed(),
             )
         } else {
-            (Vec::new(), Vec::new(), true)
+            (std::collections::HashMap::new(), Vec::new(), true)
         }
     };
 
-    for m in &static_methods {
-        let on = m.overload_name();
-        let js_name = if on.is_empty() { m.name() } else { on }.to_string();
+    // One property per public name; the closure picks the overload matching the argument count
+    // supplied at call time (see the instance-method loop above for why this matters: e.g.
+    // `Windows.System.Launcher.LaunchUriAsync` has 1/2/3-arg overloads on distinct interfaces,
+    // and always resolving to whichever one metadata listed first crashes instead of erroring
+    // when the caller's arg count picks a different one).
+    for (js_name, overloads) in &static_methods_by_name {
         let cls = class_name.to_string();
-        let method = m.clone();
-        let f = env.create_function_from_closure(&js_name, move |ctx: CallContext| {
+        let overloads = overloads.clone();
+        let f = env.create_function_from_closure(js_name, move |ctx: CallContext| {
             let env = &ctx.env;
             let mut args = Vec::with_capacity(ctx.length);
             for i in 0..ctx.length {
                 args.push(ctx.get::<JsUnknown>(i)?);
             }
-            crate::napi_engine::invoke::invoke_static_method(env, &cls, &method, is_sealed, &args)
+            let method = overloads
+                .iter()
+                .find(|m| m.number_of_parameters() == args.len())
+                .unwrap_or(&overloads[0]);
+            crate::napi_engine::invoke::invoke_static_method(env, &cls, method, is_sealed, &args)
                 .map_err(napi_err)
         })?;
-        ctor_obj.set_named_property(&js_name, f)?;
+        ctor_obj.set_named_property(js_name, f)?;
     }
 
     for p in &static_props {

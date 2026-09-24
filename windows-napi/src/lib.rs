@@ -40,6 +40,7 @@ fn drop_runtime() {
 /// call while a runtime already exists is a no-op and returns `true`.
 #[napi]
 pub fn init(mut env: Env, app_root: Option<String>) -> bool {
+    runtime::napi_engine::crash_reporter::install();
     RT.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_some() {
@@ -109,6 +110,46 @@ pub fn get_namespace(env: Env, name: String) -> napi::Result<napi::JsObject> {
 #[napi]
 pub fn ns_uuid() -> String {
     runtime::napi_engine::interop::ns_uuid()
+}
+
+/// Create and show a plain Win32 top-level window; returns its `HWND` as an opaque handle.
+/// `pumpMessages`/`enableAutoPump` (already used for WinRT async completions) pump its message
+/// queue for free. They peek messages for the whole calling thread, not a specific window.
+#[napi]
+pub fn create_window(env: Env, title: String, width: i32, height: i32) -> napi::Result<napi::JsUnknown> {
+    runtime::napi_engine::composition_window::create_window(&env, &title, width, height)
+}
+
+/// Attach a `Windows.UI.Composition.Compositor` instance to a window from `createWindow` and
+/// return the resulting `DesktopWindowTarget` as a normal WinRT proxy. Set its `.Root` to a
+/// visual to render into the window.
+#[napi]
+pub fn attach_compositor_to_window(
+    env: Env,
+    compositor: napi::JsUnknown,
+    hwnd: napi::JsUnknown,
+) -> napi::Result<napi::JsObject> {
+    runtime::napi_engine::composition_window::attach_compositor_to_window(&env, &compositor, &hwnd)
+}
+
+/// Drain the input/lifecycle events queued for a `createWindow` window since the last poll:
+/// `pointerdown {x, y, button}`, `pointerup {x, y}`, `pointermove {x, y}` (latest position only),
+/// `resize {width, height}`, `close`. Coordinates are client-area pixels. Poll after `pumpMessages`.
+#[napi]
+pub fn poll_window_events(env: Env, hwnd: napi::JsUnknown) -> napi::Result<napi::JsObject> {
+    runtime::napi_engine::composition_window::poll_window_events(&env, &hwnd)
+}
+
+/// Client-area size of a `createWindow` window as `{ width, height }`, or `null` once closed.
+#[napi]
+pub fn get_window_size(env: Env, hwnd: napi::JsUnknown) -> napi::Result<napi::JsUnknown> {
+    runtime::napi_engine::composition_window::window_client_size(&env, &hwnd)
+}
+
+/// Set the title-bar text of a `createWindow` window.
+#[napi]
+pub fn set_window_title(env: Env, hwnd: napi::JsUnknown, title: String) -> napi::Result<()> {
+    runtime::napi_engine::composition_window::set_window_title(&env, &hwnd, &title)
 }
 
 /// Whether the WinRT class `name` is sealed (metadata flag). Test hook: lets suites assert

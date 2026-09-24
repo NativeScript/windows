@@ -256,6 +256,7 @@ fn invoke_callback_by_id(id: i32) {
 }
 
 pub fn pump() {
+    crate::websocket::pump();
     // If the scheduler hasn't been initialized yet, nothing to do.
     if SCHEDULER.get().is_none() {
         return;

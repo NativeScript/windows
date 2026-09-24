@@ -32,6 +32,7 @@ pub fn ensure_winrt_initialized() {
     if WINRT_READY.with(|r| r.get()) {
         return;
     }
+    crate::napi_engine::crash_reporter::install();
     let _ = unsafe { RoInitialize(RO_INIT_SINGLETHREADED) };
     // Runtime::new's third-party winmd auto-scan doesn't run on the napi path (no Runtime),
     // so do it here once (cwd + addon dir) — WebView2 / app types resolve without an explicit

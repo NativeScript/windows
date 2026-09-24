@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use windows::core::{IInspectable, IUnknown, Interface};
 use windows::Win32::System::WinRT::IActivationFactory;
 
-use crate::class_helpers::{class_method_matches, find_class_method, find_class_property};
+use crate::class_helpers::{class_method_matches, find_class_methods, find_class_property};
 use crate::error::{generic_error, AnyError};
 use crate::napi_engine::invoke::{
     invoke_instance_owned, invoke_interface_method, invoke_interface_property, invoke_property,
@@ -707,18 +707,22 @@ pub fn create_ctor_proxy(env: &Env, class_name: &str, declaration: Decl) -> napi
                 return Ok(cached);
             }
         }
-        let (method, property, is_sealed) = {
+        let (methods, property, is_sealed) = {
             let lock = get_decl.read();
             let Some(class) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
                 return undefined_js(env);
             };
+            let all_static: Vec<_> = find_class_methods(class, &prop)
+                .into_iter()
+                .filter(|m| m.is_static())
+                .collect();
             (
-                find_class_method(class, &prop).filter(|m| m.is_static()),
+                all_static,
                 find_class_property(class, &prop).filter(|p| p.is_static()),
                 class.is_sealed(),
             )
         };
-        if let Some(method) = method {
+        if !methods.is_empty() {
             let m_class = get_name.clone();
             let f = env.create_function_from_closure(&prop.clone(), move |ctx: CallContext| {
                 let env = &ctx.env;
@@ -726,8 +730,19 @@ pub fn create_ctor_proxy(env: &Env, class_name: &str, declaration: Decl) -> napi
                 for i in 0..ctx.length {
                     args.push(ctx.get::<JsUnknown>(i)?);
                 }
+                // Several WinRT methods share one public name across arities (e.g.
+                // Launcher.LaunchUriAsync(uri) vs (uri, options)): each is a distinct ABI
+                // method on a distinct interface, so the overload must be picked by the
+                // argument count actually supplied at this call, not once at property-access
+                // time (that previously called the wrong vtable slot for any not-first-listed
+                // overload: a null-pointer crash inside the WinRT-side DLL, not a catchable
+                // JS error).
+                let method = methods
+                    .iter()
+                    .find(|m| m.number_of_parameters() == args.len())
+                    .unwrap_or(&methods[0]);
                 crate::napi_engine::invoke::invoke_static_method(
-                    env, &m_class, &method, is_sealed, &args,
+                    env, &m_class, method, is_sealed, &args,
                 )
                 .map_err(napi_err)
             })?;
@@ -1216,16 +1231,18 @@ pub fn create_instance_proxy(
             return undefined_js(env);
         }
 
-        // Class instance path. Resolve the method declaration once, at closure-build time —
-        // the returned function then skips the per-call name→metadata walk entirely.
-        let (resolved_method, method_is_sealed) = {
+        // Class instance path. Resolve every same-named overload once, at closure-build time.
+        // The returned function then skips the per-call name→metadata walk entirely, but still
+        // picks among overloads by arity on each call (see the static-method site above for why:
+        // same WinRT pattern, same wrong-vtable-slot crash otherwise).
+        let (resolved_methods, method_is_sealed) = {
             let lock = get_state.declaration.read();
             match lock.as_any().downcast_ref::<ClassDeclaration>() {
-                Some(c) => (find_class_method(c, &prop), c.is_sealed()),
-                None => (None, true),
+                Some(c) => (find_class_methods(c, &prop), c.is_sealed()),
+                None => (Vec::new(), true),
             }
         };
-        if let Some(method) = resolved_method {
+        if !resolved_methods.is_empty() {
             let m_state = get_state.clone();
             let f = env.create_function_from_closure(&prop.clone(), move |ctx: CallContext| {
                 let env = &ctx.env;
@@ -1233,10 +1250,14 @@ pub fn create_instance_proxy(
                 for i in 0..ctx.length {
                     args.push(ctx.get::<JsUnknown>(i)?);
                 }
+                let method = resolved_methods
+                    .iter()
+                    .find(|m| m.number_of_parameters() == args.len())
+                    .unwrap_or(&resolved_methods[0]);
                 crate::napi_engine::invoke::invoke_instance_method_owned(
                     env,
                     m_state.instance.clone(),
-                    &method,
+                    method,
                     method_is_sealed,
                     &args,
                 )
