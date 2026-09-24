@@ -1,4 +1,4 @@
-//! `@nativescript/windows-v8` — NativeScript Windows runtime on V8.
+//! `@nativescript/windows-v8`: NativeScript Windows runtime on V8.
 //!
 //! Reuses napi-android's `v8-api.cpp` (napi over V8's C++ API) compiled against the `v8` crate's
 //! bundled rusty_v8 (V8 14.7). Our v8 crate uses the default config (no pointer compression / no
@@ -21,10 +21,20 @@ pub mod ffi {
             file: *const c_char,
             result: *mut napi_value,
         ) -> i32;
-        /// Microtask checkpoint (PerformMicrotaskCheckpoint) — the event loop's drain hook.
+        /// Microtask checkpoint (PerformMicrotaskCheckpoint): the event loop's drain hook.
         pub fn js_execute_pending_jobs(env: napi_env) -> i32;
+        /// Run an entry ES module; errors are reported through `esm::ns_esm_report_error`.
+        pub fn js_run_module(env: napi_env, source: *const c_char, key: *const c_char) -> i32;
+        pub fn js_esm_evict(key: *const c_char) -> i32;
+        pub fn js_esm_for_each_key(
+            visit: extern "C" fn(key: *const c_char, user: *mut std::ffi::c_void),
+            user: *mut std::ffi::c_void,
+        );
     }
 }
+
+/// The module loader's Rust callbacks (see `csrc/win_jsr.cpp`).
+pub mod esm;
 
 /// V8's fatal/OOM error handler (registered by `win_jsr.cpp`): logs to the trace log before the
 /// process goes down, since a packaged app has no visible stdout/stderr for V8's own CHECK-failure
@@ -56,7 +66,7 @@ pub mod abi;
 /// The three engine-specific pieces the `nativescript.dll` adapter needs: create the V8 engine +
 /// its `napi_env`, evaluate a script string, and drain the microtask queue. Mirrors the QuickJS
 /// package's `shim` surface (`shared_env_ptr` / `run_script_checked` / `drain_microtasks`) so
-/// `abi.rs` reads the same across engines. Gated behind `host_dll` — the standalone bin (`main.rs`)
+/// `abi.rs` reads the same across engines. Gated behind `host_dll`: the standalone bin (`main.rs`)
 /// keeps its own copies so the validated host path is untouched.
 #[cfg(feature = "host_dll")]
 pub mod host {
@@ -81,7 +91,7 @@ pub mod host {
             }
             unsafe {
                 // The shim's C++ can't link NewDefaultPlatform's libc++ unique_ptr, so drive the
-                // V8 platform init from rusty_v8 — before js_create_runtime creates an isolate.
+                // V8 platform init from rusty_v8: before js_create_runtime creates an isolate.
                 let platform = v8::new_default_platform(0, false).make_shared();
                 v8::V8::initialize_platform(platform);
                 v8::V8::initialize();
@@ -144,7 +154,16 @@ pub mod host {
         }
     }
 
-    /// Run V8's microtask checkpoint (promise reactions) — the event loop's drain hook.
+    /// Run `code` as the entry ES module registered under `key`. Errors are already reported
+    /// (trace log + last JS error) by the loader; `false` only says the graph didn't start.
+    pub fn run_module(raw: *mut c_void, code: &str, key: &str) -> bool {
+        let (Ok(code), Ok(key)) = (CString::new(code), CString::new(key)) else {
+            return false;
+        };
+        unsafe { ffi::js_run_module(raw as napi::sys::napi_env, code.as_ptr(), key.as_ptr()) == 0 }
+    }
+
+    /// Run V8's microtask checkpoint (promise reactions): the event loop's drain hook.
     pub fn drain_microtasks(raw: *mut c_void) {
         unsafe {
             ffi::js_execute_pending_jobs(raw as napi::sys::napi_env);

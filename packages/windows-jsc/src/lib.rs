@@ -1,8 +1,8 @@
-//! `@nativescript/windows-jsc` — NativeScript Windows runtime on JavaScriptCore.
+//! `@nativescript/windows-jsc`: NativeScript Windows runtime on JavaScriptCore.
 //!
 //! The napi provider is napi-android's JSC shim (`vendor/shim/jsc-api.cpp` + `jsr.cpp`), which is
 //! implemented purely over JavaScriptCore's **public C API** (`<JavaScriptCore/JavaScript.h>`), so
-//! it compiles against just the vendored public headers — no WebKit internals or WTF. `build.rs`
+//! it compiles against just the vendored public headers: no WebKit internals or WTF. `build.rs`
 //! compiles it (this verifies the MSVC port with no engine binary present). The runnable bin needs
 //! a real `JavaScriptCore.dll`/`.lib` in `vendor/x64` (feature `jsc_link`); see the package README.
 
@@ -30,6 +30,22 @@ pub mod ffi {
     }
 }
 
+/// Evaluate `code` as a script named `filename` for the module runner, returning its completion
+/// value. On failure JSC's exception is left pending.
+#[cfg(feature = "jsc_link")]
+pub fn eval_named(env: &napi::Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    use napi::NapiRaw;
+    let (Ok(source), Ok(file)) = (env.create_string(code), std::ffi::CString::new(filename)) else {
+        return Err(());
+    };
+    let mut result: napi::sys::napi_value = std::ptr::null_mut();
+    let status = unsafe { ffi::js_execute_script(env.raw(), source.raw(), file.as_ptr(), &mut result) };
+    if status != 0 || result.is_null() {
+        return Err(());
+    }
+    Ok(result)
+}
+
 // The `nativescript.dll` C ABI (WinUI 3 host DLL), compiled only under the `host_dll` feature
 // (which enables `jsc_link`, so a real JavaScriptCore.{lib,dll} must be present in vendor/x64).
 #[cfg(feature = "host_dll")]
@@ -38,7 +54,7 @@ pub mod abi;
 /// The three engine-specific pieces the `nativescript.dll` adapter needs: create the JSC engine +
 /// its `napi_env`, evaluate a script string, and drain microtasks. Mirrors the QuickJS package's
 /// `shim` surface (`shared_env_ptr` / `run_script_checked` / `drain_microtasks`) so `abi.rs` reads
-/// the same across engines. Gated behind `host_dll` — the standalone bin (`main.rs`) keeps its own
+/// the same across engines. Gated behind `host_dll`: the standalone bin (`main.rs`) keeps its own
 /// copies so the validated host path is untouched.
 #[cfg(feature = "host_dll")]
 pub mod host {

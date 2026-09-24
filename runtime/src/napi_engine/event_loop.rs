@@ -1,4 +1,4 @@
-//! The standalone host event loop — the piece that turns a bare engine + napi_env into an app
+//! The standalone host event loop: the piece that turns a bare engine + napi_env into an app
 //! runtime. One iteration: drain engine microtasks, pump the Windows message queue (STA WinRT
 //! async completions and cross-apartment delegate invokes arrive as messages), fire due timers,
 //! then sleep until the next timer or message.
@@ -60,6 +60,8 @@ pub fn install_loop_natives(env: &Env) -> napi::Result<()> {
 pub fn pump_once<F: FnMut()>(env: &Env, drain_microtasks: &mut F) {
     drain_microtasks();
     crate::pump_messages();
+    drain_microtasks();
+    crate::napi_engine::websocket::pump(env);
     drain_microtasks();
     timers::run_due_timers(env);
     drain_microtasks();

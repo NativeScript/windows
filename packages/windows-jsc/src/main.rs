@@ -1,4 +1,4 @@
-//! Standalone host — the NativeScript Windows runtime on **JavaScriptCore**, no Node.
+//! Standalone host: the NativeScript Windows runtime on **JavaScriptCore**, no Node.
 //! Built only with `--features jsc_link` (needs a real JavaScriptCore.dll/.lib in vendor/x64).
 //! The JSC shim (statically linked) dllexports `napi_*`, so `napi::sys::setup()`'s GetProcAddress
 //! -on-the-exe lookup finds them (same as the QuickJS package; no forwarders like Hermes needs).
@@ -74,6 +74,10 @@ fn main() {
         }
 
         let _ = run_script(&env, ns_windows_common::url_polyfill::POLYFILL); // URL/URLSearchParams
+        // Before the prelude, which builds `__nsModuleBuiltin` over the runner's natives.
+        if let Err(e) = runtime::napi_engine::module_runner::install(&env, eval_for_modules) {
+            eprintln!("module runner install failed: {e}");
+        }
         let _ = run_script(&env, ns_windows_common::prelude::PRELUDE); // queueMicrotask + NSWinRT
         let drain = || {
             // No-op in the JSC shim (JSC drains microtasks when the VM returns to the host);
@@ -81,9 +85,18 @@ fn main() {
             ffi::js_execute_pending_jobs(env_raw);
         };
 
-        // App mode: `nativescript-windows <script.js>` — run the script, then drive the event
+        // App mode: `nativescript-windows <script.js>`: run the script, then drive the event
         // loop (timers, WinRT async completions, microtasks) until the app goes idle.
         if let Some(path) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
+            // An ES-module app (`<entry>.mjs`) goes through the module runner.
+            if path.ends_with(".mjs") {
+                if let Err(e) = runtime::napi_engine::module_runner::run_entry(&env, &path, "") {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                runtime::napi_engine::event_loop::run_event_loop(&env, drain, None);
+                return;
+            }
             let code = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -145,4 +158,9 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The engine's script evaluator for the module runner (`runtime::napi_engine::module_runner`).
+fn eval_for_modules(env: &Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    windows_jsc::eval_named(env, code, filename)
 }

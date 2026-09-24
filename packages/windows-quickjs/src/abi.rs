@@ -1,4 +1,4 @@
-//! `nativescript.dll` C ABI for the QuickJS engine — the WinUI 3 .NET host P/Invokes exactly this
+//! `nativescript.dll` C ABI for the QuickJS engine: the WinUI 3 .NET host P/Invokes exactly this
 //! surface (`runtime_init`, `runtime_runscript`, `runtime_pump_timers`, …), identical to the
 //! classic V8 runtime's DLL, so an app swaps `@nativescript/windows` for
 //! `@nativescript/windows-quickjs` with no code change. Built into the cdylib only under the
@@ -7,7 +7,7 @@
 //!
 //! This is the reference implementation of the engine → DLL adapter. The engine-neutral work
 //! (WinRT init, globals, `Windows` namespace, event-loop turn) lives in
-//! `runtime::napi_engine::host_abi`; only the three engine-specific pieces are wired here —
+//! `runtime::napi_engine::host_abi`; only the three engine-specific pieces are wired here:
 //! creating the env (`shim::shared_env_ptr`), evaluating a script (`shim::run_script_checked`),
 //! and draining microtasks (`shim::drain_microtasks`). The other engine packages follow this same
 //! shape with their own shim.
@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 use napi::Env;
-use runtime::napi_engine::host_abi;
+use runtime::napi_engine::{host_abi, module_runner};
 
 use crate::shim;
 
@@ -25,6 +25,8 @@ thread_local! {
     /// takes no handle (the classic ABI is stateless there), so the env is kept thread-local for
     /// the pump to reach it.
     static HOST_ENV: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    /// `app_root` from `runtime_init`, which a relative entry-module name resolves against.
+    static APP_ROOT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 fn host_env() -> Option<*mut c_void> {
@@ -61,6 +63,10 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
             runtime::debug_output(&format!("[NativeScript] runtime_init: initialize_runtime() failed: {e}\n"));
             return 0;
         }
+        // Before the prelude, which builds `__nsModuleBuiltin` over the runner's natives.
+        if let Err(e) = module_runner::install(&env, eval_for_modules) {
+            runtime::store_last_js_error(format!("[module_runner] {e}"));
+        }
         // Engine-specific JS setup that needs the engine's own eval: URL polyfill + runtime prelude
         // (queueMicrotask + NSWinRT.toPromise over the loop keep-alive natives).
         if let Err(e) = shim::run_script_checked(raw, ns_windows_common::url_polyfill::POLYFILL) {
@@ -73,6 +79,7 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
         }
 
         HOST_ENV.with(|c| c.set(raw));
+        APP_ROOT.with(|r| *r.borrow_mut() = app_root);
         runtime::debug_output("[NativeScript] runtime_init: initialize_runtime OK, HOST_ENV set\n");
         // A stable non-zero token; per-instance state is process-global for QuickJS (one leaked
         // runtime), so the handle only needs to be truthy and round-trip through the host.
@@ -105,7 +112,7 @@ pub extern "C" fn runtime_deinit(_runtime: i64) {
 pub extern "C" fn runtime_runscript(
     _runtime: i64,
     script: *const c_char,
-    _filename: *const c_char,
+    filename: *const c_char,
 ) {
     if script.is_null() {
         runtime::debug_output("[NativeScript] runtime_runscript: script is null\n");
@@ -115,6 +122,9 @@ pub extern "C" fn runtime_runscript(
         match host_env() {
             Some(raw) => {
                 let code = CStr::from_ptr(script).to_string_lossy();
+                if run_module_entry(raw, filename, &code) {
+                    return;
+                }
                 runtime::debug_output(&format!(
                     "[NativeScript] runtime_runscript: executing {} bytes\n",
                     code.len()
@@ -148,6 +158,30 @@ pub extern "C" fn runtime_runscript(
         };
         runtime::debug_output(&format!("[NativeScript] runtime_runscript: PANICKED: {msg}\n"));
     }
+}
+
+/// QuickJS's script evaluator for the module runner (`runtime::napi_engine::module_runner`).
+fn eval_for_modules(env: &Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    shim::eval_named(env, code, filename).map(|v| v as napi::sys::napi_value)
+}
+
+/// An ES-module entry (Vite's bundle.mjs) goes through the module runner; its imports resolve
+/// relative to its full path. False for a classic script.
+unsafe fn run_module_entry(raw: *mut c_void, filename: *const c_char, code: &str) -> bool {
+    let filename = if filename.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(filename).to_string_lossy().into_owned()
+    };
+    if !runtime::esm_loader::is_module_entry(&filename, code) {
+        return false;
+    }
+    let env = Env::from_raw(raw as napi::sys::napi_env);
+    let started = APP_ROOT.with(|r| module_runner::run_entry(&env, &filename, &r.borrow()));
+    if let Err(e) = started {
+        runtime::store_last_js_error(format!("[module_runner] {e}"));
+    }
+    true
 }
 
 /// Drive one turn of the event loop (timers, WinRT async completions, microtasks). The WinUI 3
@@ -200,6 +234,14 @@ pub extern "C" fn runtime_set_bundle_key(key_hex: *const c_char) -> c_int {
     }
     let hex = unsafe { CStr::from_ptr(key_hex) }.to_string_lossy();
     runtime::source_protect::set_custom_key_hex(hex.as_ref()) as c_int
+}
+
+/// Debug hosts (the app's Debug build) always allow dev-server modules, which Vite HMR serves over
+/// HTTP; release builds need `security.allowRemoteModules`. The classic runtime derives this from
+/// its devtools build. Call before `runtime_runscript`.
+#[no_mangle]
+pub extern "C" fn runtime_set_debug_build(debug: c_int) {
+    runtime::esm_http::set_debug_build(debug != 0);
 }
 
 #[no_mangle]

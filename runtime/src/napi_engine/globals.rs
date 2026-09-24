@@ -86,17 +86,20 @@ pub fn install_globals(env: &Env) -> napi::Result<()> {
     // next to the app).
     crate::napi_engine::dotnet::install_dotnet(env)?;
 
-    // NSWinRT.asDelegate(typeName, fn) — wraps a JS function as a COM-backed WinRT delegate.
+    // NSWinRT.asDelegate(typeName, fn): wraps a JS function as a COM-backed WinRT delegate.
     crate::napi_engine::delegate::install_as_delegate(env)?;
 
     // NSWinRT.makeItemsSource/extendItemsSource/insertItemsSource/removeItemsSource/
-    // updateItemsSource/resetItemsSource — the native IObservableVector<IInspectable> ItemsSource
+    // updateItemsSource/resetItemsSource: the native IObservableVector<IInspectable> ItemsSource
     // core's ListView (ui/list-view/index.windows.js) requires on Windows.
     crate::napi_engine::items_source::install_items_source(env)?;
 
     // Timers + event-loop keep-alive for standalone hosts (install-if-missing: on Node/Bun/Deno
     // the host's timers win and the keep-alive natives are simply never consulted).
     crate::napi_engine::timers::install_timers(env)?;
+    // Native WebSocket natives (the prelude's WHATWG `WebSocket` wraps them); events are
+    // delivered by the event loop.
+    crate::napi_engine::websocket::install_websocket(env)?;
     crate::napi_engine::event_loop::install_loop_natives(env)?;
     Ok(())
 }

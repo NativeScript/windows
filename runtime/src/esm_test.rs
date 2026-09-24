@@ -80,16 +80,16 @@ fn missing_import_reports_cannot_find_module() {
 }
 
 #[test]
-fn http_import_explains_hmr_is_unsupported() {
-    let dir = app_dir(
-        "http",
-        &[("bundle.mjs", "import 'http://127.0.0.1:5173/ns/core/index.js';")],
-    );
+fn unreachable_http_import_reports_the_url() {
+    // A port nothing listens on, so a running dev server can't answer the import.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/ns/core/index.js");
+    let dir = app_dir("http", &[("bundle.mjs", &format!("import '{url}';"))]);
     let mut runtime = Runtime::new(".");
     let _ = crate::get_last_js_error();
     run_entry(&mut runtime, &dir, "bundle.mjs");
     let err = crate::get_last_js_error().expect("http import must be reported");
-    assert!(err.contains("from disk only"), "{err}");
+    assert!(err.contains(&format!("HTTP import failed: {url}")), "{err}");
 }
 
 #[test]

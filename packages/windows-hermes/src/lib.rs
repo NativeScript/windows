@@ -1,4 +1,4 @@
-//! `@nativescript/windows-hermes` — NativeScript Windows runtime on Microsoft's prebuilt Hermes.
+//! `@nativescript/windows-hermes`: NativeScript Windows runtime on Microsoft's prebuilt Hermes.
 //!
 //! Hermes ships no compilable shim (unlike QuickJS/V8/JSC): `hermes.dll` already exports the JSR
 //! C API (`jsr_create_runtime`, `jsr_runtime_get_node_api_env`, …) and a full `napi_*` surface.
@@ -43,7 +43,7 @@ pub mod ffi {
 /// `None` on failure.
 ///
 /// Explicit microtasks: without this Hermes schedules promise reactions through a host-provided
-/// `setImmediate` (the React Native model), which a bare engine doesn't have — promises would
+/// `setImmediate` (the React Native model), which a bare engine doesn't have: promises would
 /// throw on settle. With it, reactions queue as microtasks that [`drain_microtasks`] runs.
 ///
 /// # Safety
@@ -65,6 +65,21 @@ pub unsafe fn create_runtime_env() -> Option<(*mut c_void, napi_env, *mut c_void
         return None;
     }
     Some((runtime, env_raw, scope))
+}
+
+/// Evaluate `code` as a script named `filename` for the module runner, returning its completion
+/// value. On failure Hermes's exception is left pending.
+pub fn eval_named(env: &napi::Env, code: &str, filename: &str) -> Result<napi_value, ()> {
+    use napi::NapiRaw;
+    let (Ok(source), Ok(url)) = (env.create_string(code), std::ffi::CString::new(filename)) else {
+        return Err(());
+    };
+    let mut result: napi_value = std::ptr::null_mut();
+    let status = unsafe { ffi::jsr_run_script(env.raw(), source.raw(), url.as_ptr(), &mut result) };
+    if status != napi::sys::Status::napi_ok || result.is_null() {
+        return Err(());
+    }
+    Ok(result)
 }
 
 /// Evaluate `code` and return the completion value coerced to a string, or the thrown exception's
@@ -97,7 +112,7 @@ pub fn run_script(env: &napi::Env, code: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Run Hermes's microtask queue to exhaustion (promise reactions) — the event loop's drain hook.
+/// Run Hermes's microtask queue to exhaustion (promise reactions): the event loop's drain hook.
 pub fn drain_microtasks(env_raw: napi_env) {
     unsafe {
         let mut more = false;
@@ -143,7 +158,7 @@ pub mod host {
         super::run_script(&env, code)
     }
 
-    /// Drain Hermes's microtask queue — the event loop's drain hook.
+    /// Drain Hermes's microtask queue: the event loop's drain hook.
     pub fn drain_microtasks(raw: *mut c_void) {
         super::drain_microtasks(raw as napi::sys::napi_env);
     }

@@ -43,7 +43,7 @@ pub fn eval_string(code: &str) -> Option<String> {
 }
 
 /// The napi-android node_api provider over quickjs-ng (quickjs-api.c + jsr.cpp), exercised
-/// through the standard `napi_*` C ABI — proving the standalone Node-API provider works on
+/// through the standard `napi_*` C ABI: proving the standalone Node-API provider works on
 /// Windows. This is what a standalone host + the engine-neutral `runtime::napi_engine` layer
 /// will run against (no Node required).
 #[cfg(feature = "napi_shim")]
@@ -138,6 +138,23 @@ pub mod shim {
         }
     }
 
+    /// Evaluate `code` as a script named `filename` for the module runner, returning its
+    /// completion value. On failure QuickJS's exception is left pending.
+    pub fn eval_named(env: &napi::Env, code: &str, filename: &str) -> Result<NapiValue, ()> {
+        use napi::NapiRaw;
+        let (Ok(source), Ok(file)) = (env.create_string(code), CString::new(filename)) else {
+            return Err(());
+        };
+        let mut result: NapiValue = std::ptr::null_mut();
+        let status = unsafe {
+            qjs_execute_script(env.raw() as NapiEnv, source.raw() as NapiValue, file.as_ptr(), &mut result)
+        };
+        if status != 0 || result.is_null() {
+            return Err(());
+        }
+        Ok(result)
+    }
+
     // One leaked runtime+env for the process (as a real host would keep). Avoids repeated
     // create/free cycles of the engine + shim global caches. Single-threaded use only.
     fn shared_env() -> NapiEnv {
@@ -171,7 +188,7 @@ pub mod shim {
         shared_env()
     }
 
-    /// Run QuickJS's pending-job queue to exhaustion (promise reactions) — the standalone event
+    /// Run QuickJS's pending-job queue to exhaustion (promise reactions): the standalone event
     /// loop's microtask drain hook.
     pub fn drain_microtasks(env: NapiEnv) {
         unsafe {
@@ -228,7 +245,7 @@ pub mod shim {
                 let mut i = 0i32;
                 napi_get_value_int32(env, result, &mut i);
                 // Coerce to string, then copy into a zeroed buffer. NB: this shim leaves the
-                // out-length (`written`) at 0 even on success, but null-terminates the buffer —
+                // out-length (`written`) at 0 even on success, but null-terminates the buffer:
                 // so read it as a C string rather than trusting the length.
                 let mut buf = vec![0u8; 8192];
                 let mut written = 0usize;
@@ -253,7 +270,7 @@ pub mod shim {
         }
     }
 
-    /// Prove napi-rs's high-level `Env` API operates against the shim's `napi_env` — the exact
+    /// Prove napi-rs's high-level `Env` API operates against the shim's `napi_env`: the exact
     /// bridge `runtime::napi_engine` relies on. If this works, the standalone host is just
     /// `Env::from_raw(shim_env)` → `napi_engine::install_globals` + run.
     pub fn napi_rs_bridge_probe() -> napi::Result<String> {
@@ -281,7 +298,7 @@ pub mod shim {
         global.set_named_property("__add1", f)?;
 
         // Read the property back through the ENGINE (script sees what napi-rs set), and call
-        // the Rust closure from JS — round-tripping napi-rs ⇄ shim ⇄ engine.
+        // the Rust closure from JS: round-tripping napi-rs ⇄ shim ⇄ engine.
         let out = run_script(raw as *mut std::ffi::c_void, "__probe + ':' + __add1(41)")
             .unwrap_or_default();
         Ok(out)
@@ -316,7 +333,7 @@ pub mod shim {
         proxy_ctor.new_instance(&[t, h])
     }
 
-    /// Deep-nesting repro: `__deep.a.b(5)` — two proxy levels then a leaf fn, matching the
+    /// Deep-nesting repro: `__deep.a.b(5)`: two proxy levels then a leaf fn, matching the
     /// runtime's `Windows.Data.Json.JsonValue.CreateNumberValue(5)` shape.
     pub fn deep_nested_probe() -> napi::Result<String> {
         use napi::{NapiRaw, NapiValue};
@@ -382,7 +399,7 @@ pub mod shim {
 
         #[test]
         fn deep_nested_call() {
-            // Two proxy levels then a leaf fn, called — matches the runtime host's shape.
+            // Two proxy levels then a leaf fn, called: matches the runtime host's shape.
             let out = deep_nested_probe().expect("deep nested probe failed");
             assert_eq!(out, "905");
         }

@@ -9,7 +9,7 @@ description = "NativeScript Windows runtime on JavaScriptCore (napi-android JSC 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-# The runnable bin needs a real JavaScriptCore.lib in vendor/x64 — gated so the shim still
+# The runnable bin needs a real JavaScriptCore.lib in vendor/x64: gated so the shim still
 # compile-verifies (cargo build --lib) without the engine binary present.
 [[bin]]
 name = "nativescript-windows"
@@ -27,8 +27,8 @@ host_dll = ["jsc_link"]
 
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
-runtime = { path = "../../runtime", features = ["napi_engine"], optional = true }
-# Shared JS prelude + URL polyfill — used by both the cdylib (abi.rs) and the demo bin (main.rs).
+runtime = { path = "../../runtime", features = ["napi_engine", "module_runner"], optional = true }
+# Shared JS prelude + URL polyfill: used by both the cdylib (abi.rs) and the demo bin (main.rs).
 ns-windows-common = { path = "../common", optional = true }
 # Crash reporter + self-test harness for the demo bin (main.rs) only.
 ns-windows-demo = { path = "../demo", optional = true }

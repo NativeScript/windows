@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [features]
 # `icu` defaults on: the smaller `uwp/x64` build it trades in for has no package identity, so it
-# fails to load in the standalone `nativescript-windows` bin (STATUS_DLL_NOT_FOUND — confirmed, not
+# fails to load in the standalone `nativescript-windows` bin (STATUS_DLL_NOT_FOUND: confirmed, not
 # hypothetical; see vendor/README.md). Build with `--no-default-features` only for an MSIX-packaged
 # `host_dll` target where that's verified to work.
 default = ["icu"]
@@ -29,9 +29,9 @@ host_dll = []
 icu = []
 
 [dependencies]
-runtime = { path = "../../runtime", features = ["napi_engine"] }
+runtime = { path = "../../runtime", features = ["napi_engine", "module_runner"] }
 napi = { version = "2", default-features = false, features = ["napi8"] }
-# Shared JS prelude + URL polyfill — used by both the cdylib (abi.rs) and the demo bin (main.rs).
+# Shared JS prelude + URL polyfill: used by both the cdylib (abi.rs) and the demo bin (main.rs).
 ns-windows-common = { path = "../common" }
 # Crash reporter + self-test harness for the demo bin (main.rs) only.
 ns-windows-demo = { path = "../demo" }

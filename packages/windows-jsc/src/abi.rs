@@ -1,4 +1,4 @@
-//! `nativescript.dll` C ABI for the JavaScriptCore engine — the WinUI 3 .NET host P/Invokes
+//! `nativescript.dll` C ABI for the JavaScriptCore engine: the WinUI 3 .NET host P/Invokes
 //! exactly this surface (`runtime_init`, `runtime_runscript`, `runtime_pump_timers`, …), identical
 //! to the classic V8 runtime's DLL, so an app swaps `@nativescript/windows` for
 //! `@nativescript/windows-jsc` with no code change. Built into the cdylib only under the
@@ -14,7 +14,7 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 use napi::Env;
-use runtime::napi_engine::host_abi;
+use runtime::napi_engine::{host_abi, module_runner};
 
 use crate::host;
 
@@ -23,6 +23,8 @@ thread_local! {
     /// no handle (the classic ABI is stateless there), so the env is kept thread-local for the
     /// pump to reach it.
     static HOST_ENV: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    /// `app_root` from `runtime_init`, which a relative entry-module name resolves against.
+    static APP_ROOT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 fn host_env() -> Option<*mut c_void> {
@@ -61,6 +63,10 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
         if host_abi::initialize_runtime(&env, &app_root).is_err() {
             return 0;
         }
+        // Before the prelude, which builds `__nsModuleBuiltin` over the runner's natives.
+        if let Err(e) = module_runner::install(&env, eval_for_modules) {
+            runtime::store_last_js_error(format!("[module_runner] {e}"));
+        }
         // Engine-specific JS setup that needs the engine's own eval: URL polyfill + runtime prelude
         // (queueMicrotask + NSWinRT.toPromise over the loop keep-alive natives).
         if let Err(e) = host::run_script_checked(raw, ns_windows_common::url_polyfill::POLYFILL) {
@@ -71,6 +77,7 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
         }
 
         HOST_ENV.with(|c| c.set(raw));
+        APP_ROOT.with(|r| *r.borrow_mut() = app_root);
         // A stable non-zero token; per-instance state is process-global (one leaked runtime), so
         // the handle only needs to be truthy and round-trip through the host.
         1
@@ -89,7 +96,7 @@ pub extern "C" fn runtime_deinit(_runtime: i64) {
 pub extern "C" fn runtime_runscript(
     _runtime: i64,
     script: *const c_char,
-    _filename: *const c_char,
+    filename: *const c_char,
 ) {
     if script.is_null() {
         return;
@@ -97,12 +104,39 @@ pub extern "C" fn runtime_runscript(
     let _ = std::panic::catch_unwind(|| unsafe {
         if let Some(raw) = host_env() {
             let code = CStr::from_ptr(script).to_string_lossy();
+            if run_module_entry(raw, filename, &code) {
+                return;
+            }
             if let Err(e) = host::run_script_checked(raw, &code) {
                 eprintln!("[NativeScript] script error: {e}");
                 runtime::store_last_js_error(e);
             }
         }
     });
+}
+
+/// JSC's script evaluator for the module runner (`runtime::napi_engine::module_runner`).
+fn eval_for_modules(env: &Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    crate::eval_named(env, code, filename)
+}
+
+/// An ES-module entry (Vite's bundle.mjs) goes through the module runner; its imports resolve
+/// relative to its full path. False for a classic script.
+unsafe fn run_module_entry(raw: *mut c_void, filename: *const c_char, code: &str) -> bool {
+    let filename = if filename.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(filename).to_string_lossy().into_owned()
+    };
+    if !runtime::esm_loader::is_module_entry(&filename, code) {
+        return false;
+    }
+    let env = Env::from_raw(raw as napi::sys::napi_env);
+    let started = APP_ROOT.with(|r| module_runner::run_entry(&env, &filename, &r.borrow()));
+    if let Err(e) = started {
+        runtime::store_last_js_error(format!("[module_runner] {e}"));
+    }
+    true
 }
 
 /// Drive one turn of the event loop (timers, WinRT async completions, microtasks). The WinUI 3
@@ -155,6 +189,14 @@ pub extern "C" fn runtime_set_bundle_key(key_hex: *const c_char) -> c_int {
     }
     let hex = unsafe { CStr::from_ptr(key_hex) }.to_string_lossy();
     runtime::source_protect::set_custom_key_hex(hex.as_ref()) as c_int
+}
+
+/// Debug hosts (the app's Debug build) always allow dev-server modules, which Vite HMR serves over
+/// HTTP; release builds need `security.allowRemoteModules`. The classic runtime derives this from
+/// its devtools build. Call before `runtime_runscript`.
+#[no_mangle]
+pub extern "C" fn runtime_set_debug_build(debug: c_int) {
+    runtime::esm_http::set_debug_build(debug != 0);
 }
 
 #[no_mangle]

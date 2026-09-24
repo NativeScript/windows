@@ -7,6 +7,9 @@
 //! pump (the host drives it from its render/heartbeat loop), so JS is only ever called on the JS
 //! thread. `send` runs on the JS thread; `close` sends the close frame without waiting, and the
 //! receive loop reports the resulting close.
+//!
+//! The socket threads and event channel (`connect` / `send` / `shutdown` / `take_events`) are
+//! engine-neutral; the napi engines bind the same natives in `napi_engine::websocket`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,7 +29,7 @@ use windows::Win32::Networking::WinHttp::{
 use crate::winhttp::Handle;
 use crate::DELEGATE_ISOLATE_PTR;
 
-enum Event {
+pub(crate) enum Event {
     Open(String),
     Text(String),
     Binary(Vec<u8>),
@@ -54,15 +57,65 @@ thread_local! {
 /// Called from `Runtime::drop` while the isolate is alive.
 pub(crate) fn clear_thread_sockets() {
     let ids: Vec<i32> = CALLBACKS.with(|c| c.borrow_mut().drain().map(|(id, _)| id).collect());
+    drop_sockets(&ids);
+}
+
+/// Close (1001, going away) and forget sockets whose JS side is gone.
+pub(crate) fn drop_sockets(ids: &[i32]) {
     if let Ok(mut map) = sockets().lock() {
         for id in ids {
-            if let Some(s) = map.remove(&id) {
+            if let Some(s) = map.remove(id) {
                 unsafe {
                     let _ = WinHttpWebSocketShutdown(s.ws.raw(), 1001, None, 0);
                 }
             }
         }
     }
+}
+
+/// Start connecting `url` on its own thread. Its events arrive, tagged with the returned id,
+/// through `take_events` on this (the JS) thread.
+pub(crate) fn connect(url: String, protocols: Vec<String>) -> i32 {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let tx = CHANNEL.with(|(tx, _)| tx.clone());
+    std::thread::Builder::new()
+        .name(format!("ns-websocket-{id}"))
+        .spawn(move || run_socket(id, url, protocols, tx))
+        .ok();
+    id
+}
+
+/// Send one text or binary message. False when the socket isn't open.
+pub(crate) fn send(id: i32, bytes: &[u8], binary: bool) -> bool {
+    let Some(socket) = sockets().lock().ok().and_then(|m| m.get(&id).cloned()) else {
+        return false;
+    };
+    let kind = if binary {
+        WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
+    } else {
+        WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE
+    };
+    unsafe { WinHttpWebSocketSend(socket.ws.raw(), kind, Some(bytes)) == 0 }
+}
+
+/// Send the close frame without waiting; the receive loop reports the resulting close.
+pub(crate) fn shutdown(id: i32, code: u16, reason: &str) {
+    let reason = &reason.as_bytes()[..reason.len().min(123)];
+    if let Some(socket) = sockets().lock().ok().and_then(|m| m.get(&id).cloned()) {
+        unsafe {
+            let _ = WinHttpWebSocketShutdown(
+                socket.ws.raw(),
+                code,
+                if reason.is_empty() { None } else { Some(reason.as_ptr() as *const c_void) },
+                reason.len() as u32,
+            );
+        }
+    }
+}
+
+/// Socket events queued since the last call, in arrival order.
+pub(crate) fn take_events() -> Vec<(i32, Event)> {
+    CHANNEL.with(|(_, rx)| rx.try_iter().collect())
 }
 
 fn run_socket(id: i32, url: String, protocols: Vec<String>, tx: Sender<(i32, Event)>) {
@@ -156,14 +209,9 @@ pub(crate) fn handle_open(
     let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(2)) else {
         return;
     };
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let callback = v8::Global::new(scope, callback);
+    let id = connect(url, protocols);
     CALLBACKS.with(|c| c.borrow_mut().insert(id, callback));
-    let tx = CHANNEL.with(|(tx, _)| tx.clone());
-    std::thread::Builder::new()
-        .name(format!("ns-websocket-{id}"))
-        .spawn(move || run_socket(id, url, protocols, tx))
-        .ok();
     rv.set(v8::Integer::new(scope, id).into());
 }
 
@@ -175,29 +223,24 @@ pub(crate) fn handle_send(
     mut rv: v8::ReturnValue,
 ) {
     let id = args.get(0).int32_value(scope).unwrap_or(0);
-    let Some(socket) = sockets().lock().ok().and_then(|m| m.get(&id).cloned()) else {
-        rv.set(v8::Boolean::new(scope, false).into());
-        return;
-    };
     let data = args.get(1);
-    let (bytes, kind) = if data.is_string() {
-        (data.to_rust_string_lossy(scope).into_bytes(), WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE)
+    let (bytes, binary) = if data.is_string() {
+        (data.to_rust_string_lossy(scope).into_bytes(), false)
     } else if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(data) {
         let mut v = vec![0u8; view.byte_length()];
         view.copy_contents(&mut v);
-        (v, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE)
+        (v, true)
     } else if let Ok(ab) = v8::Local::<v8::ArrayBuffer>::try_from(data) {
         let len = ab.byte_length();
         let v = match ab.data() {
             Some(p) if len > 0 => unsafe { std::slice::from_raw_parts(p.as_ptr() as *const u8, len) }.to_vec(),
             _ => Vec::new(),
         };
-        (v, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE)
+        (v, true)
     } else {
-        (data.to_rust_string_lossy(scope).into_bytes(), WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE)
+        (data.to_rust_string_lossy(scope).into_bytes(), false)
     };
-    let err = unsafe { WinHttpWebSocketSend(socket.ws.raw(), kind, Some(&bytes)) };
-    rv.set(v8::Boolean::new(scope, err == 0).into());
+    rv.set(v8::Boolean::new(scope, send(id, &bytes, binary)).into());
 }
 
 /// `__nsWebSocketClose(id, code, reason)`.
@@ -209,17 +252,7 @@ pub(crate) fn handle_close(
     let id = args.get(0).int32_value(scope).unwrap_or(0);
     let code = args.get(1).uint32_value(scope).filter(|c| *c > 0).unwrap_or(1000) as u16;
     let reason = if args.get(2).is_undefined() { String::new() } else { args.get(2).to_rust_string_lossy(scope) };
-    let reason = &reason.as_bytes()[..reason.len().min(123)];
-    if let Some(socket) = sockets().lock().ok().and_then(|m| m.get(&id).cloned()) {
-        unsafe {
-            let _ = WinHttpWebSocketShutdown(
-                socket.ws.raw(),
-                code,
-                if reason.is_empty() { None } else { Some(reason.as_ptr() as *const c_void) },
-                reason.len() as u32,
-            );
-        }
-    }
+    shutdown(id, code, &reason);
 }
 
 fn str_val<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::Value> {
@@ -231,7 +264,7 @@ fn str_val<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::V
 
 /// Deliver queued socket events to JS. Runs from `timers::pump()` on the JS thread.
 pub(crate) fn pump() {
-    let events: Vec<(i32, Event)> = CHANNEL.with(|(_, rx)| rx.try_iter().collect());
+    let events = take_events();
     if events.is_empty() {
         return;
     }

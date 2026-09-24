@@ -1,7 +1,7 @@
 //! JS runtime prelude for the standalone hosts, evaluated after `install_globals` and the URL
 //! polyfill. Provides the pieces a bare engine lacks that are pure JS over the napi natives:
 //!   - `queueMicrotask` (over the engine's own promise queue) when the engine doesn't expose it,
-//!   - `NSWinRT.toPromise(op)` — converts a WinRT IAsyncOperation/IAsyncAction to a Promise
+//!   - `NSWinRT.toPromise(op)`: converts a WinRT IAsyncOperation/IAsyncAction to a Promise
 //!     (same idea as nswinrt.js's `toPromise` for the Node package). It holds the event loop
 //!     open via the `__nsLoopRetain`/`__nsLoopRelease` natives while an operation is
 //!     outstanding, so `await NSWinRT.toPromise(op)` "just works" under `run_event_loop`.
@@ -13,12 +13,104 @@ pub const PRELUDE: &str = r#"
 (function (g) {
   'use strict';
 
-  // Node-style `global` alias for `globalThis` — @nativescript/core and webpack `target: 'node'`
+  // Node-style `global` alias for `globalThis`: @nativescript/core and webpack `target: 'node'`
   // output both reference bare `global` (e.g. `global.foo = ...`). Classic rusty_v8 sets this via
   // `init_global` (a read-only own property); defined the same way here so it runs on every napi
   // engine.
   if (typeof g.global === 'undefined') {
     Object.defineProperty(g, 'global', { value: g, writable: false, configurable: true });
+  }
+
+  // DevTools host hooks @nativescript/core's debugger domains call at module evaluation
+  // (`@DomainDispatcher` decorators; a Vite dev build imports them unconditionally). The classic
+  // runtime backs them with its inspector; the napi engines have none, so dispatchers are only
+  // kept for inspection and events are dropped.
+  if (typeof g.__registerDomainDispatcher !== 'function') {
+    var domainDispatchers = {};
+    Object.defineProperty(g, '__nsInspectorDomainDispatchers', { value: domainDispatchers, configurable: true });
+    g.__registerDomainDispatcher = function (domain, dispatcher) {
+      domainDispatchers[String(domain)] = dispatcher;
+    };
+  }
+  if (typeof g.__inspectorSendEvent !== 'function') {
+    g.__inspectorSendEvent = function () {};
+  }
+  if (typeof g.__inspectorTimestamp !== 'function') {
+    g.__inspectorTimestamp = function () { return Date.now(); };
+  }
+
+  // WHATWG WebSocket over the native WinHTTP socket (runtime/src/websocket.rs, bound by
+  // napi_engine::websocket), as the classic runtime's HELPER_SOURCE defines it. Events are
+  // delivered on the JS thread by the event loop.
+  if (typeof g.WebSocket !== 'function' && typeof g.__nsWebSocketOpen === 'function') {
+    var WebSocket = function WebSocket(url, protocols) {
+      if (!(this instanceof WebSocket)) { throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator"); }
+      var href = String(url);
+      if (!/^wss?:\/\//i.test(href)) {
+        if (/^https?:\/\//i.test(href)) { href = href.replace(/^http/i, 'ws'); }
+        else { throw new SyntaxError("Failed to construct 'WebSocket': The URL '" + href + "' is invalid."); }
+      }
+      var list = protocols === undefined ? [] : (Array.isArray(protocols) ? protocols : [protocols]).map(String);
+      this.url = href;
+      this.protocol = '';
+      this.extensions = '';
+      this.readyState = 0;
+      this.bufferedAmount = 0;
+      this.binaryType = 'arraybuffer';
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+      this._listeners = {};
+      var self = this;
+      this._id = g.__nsWebSocketOpen(href, list, function (type, a, b, c) {
+        if (type === 'open') {
+          self.readyState = 1;
+          self.protocol = a || '';
+          self._emit({ type: 'open', target: self });
+        } else if (type === 'message') {
+          if (self.readyState === 1) { self._emit({ type: 'message', data: a, origin: self.url, target: self }); }
+        } else if (type === 'error') {
+          self._emit({ type: 'error', message: a, target: self });
+        } else if (type === 'close') {
+          self.readyState = 3;
+          self._emit({ type: 'close', code: a, reason: b || '', wasClean: !!c, target: self });
+        }
+      });
+    };
+    WebSocket.CONNECTING = WebSocket.prototype.CONNECTING = 0;
+    WebSocket.OPEN = WebSocket.prototype.OPEN = 1;
+    WebSocket.CLOSING = WebSocket.prototype.CLOSING = 2;
+    WebSocket.CLOSED = WebSocket.prototype.CLOSED = 3;
+    WebSocket.prototype._emit = function (event) {
+      var handler = this['on' + event.type];
+      if (typeof handler === 'function') { handler.call(this, event); }
+      var list = (this._listeners[event.type] || []).slice();
+      for (var i = 0; i < list.length; i++) {
+        try { list[i].call(this, event); } catch (e) { setTimeout(function () { throw e; }, 0); }
+      }
+    };
+    WebSocket.prototype.addEventListener = function (type, listener) {
+      if (typeof listener !== 'function') { return; }
+      var list = this._listeners[type] || (this._listeners[type] = []);
+      if (list.indexOf(listener) < 0) { list.push(listener); }
+    };
+    WebSocket.prototype.removeEventListener = function (type, listener) {
+      var list = this._listeners[type];
+      if (list) { var i = list.indexOf(listener); if (i >= 0) { list.splice(i, 1); } }
+    };
+    WebSocket.prototype.dispatchEvent = function (event) { this._emit(event); return true; };
+    WebSocket.prototype.send = function (data) {
+      if (this.readyState === 0) { throw new Error("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state."); }
+      if (this.readyState !== 1) { return; }
+      g.__nsWebSocketSend(this._id, data);
+    };
+    WebSocket.prototype.close = function (code, reason) {
+      if (this.readyState >= 2) { return; }
+      this.readyState = 2;
+      g.__nsWebSocketClose(this._id, code === undefined ? 1000 : code, reason === undefined ? '' : String(reason));
+    };
+    g.WebSocket = WebSocket;
   }
 
   if (typeof g.queueMicrotask !== 'function') {
@@ -96,7 +188,7 @@ pub const PRELUDE: &str = r#"
 })(globalThis);
 
 // CommonJS shim: webpack `target: 'node'` bundles (what NativeScript apps are built as) expect
-// `require`/`module`/`exports`/`__dirname`/`__filename` as globals — normally supplied by Node's
+// `require`/`module`/`exports`/`__dirname`/`__filename` as globals: normally supplied by Node's
 // own module wrapper. This runtime is not Node, so we supply them here the same way the classic
 // rusty_v8 runtime does (`global_fns::HELPER_SOURCE`), backed by the `__nsResolveModulePath` /
 // `__nsReadTextFile` / `__nsAppRoot` natives `host_abi::initialize_runtime` installs. Without this, every
@@ -134,6 +226,7 @@ pub const PRELUDE: &str = r#"
 
   function makeRequire(callerFile) {
     return function require(specifier) {
+      if (specifier === 'ns:module' && g.__nsModuleBuiltin) { return g.__nsModuleBuiltin; }
       var resolved = resolveSpecifier(specifier, callerFile);
       if (!resolved) { throw new Error('Cannot find module: ' + specifier); }
 
@@ -168,8 +261,41 @@ pub const PRELUDE: &str = r#"
 
   g.require = makeRequire(null);
 
+  // The `ns:module` builtin (require/import/import()): the dev-loader control surface
+  // @nativescript/vite's HMR client drives, as on iOS/Android and the classic runtime. Present
+  // only on engines with a module loader (the natives come from the engine package). Members are
+  // frozen and non-throwing to feature-detect.
+  if (!g.__nsModuleBuiltin && typeof g.__nsModuleConfigureLoader === 'function') {
+    var nsModule = {
+      configureLoader: function configureLoader(config) {
+        if (!config || typeof config !== 'object') { throw new TypeError('configureLoader expects a config object'); }
+        g.__nsModuleConfigureLoader(JSON.stringify(config));
+      },
+      invalidateModules: function invalidateModules(urls) {
+        return g.__nsModuleInvalidate(urls);
+      },
+      getLoadedModuleUrls: function getLoadedModuleUrls() {
+        return g.__nsModuleLoadedUrls();
+      },
+      createRequire: function createRequire(filenameOrURL) {
+        var value = filenameOrURL && typeof filenameOrURL === 'object' ? filenameOrURL.href : filenameOrURL;
+        if (typeof value !== 'string') {
+          throw new TypeError("The argument 'filename' must be a file URL object, file URL string, or absolute path string.");
+        }
+        if (/^https?:/.test(value)) {
+          throw new TypeError('createRequire() cannot take an http(s) URL (' + value + '): use import() for remote modules.');
+        }
+        if (value.indexOf('file:') === 0) {
+          value = decodeURIComponent(value.replace(/^file:\/\/(localhost)?/, '').replace(/[?#].*$/, '')).replace(/^\/([A-Za-z]:)/, '$1');
+        }
+        return makeRequire(value);
+      }
+    };
+    Object.defineProperty(g, '__nsModuleBuiltin', { value: Object.freeze(nsModule), enumerable: false });
+  }
+
   // Top-level CJS globals for scripts executed outside a factory wrapper (e.g. when the host
-  // calls runtime_runscript directly with a CJS file — runtime.js/vendor.js/the app bundle).
+  // calls runtime_runscript directly with a CJS file: runtime.js/vendor.js/the app bundle).
   if (typeof g.module === 'undefined') {
     var _topMod = { id: '<main>', exports: {} };
     Object.defineProperty(g, 'module',  { value: _topMod, writable: true, configurable: true });

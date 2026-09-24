@@ -1,4 +1,4 @@
-//! Standalone host — the NativeScript Windows runtime running on **Microsoft's prebuilt
+//! Standalone host: the NativeScript Windows runtime running on **Microsoft's prebuilt
 //! Hermes**, with no Node/Bun/Deno. Hermes's `hermes.dll` exports both the JSR C API
 //! (`jsr_create_runtime`, `jsr_runtime_get_node_api_env`, ...) and a full `napi_*` surface. So:
 //!   1. `napi::sys::setup()` populates napi-sys from the exe's forwarded exports (build.rs
@@ -29,7 +29,7 @@ fn main() {
         };
         let env = Env::from_raw(env_raw);
 
-        // 3. Bring up the WinRT runtime over this env — identical calls to the Node/QuickJS hosts.
+        // 3. Bring up the WinRT runtime over this env: identical calls to the Node/QuickJS hosts.
         runtime::napi_engine::invoke::ensure_winrt_initialized();
         if let Err(e) = runtime::napi_engine::globals::install_globals(&env) {
             eprintln!("install_globals failed: {e}");
@@ -49,12 +49,25 @@ fn main() {
 
         // The full WinRT runtime running on standalone Hermes (no Node/Bun/Deno).
         let _ = run_script(&env, ns_windows_common::url_polyfill::POLYFILL); // URL/URLSearchParams
+        // Before the prelude, which builds `__nsModuleBuiltin` over the runner's natives.
+        if let Err(e) = runtime::napi_engine::module_runner::install(&env, eval_for_modules) {
+            eprintln!("module runner install failed: {e}");
+        }
         let _ = run_script(&env, ns_windows_common::prelude::PRELUDE); // queueMicrotask + NSWinRT
         let drain = || drain_microtasks(env_raw);
 
-        // App mode: `nativescript-windows <script.js>` — run the script, then drive the event
+        // App mode: `nativescript-windows <script.js>`: run the script, then drive the event
         // loop (timers, WinRT async completions, microtasks) until the app goes idle.
         if let Some(path) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
+            // An ES-module app (`<entry>.mjs`) goes through the module runner.
+            if path.ends_with(".mjs") {
+                if let Err(e) = runtime::napi_engine::module_runner::run_entry(&env, &path, "") {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                runtime::napi_engine::event_loop::run_event_loop(&env, drain, None);
+                return;
+            }
             let code = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -122,4 +135,9 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The engine's script evaluator for the module runner (`runtime::napi_engine::module_runner`).
+fn eval_for_modules(env: &Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    windows_hermes::eval_named(env, code, filename)
 }

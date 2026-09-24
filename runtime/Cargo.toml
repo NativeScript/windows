@@ -23,6 +23,10 @@ libc = "0.2"
 runtime-devtools = { path = "../runtime-devtools", optional = true }
 # Node-API backend (napi_engine feature). Off by default so the rusty_v8 build is unaffected.
 napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
+# The `module_runner` feature's ES module transform. Pinned: 0.146+ needs a newer rustc than the
+# toolchain here.
+oxc = { version = "=0.145.0", default-features = false, features = ["semantic", "codegen"], optional = true }
+oxc_transformer_plugins = { version = "=0.145.0", optional = true }
 # Native crash reporter (napi_engine hosts): symbolize SEH faults via the host PDB.
 backtrace = "0.3"
 aes-gcm = "0.10"
@@ -67,6 +71,9 @@ features = [
 default = []
 devtools = ["runtime-devtools"]
 napi_engine = ["dep:napi"]
+# ES modules for napi engines without a native module loader (QuickJS, Hermes, JSC): modules are
+# transformed to async functions and run by a JS module runner (napi_engine::module_runner).
+module_runner = ["napi_engine", "dep:oxc", "dep:oxc_transformer_plugins"]
 
 [dev-dependencies]
 criterion = "0.5"

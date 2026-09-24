@@ -18,11 +18,14 @@ pub mod interop;
 pub mod invoke;
 pub mod items_source;
 pub mod module_natives;
+#[cfg(feature = "module_runner")]
+pub mod module_runner;
 pub mod ns_hostobject;
 pub mod ns_proxy;
 pub mod timers;
 pub mod url;
 pub mod value;
+pub mod websocket;
 
 // Engine-neutral marshaling types the napi backend and standalone hosts build against.
 pub use crate::value::{NativeType, NativeValue};

@@ -1,4 +1,4 @@
-//! Standalone host — the NativeScript Windows runtime on **V8**, no Node. Uses the bundled
+//! Standalone host: the NativeScript Windows runtime on **V8**, no Node. Uses the bundled
 //! rusty_v8 (same engine our classic runtime is built on) + napi-android's v8-api.cpp napi shim +
 //! our Windows bring-up. The shim statically links and dllexports `napi_*`, so `napi::sys::setup()`'s
 //! GetProcAddress-on-the-exe lookup finds them (like the QuickJS/JSC packages).
@@ -104,7 +104,7 @@ fn main() {
             ffi::js_execute_pending_jobs(env_raw);
         };
 
-        // App mode: `nativescript-windows <script.js>` — run the script, then drive the event
+        // App mode: `nativescript-windows <script.js>`: run the script, then drive the event
         // loop (timers, WinRT async completions, microtasks) until the app goes idle.
         if let Some(path) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
             let code = match std::fs::read_to_string(&path) {
@@ -114,6 +114,19 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            // An ES-module app (`<entry>.mjs`) goes through V8's module loader (csrc/win_jsr.cpp).
+            if path.ends_with(".mjs") {
+                let key = runtime::esm_loader::entry_key(&path, "");
+                let (Ok(code), Ok(key)) = (CString::new(code), CString::new(key)) else {
+                    eprintln!("{path}: source or path contains a NUL byte");
+                    std::process::exit(1);
+                };
+                if ffi::js_run_module(env.raw(), code.as_ptr(), key.as_ptr()) != 0 {
+                    std::process::exit(1);
+                }
+                runtime::napi_engine::event_loop::run_event_loop(&env, drain, None);
+                return;
+            }
             if let Err(e) = run_script(&env, &code) {
                 eprintln!("{e}");
                 std::process::exit(1);

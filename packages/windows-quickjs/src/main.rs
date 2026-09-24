@@ -1,4 +1,4 @@
-//! Standalone host — the NativeScript Windows runtime running on **embedded QuickJS**,
+//! Standalone host: the NativeScript Windows runtime running on **embedded QuickJS**,
 //! with no Node/Bun/Deno. It wires three proven pieces together:
 //!   1. windows-quickjs: quickjs-ng + the napi-android node_api shim → a `napi_env`.
 //!   2. napi-rs `Env::from_raw` over that env (needs `napi::sys::setup()` first on Windows).
@@ -24,7 +24,7 @@ fn main() {
         }
         let env = Env::from_raw(raw);
 
-        // Bring up the WinRT runtime over this env — identical calls to the Node package.
+        // Bring up the WinRT runtime over this env: identical calls to the Node package.
         runtime::napi_engine::invoke::ensure_winrt_initialized();
         if let Err(e) = runtime::napi_engine::globals::install_globals(&env) {
             eprintln!("install_globals failed: {e}");
@@ -47,12 +47,25 @@ fn main() {
         // Install the URL/URLSearchParams polyfill (QuickJS has no built-in URL) and the runtime
         // prelude (queueMicrotask + NSWinRT.toPromise over the event-loop keep-alive natives).
         let _ = shim::run_script_checked(raw_v, ns_windows_common::url_polyfill::POLYFILL);
+        // Before the prelude, which builds `__nsModuleBuiltin` over the runner's natives.
+        if let Err(e) = runtime::napi_engine::module_runner::install(&env, eval_for_modules) {
+            eprintln!("module runner install failed: {e}");
+        }
         let _ = shim::run_script_checked(raw_v, ns_windows_common::prelude::PRELUDE);
         let drain = || shim::drain_microtasks(raw_v);
 
-        // App mode: `nativescript-windows <script.js>` — run the script, then drive the event
+        // App mode: `nativescript-windows <script.js>`: run the script, then drive the event
         // loop (timers, WinRT async completions, microtasks) until the app goes idle.
         if let Some(path) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
+            // An ES-module app (`<entry>.mjs`) goes through the module runner.
+            if path.ends_with(".mjs") {
+                if let Err(e) = runtime::napi_engine::module_runner::run_entry(&env, &path, "") {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                runtime::napi_engine::event_loop::run_event_loop(&env, drain, None);
+                return;
+            }
             let code = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -94,7 +107,7 @@ fn main() {
             ("WinRT calls x20 (stress)", "var s=0; for (var i=0;i<20;i++) s+=Windows.Data.Json.JsonValue.CreateNumberValue(i).GetNumber(); s"),
             // Full object round-trip: construct, set, stringify (ctor proxy + instance methods).
             ("JsonObject round-trip", "var o=new Windows.Data.Json.JsonObject(); o.SetNamedValue('a', Windows.Data.Json.JsonValue.CreateNumberValue(7)); o.GetNamedNumber('a')+':'+o.Stringify()"),
-            // Force GC, then keep using the proxies — proves finalizers no longer corrupt state.
+            // Force GC, then keep using the proxies: proves finalizers no longer corrupt state.
             ("post-GC reuse", "gc(); Windows.Data.Json.JsonValue.CreateNumberValue(99).GetNumber()"),
             // URL / URLSearchParams polyfill (native __urlParse/__urlWith over the url crate).
             ("URL parse components", "var u=new URL('https://us:pw@ex.com:8443/a/b?x=1&y=2#h'); u.host+'|'+u.pathname+'|'+u.hash+'|'+u.origin"),
@@ -121,4 +134,9 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The engine's script evaluator for the module runner (`runtime::napi_engine::module_runner`).
+fn eval_for_modules(env: &Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    windows_quickjs::shim::eval_named(env, code, filename).map(|v| v as napi::sys::napi_value)
 }

@@ -185,19 +185,19 @@ pub fn pump_dispatcher() {
 /// Move the post-callback microtask checkpoint out of the current native frame
 /// when that frame may be a re-entrancy-sensitive XAML callout.
 ///
-/// JS delegates frequently fire from inside XAML's render walk — a JS handler on
+/// JS delegates frequently fire from inside XAML's render walk: a JS handler on
 /// `CompositionTarget.Rendering`, or a re-entrant raise like
 /// `ContainerContentChanging`. Draining Promise continuations there lets
 /// arbitrary JS mutate the live XAML tree mid-walk, which trips XAML's
 /// re-entrancy guard and fail-fasts the process with a stowed exception
-/// (0xC000027B) — the host-side half of this contract is documented at
+/// (0xC000027B): the host-side half of this contract is documented at
 /// App.xaml.cs `SchedulePump`. On the XAML UI thread the checkpoint is therefore
 /// queued as an ordinary `DispatcherQueue` work item (coalesced: at most one in
 /// flight), which the dispatcher runs only after the render walk completes.
 ///
 /// Returns `true` when a drain is queued (or already pending) and the caller
 /// must skip its inline checkpoint. Returns `false` when this thread has no
-/// XAML dispatcher — console hosts, workers and tests keep the inline
+/// XAML dispatcher: console hosts, workers and tests keep the inline
 /// checkpoint, where no render walk exists and prompt draining is preferable.
 pub(crate) fn defer_microtask_drain() -> bool {
     MICROTASK_DRAIN_QUEUED.with(|queued| {
@@ -225,7 +225,7 @@ pub(crate) fn defer_microtask_drain() -> bool {
 /// Pump Win32 messages and flush V8 microtasks.
 ///
 /// Safe to call from a console app's own event loop (no XAML renderer active).
-/// Do NOT call this from `CompositionTarget.Rendering` — use `pump_dispatcher()`
+/// Do NOT call this from `CompositionTarget.Rendering`: use `pump_dispatcher()`
 /// there instead, which skips `PeekMessageW` to avoid XAML reentrancy.
 ///
 /// Returns `true` if at least one Win32 message was dispatched.
@@ -378,7 +378,7 @@ pub(crate) const INSTANCE_CACHE_GC_THRESHOLD: usize = 512;
 thread_local!(pub(crate) static GC_NUDGE_NEXT_AT: std::cell::Cell<usize> = std::cell::Cell::new(INSTANCE_CACHE_GC_THRESHOLD));
 
 // IActivationFactory cache: RoGetActivationFactory is expensive (COM broker round-trip) but factories
-// are app-lifetime singletons — same class name always returns the same factory pointer.
+// are app-lifetime singletons: same class name always returns the same factory pointer.
 // Keyed on the WinRT class full name (e.g. "Microsoft.UI.Xaml.Controls.TextBlock").
 thread_local!(static ACTIVATION_FACTORY_CACHE: RefCell<HashMap<String, IUnknown>> = RefCell::new(HashMap::new()));
 
@@ -677,7 +677,7 @@ fn with_class_members<R>(
     CLASS_MEMBERS_CACHE.with(|cache| {
         let full_name = class_declaration.full_name();
 
-        // Fast path: read with a shared borrow — no String allocation for the key.
+        // Fast path: read with a shared borrow: no String allocation for the key.
         // String-keyed maps accept &str via the Borrow<str> blanket impl.
         {
             let borrow = cache.borrow();
@@ -825,17 +825,17 @@ pub(crate) enum ReturnKind {
     /// GUID uses value-type ABI but a dedicated JS conversion.
     Guid,
     Struct(Arc<RwLock<dyn Declaration>>),
-    /// Concrete class return — GetRuntimeClassName not needed.
+    /// Concrete class return: GetRuntimeClassName not needed.
     Object {
         decl: Arc<RwLock<dyn Declaration>>,
         type_name: Arc<str>,
     },
-    /// Interface return — GetRuntimeClassName resolves the concrete class at runtime.
+    /// Interface return: GetRuntimeClassName resolves the concrete class at runtime.
     InterfaceObject {
         decl: Arc<RwLock<dyn Declaration>>,
         type_name: Arc<str>,
     },
-    /// Return type is `Object`/IInspectable — concrete type only known at runtime.
+    /// Return type is `Object`/IInspectable: concrete type only known at runtime.
     DynamicObject,
 }
 
@@ -1229,7 +1229,7 @@ pub fn debug_output(msg: &str) {
 }
 
 /// Set the directory for the runtime trace log (`console.log`). Called by the host with the app's
-/// LocalState folder. Idempotent (first value wins) — must be set before the first `debug_output`.
+/// LocalState folder. Idempotent (first value wins): must be set before the first `debug_output`.
 pub fn set_log_dir(dir: String) {
     let _ = LOG_DIR.set(dir);
 }
@@ -1294,7 +1294,7 @@ pub(crate) fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 }
 
 pub(crate) fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
-    // Fast path: factories are app-lifetime singletons — cache avoids a COM broker round-trip per call.
+    // Fast path: factories are app-lifetime singletons: cache avoids a COM broker round-trip per call.
     let cached = ACTIVATION_FACTORY_CACHE.with(|c| c.borrow().get(full_name).cloned());
     if let Some(factory) = cached {
         return Ok(factory);
@@ -1358,7 +1358,7 @@ fn normalize_js_path(path: &str) -> PathBuf {
 
 fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
     // Each `.exists()` probe also checks the sealed app.nsbundle's decrypted table (a no-op,
-    // cheap OnceLock read when no bundle is loaded) — a packed app has no real `app/` directory
+    // cheap OnceLock read when no bundle is loaded): a packed app has no real `app/` directory
     // on disk, so `is_dir()`/`.exists()` alone would never resolve anything.
     if candidate.exists() || crate::source_protect::contains(&candidate.to_string_lossy()) {
         return candidate;
@@ -1496,7 +1496,7 @@ fn resolve_file_specifier(specifier: &str, referrer_path: Option<&str>) -> Strin
             .map(normalize_js_path)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`, so also
-        // check the sealed bundle's table — otherwise a relative import from a bundle-only module
+        // check the sealed bundle's table: otherwise a relative import from a bundle-only module
         // would wrongly treat the referrer itself as the base directory instead of its parent.
         let base = if parent.is_file() || crate::source_protect::contains(&parent.to_string_lossy())
         {
@@ -1777,6 +1777,113 @@ fn read_module_source(key: &str) -> Option<String> {
     crate::source_protect::read_text(key).or_else(|| fs::read_to_string(key).ok())
 }
 
+/// The module loader's engine-neutral half, for engines whose module records live in their own
+/// shim (the napi V8 package compiles, links and evaluates in C++): the same resolution, source
+/// loading, error text and `ns:module` bookkeeping the classic loader above uses, so both
+/// resolve a graph identically.
+pub mod esm_loader {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    thread_local! {
+        // HTTP modules fetched ahead by `prefetch`, consumed by `read_source`.
+        static PREFETCHED: RefCell<HashMap<String, Result<crate::esm_http::FetchedModule, String>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// Registry key of the entry module the host passes in (`bundle.mjs`, absolute or relative to
+    /// the app root). Also roots `~/` / `/` specifiers and the remote-module gate at its directory.
+    pub fn entry_key(filename: &str, app_root: &str) -> String {
+        let p = super::locate_entry_module(filename, app_root);
+        let key = p.canonicalize().unwrap_or(p).to_string_lossy().into_owned();
+        if let Some(dir) = Path::new(&key).parent() {
+            super::ESM_APP_DIR.with(|d| *d.borrow_mut() = Some(dir.to_path_buf()));
+            crate::esm_http::init_security_from_app_dir(dir);
+        }
+        key
+    }
+
+    /// Whether the host's entry script is an ES module: Vite's `bundle.mjs`, or source opening
+    /// with an import/export (the classic runtime's `run_script` rule).
+    pub fn is_module_entry(filename: &str, code: &str) -> bool {
+        let trimmed = code.trim_start();
+        filename.ends_with(".mjs") || trimmed.starts_with("import ") || trimmed.starts_with("export ")
+    }
+
+    pub fn resolve(spec: &str, referrer: Option<&str>) -> String {
+        super::resolve_esm_path(spec, referrer)
+    }
+
+    /// Source text for a registry key (builtin, HTTP fetch or file); `None` records why.
+    pub fn read_source(key: &str) -> Option<String> {
+        match PREFETCHED.with(|m| m.borrow_mut().remove(key)) {
+            Some(Ok(fetched)) => Some(super::http_module_source(fetched)),
+            Some(Err(reason)) => {
+                super::record_load_error(key, reason);
+                None
+            }
+            None => super::read_module_source(key),
+        }
+    }
+
+    /// Fetch a module's HTTP dependencies concurrently before they're read one by one, as the
+    /// classic graph walk does (a dev-server boot walks hundreds of modules).
+    pub fn prefetch(keys: &[String]) {
+        let pending: Vec<(String, String)> = keys
+            .iter()
+            .filter(|k| crate::esm_http::is_http(k))
+            .filter(|k| !PREFETCHED.with(|m| m.borrow().contains_key(k.as_str())))
+            .map(|k| (super::http_fetch_url(k), k.clone()))
+            .collect();
+        if pending.len() < 2 {
+            return;
+        }
+        let results = crate::esm_http::fetch_modules(&pending);
+        PREFETCHED.with(|m| {
+            let mut m = m.borrow_mut();
+            for ((_, key), result) in pending.into_iter().zip(results) {
+                m.insert(key, result);
+            }
+        });
+    }
+
+    pub fn not_found_message(spec: &str, referrer: Option<&str>, key: &str) -> String {
+        super::module_not_found_message(spec, referrer, key)
+    }
+
+    /// Volatile (`configureLoader`) HTTP keys are re-fetched on every dynamic import.
+    pub fn is_volatile(key: &str) -> bool {
+        crate::esm_http::is_http(key) && crate::esm_http::is_volatile(key)
+    }
+
+    pub fn is_http(key: &str) -> bool {
+        crate::esm_http::is_http(key)
+    }
+
+    /// Forget a key's recorded load failure (the engine drops its module record alongside).
+    pub fn forget(key: &str) {
+        super::ESM_LOAD_ERRORS.with(|m| m.borrow_mut().remove(key));
+        PREFETCHED.with(|m| m.borrow_mut().remove(key));
+    }
+
+    pub fn registry_key_for(url: &str) -> String {
+        super::registry_key_for(url)
+    }
+
+    pub fn configure_loader(json: &str) -> Result<(), String> {
+        crate::esm_http::configure_loader(json)
+    }
+
+    pub fn mark_keys_for_cache_bust(keys: &[String]) {
+        crate::esm_http::mark_keys_for_cache_bust(keys)
+    }
+
+    /// Specifier (and registry key) of the `ns:module` builtin, which re-exports
+    /// `globalThis.__nsModuleBuiltin`.
+    pub const NS_MODULE: &str = super::NS_MODULE_BUILTIN;
+}
+
 /// Load, link and evaluate the module graph rooted at `resolved` (`source` when the caller
 /// already has the root's text). `Ok` carries the root module and `evaluate`'s result (a promise
 /// under TLA); `Err` the value to throw/reject with. The real exception (SyntaxError, link
@@ -2017,11 +2124,11 @@ fn create_ns_object<'a>(
 }
 
 /// Properties exposed on the returned JS object:
-///   .data1   – UInt32
-///   .data2   – UInt16
-///   .data3   – UInt16
-///   .data4   – Array<number> (8 bytes)
-///   .toString() / .valueOf() – "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+///   .data1: UInt32
+///   .data2: UInt16
+///   .data3: UInt16
+///   .data4: Array<number> (8 bytes)
+///   .toString() / .valueOf(): "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
 unsafe fn guid_ptr_to_js_object<'a>(
     ptr: *mut std::ffi::c_void,
     scope: &mut v8::PinScope<'a, '_>,
@@ -2167,7 +2274,7 @@ fn create_ns_ctor_instance_object<'a>(
 
     // Member callbacks resolve the COM instance from internal field 0, so a
     // template built for one instance serves all. The "L|" prefix keeps this
-    // builder's templates separate from ns_proxy's — the interceptor sets differ.
+    // builder's templates separate from ns_proxy's: the interceptor sets differ.
     let template_key: String = match &parent {
         Some(p) => format!("L|{}|{}", name, p.read().full_name()),
         None => format!("L|{}", name),
@@ -2339,7 +2446,7 @@ fn create_ns_ctor_instance_object<'a>(
                             return v8::Intercepted::kNo;
                         }
 
-                        // Method access — return a JS function that calls via QI + vtable
+                        // Method access: return a JS function that calls via QI + vtable
                         if let Some(method_decl) =
                             iface.methods().iter().find(|m| m.name() == name.as_str())
                         {
@@ -2980,7 +3087,7 @@ fn create_ns_ctor_instance_object<'a>(
                     // Prefer the per-instance DeclarationFFI stored on the holder
                     // (internal field 0). The callback data is baked into the per-class
                     // cached template and holds the instance the template was first
-                    // built with — using it would attach events to the wrong object.
+                    // built with: using it would attach events to the wrong object.
                     let dec_ptr = crate::ns_proxy::this_declaration_ffi(scope, args.holder())
                         .unwrap_or_else(|| {
                             unsafe { args.data().cast::<v8::External>() }.value()
@@ -3348,7 +3455,7 @@ fn create_ns_ctor_instance_object<'a>(
                             // Methods declared to return `Object`/IInspectable (e.g. XamlReader.Load)
                             // hand back an opaque pointer whose concrete type is only known at runtime.
                             // Resolve it via GetRuntimeClassName and wrap as a full typed proxy so
-                            // property/event interceptors work — otherwise the caller gets a
+                            // property/event interceptors work: otherwise the caller gets a
                             // non-extensible object that can't subscribe to events.
                             let instance = unsafe { IUnknown::from_raw(result) };
                             let resolved = instance
@@ -3427,7 +3534,7 @@ fn create_ns_ctor_instance_object<'a>(
                             v8::PropertyAttribute::DONT_DELETE,
                         );
                     } else {
-                        // Prototype, not instance template — see toString above.
+                        // Prototype, not instance template: see toString above.
                         proto.set_with_attr(
                             name.unwrap().into(),
                             func.into(),
@@ -3684,7 +3791,7 @@ fn create_ns_ctor_instance_object<'a>(
                         );
                     } else {
                         let name = name.unwrap();
-                        // Prototype, not instance template — see toString above.
+                        // Prototype, not instance template: see toString above.
                         proto.set_accessor_property(
                             name.into(),
                             Some(getter),
@@ -3842,7 +3949,7 @@ fn create_ns_ctor_instance_object<'a>(
                                         // XamlReader.Load) hand back an opaque pointer whose concrete
                                         // type is only known at runtime. Resolve via GetRuntimeClassName
                                         // and wrap as a full typed proxy so property/event interceptors
-                                        // work — otherwise the caller gets a non-extensible object that
+                                        // work: otherwise the caller gets a non-extensible object that
                                         // can't subscribe to events.
                                         let instance = unsafe { IUnknown::from_raw(result) };
                                         let resolved = instance
@@ -4151,7 +4258,7 @@ fn create_ns_ctor_instance_object<'a>(
                                         // XamlReader.Load) hand back an opaque pointer whose concrete
                                         // type is only known at runtime. Resolve via GetRuntimeClassName
                                         // and wrap as a full typed proxy so property/event interceptors
-                                        // work — otherwise the caller gets a non-extensible object that
+                                        // work: otherwise the caller gets a non-extensible object that
                                         // can't subscribe to events.
                                         let instance = unsafe { IUnknown::from_raw(result) };
                                         let resolved = instance
@@ -5264,7 +5371,7 @@ unsafe fn raw_result_to_local<'s>(
                     v8::String::new(scope, s.as_str())?.into()
                 }
                 // "Object" in WinRT metadata maps to NativeType::Pointer and means
-                // IInspectable* — try to resolve the concrete runtime class name so
+                // IInspectable*: try to resolve the concrete runtime class name so
                 // we can hand back a typed wrapper instead of an opaque External.
                 NativeType::Pointer => {
                     if result.is_null() {
@@ -5290,7 +5397,7 @@ unsafe fn raw_result_to_local<'s>(
                             }
                         }
                     }
-                    // Could not resolve type — expose as opaque External so the
+                    // Could not resolve type: expose as opaque External so the
                     // property is at least present rather than silently missing.
                     v8::External::new(scope, result).into()
                 }
@@ -6342,7 +6449,7 @@ fn create_ns_ctor_object<'a>(
                     let (hresult, result, _outs) = prop_call.call_with_values(scope, &[]);
 
                     // If the call failed because the process is unpackaged, do not provide a runtime shim.
-                    // HRESULT 0x80073D54 = "The process has no package identity." — let callers/tests handle fallback.
+                    // HRESULT 0x80073D54 = "The process has no package identity.": let callers/tests handle fallback.
                     if !hresult.is_ok() && (hresult.0 as u32) == 0x80073D54u32 {
                         // If the static getter failed because the process is unpackaged,
                         // do not synthesize values here; let the caller/tests detect the
@@ -7054,7 +7161,7 @@ fn init_meta(
 }
 
 // Setter for the namespace/enum/struct *proxy* objects (the ones returned by
-// `create_ns_object`). These are not instances — they're traversal handles like
+// `create_ns_object`). These are not instances: they're traversal handles like
 // `Windows` or `Windows.UI.Popups`. The rule is:
 //   - Names that resolve to real WinRT metadata are immutable (writes are ignored).
 //   - Anything else is stored in the per-object side map so user code can stash
@@ -7278,7 +7385,7 @@ fn handle_named_property_getter(
                         return v8::Intercepted::kYes;
                     }
 
-                    // Name isn't a real namespace child — let V8 fall back to
+                    // Name isn't a real namespace child: let V8 fall back to
                     // Object.prototype defaults so toString/valueOf/etc. work.
                     return v8::Intercepted::kNo;
                 }
@@ -7410,7 +7517,7 @@ fn handle_named_property_getter(
                     }
 
                     // Name isn't an enum member (e.g. `toString`, `valueOf`).
-                    // Don't intercept — let V8 fall back to Object.prototype
+                    // Don't intercept: let V8 fall back to Object.prototype
                     // so coercion-style operations (console.log on the enum,
                     // template-string interpolation, etc.) work.
                     return v8::Intercepted::kNo;
@@ -7465,7 +7572,7 @@ fn handle_named_property_getter(
             }
             DeclarationKind::Parameter => {}
         }
-        // Fell through every arm without setting rv — let V8 do its default
+        // Fell through every arm without setting rv: let V8 do its default
         // lookup (returns `undefined` for missing names, which is what JS
         // expects for unknown WinRT properties).
         return v8::Intercepted::kNo;
@@ -7513,7 +7620,7 @@ struct JsDelegateVtbl {
     add_ref: unsafe extern "system" fn(*mut JsDelegate) -> u32,
     release: unsafe extern "system" fn(*mut JsDelegate) -> u32,
     // Declared with 4 usize params so the same slot works for delegates with
-    // 0–4 pointer-sized arguments.  Callers pass only what they need; extras
+    // 0 to 4 pointer-sized arguments.  Callers pass only what they need; extras
     // land in dead registers and are never read (guarded by param_types.len()).
     invoke: unsafe extern "system" fn(*mut JsDelegate, usize, usize, usize, usize) -> HRESULT,
 }
@@ -7740,7 +7847,7 @@ fn js_delegate_run(
         tc.reset();
     }
     // Delegates can fire from inside XAML's render walk; never drain Promise
-    // continuations there (fail-fast 0xC000027B) — defer when possible.
+    // continuations there (fail-fast 0xC000027B): defer when possible.
     if !defer_microtask_drain() {
         tc.perform_microtask_checkpoint();
     }
@@ -7813,7 +7920,7 @@ pub(crate) fn js_delegate_params_from_declaration(
 /// auto-wrap raw JS functions as `JsDelegate` COM objects.
 pub(crate) fn delegate_info_from_type_sig(iid_name: &str) -> Option<(GUID, Vec<NativeType>)> {
     if let Some(open_name) = iid_name.split_once('<').map(|(prefix, _)| prefix) {
-        // Generic delegate instance — compute the parameterized GUID.
+        // Generic delegate instance: compute the parameterized GUID.
         let guid = GenericInstanceIdBuilder::generate_id_from_name(iid_name);
 
         // Derive param_types from the open-generic delegate's Invoke signature.
@@ -7834,7 +7941,7 @@ pub(crate) fn delegate_info_from_type_sig(iid_name: &str) -> Option<(GUID, Vec<N
             .collect();
         Some((guid, param_types))
     } else {
-        // Non-generic delegate — look up by the exact type name.
+        // Non-generic delegate: look up by the exact type name.
         let decl = MetadataReader::find_by_name(iid_name)?;
         let lock = decl.read();
         let kind = lock.kind();
@@ -7865,7 +7972,7 @@ pub(crate) fn delegate_info_from_add_method(
 ///
 /// Looks up `typeName` in the WinRT metadata, derives the delegate's GUID and
 /// input-parameter NativeTypes via `js_delegate_params_from_declaration`, then
-/// allocates a `JsDelegate` COM object and returns `{ handle: External }` —
+/// allocates a `JsDelegate` COM object and returns `{ handle: External }`:
 /// the same shape that WinRT event-add methods expect.
 pub(crate) fn handle_as_delegate(
     scope: &mut v8::PinScope<'_, '_>,
@@ -7945,7 +8052,7 @@ pub(crate) fn handle_make_items_source(
     }
 }
 
-/// __nsExtendItemsSource({ handle }, newCount) — grow an existing items source (from
+/// __nsExtendItemsSource({ handle }, newCount): grow an existing items source (from
 /// __nsMakeItemsSource) in place to `newCount` items, firing VectorChanged so WinUI adds only the new
 /// rows (preserves scroll position + already-realized cells). Used by the ListView for infinite-scroll
 /// append instead of replacing the whole ItemsSource.
@@ -8005,7 +8112,7 @@ fn items_source_handle(
     }))
 }
 
-/// __nsInsertItemsSource({ handle }, index, count) — insert `count` rows at `index` into an items
+/// __nsInsertItemsSource({ handle }, index, count): insert `count` rows at `index` into an items
 /// source (from __nsMakeItemsSource), firing VectorChanged(ItemInserted) so WinUI adds only the new
 /// rows. Used by the ListView for granular ObservableArray add/splice without a full rebuild.
 pub(crate) fn handle_insert_items_source(
@@ -8021,7 +8128,7 @@ pub(crate) fn handle_insert_items_source(
     let _ = crate::js_observable_vector::insert_index_vector(&inspectable, index, count);
 }
 
-/// __nsRemoveItemsSource({ handle }, index, count) — remove `count` rows at `index`, firing
+/// __nsRemoveItemsSource({ handle }, index, count): remove `count` rows at `index`, firing
 /// VectorChanged(ItemRemoved) so WinUI drops only those rows. Granular ObservableArray delete/splice.
 pub(crate) fn handle_remove_items_source(
     scope: &mut v8::PinScope<'_, '_>,
@@ -8036,7 +8143,7 @@ pub(crate) fn handle_remove_items_source(
     let _ = crate::js_observable_vector::remove_index_vector(&inspectable, index, count);
 }
 
-/// __nsResetItemsSource({ handle }, newCount) — rebuild the items source to `newCount` rows and fire a
+/// __nsResetItemsSource({ handle }, newCount): rebuild the items source to `newCount` rows and fire a
 /// SINGLE VectorChanged(Reset). WinRT has no range event, so this is the one-event way to apply a bulk
 /// change (wholesale replace / large splice / filter); WinUI re-realizes only the visible containers.
 pub(crate) fn handle_reset_items_source(
@@ -8055,7 +8162,7 @@ pub(crate) fn handle_reset_items_source(
     let _ = crate::js_observable_vector::reset_index_vector(&inspectable, new_count);
 }
 
-/// __nsUpdateItemsSource({ handle }, index, count) — fire VectorChanged(ItemChanged) for `count` rows
+/// __nsUpdateItemsSource({ handle }, index, count): fire VectorChanged(ItemChanged) for `count` rows
 /// at `index` (count unchanged) so WinUI re-realizes just those containers. Granular setItem/update.
 pub(crate) fn handle_update_items_source(
     scope: &mut v8::PinScope<'_, '_>,
@@ -8073,7 +8180,7 @@ pub(crate) fn handle_update_items_source(
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         // Look for a sealed app.nsbundle next to app_root before anything else touches the
-        // filesystem for JS source — every read/resolve point below consults the decrypted
+        // filesystem for JS source: every read/resolve point below consults the decrypted
         // in-memory table first and falls back to disk when none was found.
         crate::source_protect::init_from_app_root(app_root);
 
@@ -8140,7 +8247,7 @@ impl Runtime {
         // Microtasks must drain only at the runtime's explicit checkpoint sites
         // (pump_dispatcher and the native→JS callback exits). V8's default kAuto
         // policy also drains whenever a Function::call returns at embedder call
-        // depth zero — which includes delegate invokes fired from inside XAML's
+        // depth zero: which includes delegate invokes fired from inside XAML's
         // render walk (e.g. a JS handler on CompositionTarget.Rendering), where
         // running Promise continuations re-enters the XAML core and fail-fasts
         // with 0xC000027B. Explicit policy lets `defer_microtask_drain` move
@@ -8536,7 +8643,7 @@ impl Runtime {
             return;
         };
         let Ok(func) = v8::Local::<v8::Function>::try_from(value) else {
-            return; // handler not registered (yet) — nothing to do
+            return; // handler not registered (yet): nothing to do
         };
 
         let recv: v8::Local<v8::Value> = global.into();
@@ -8588,7 +8695,7 @@ impl Drop for Runtime {
         MICROTASK_DRAIN_QUEUED.with(|cell| cell.set(false));
         if self.winrt_initialized {
             // Signal backing-store deleters (e.g. zero-copy IBuffer ArrayBuffers)
-            // to skip COM Release once the isolate is disposed below — that runs
+            // to skip COM Release once the isolate is disposed below: that runs
             // after RoUninitialize, so Release would hit a dead apartment.
             crate::global_fns::set_com_teardown(true);
             unsafe { RoUninitialize() };

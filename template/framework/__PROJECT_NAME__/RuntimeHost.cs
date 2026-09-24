@@ -33,7 +33,7 @@ namespace __PROJECT_NAME__
         private static extern void runtime_set_local_folder([MarshalAs(UnmanagedType.LPUTF8Str)] string localFolder);
 
         // Escape hatch for apps packed with `nsbundle_pack --key-hex <hex>` (custom-key
-        // app.nsbundle containers). Must be called before runtime_init if used at all — apps
+        // app.nsbundle containers). Must be called before runtime_init if used at all: apps
         // packed with the default pepper (no --key-hex) never need to call this. Not wired to a
         // default call site here; an app author supplies their own key material and calls this
         // from Initialize() before runtime_init(...).
@@ -69,6 +69,18 @@ namespace __PROJECT_NAME__
         }
 
     #if DEBUG
+        // Engine runtimes (@nativescript/windows-<engine>) only: a debug host always allows
+        // dev-server modules (Vite HMR). The classic runtime derives this from its devtools build
+        // and doesn't export it.
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_set_debug_build))]
+        private static extern void runtime_set_debug_build(int debug);
+
+        private static void TrySetDebugBuild()
+        {
+            try { runtime_set_debug_build(1); }
+            catch (EntryPointNotFoundException) { }
+        }
+
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(ns_set_log_to_console))]
         private static extern int ns_set_log_to_console(int enabled);
 
@@ -154,6 +166,7 @@ namespace __PROJECT_NAME__
             runtime_set_local_folder(Windows.Storage.ApplicationData.Current.LocalFolder.Path);
             _runtime = runtime_init(AppContext.BaseDirectory);
 #if DEBUG
+            TrySetDebugBuild();
             var trySet = TrySetLogToConsole(true);
             System.Diagnostics.Debug.WriteLine($"[NativeScript] TrySetLogToConsole returned={trySet}");
 
@@ -208,7 +221,7 @@ namespace __PROJECT_NAME__
         /// Reads a file that may live inside a sealed app.nsbundle instead of on disk: tries the
         /// protected-VFS native call first (cheap no-op when no bundle is loaded), falls back to
         /// the real filesystem. `path` is whatever candidate the caller already built for
-        /// `File.Exists`/`File.ReadAllText` — the native side strips it down to the bundle's
+        /// `File.Exists`/`File.ReadAllText`: the native side strips it down to the bundle's
         /// virtual (app/App-relative) path itself, so no extra bookkeeping is needed here.
         private static string TryReadVirtual(string path)
         {

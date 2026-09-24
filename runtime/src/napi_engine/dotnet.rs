@@ -2,7 +2,7 @@
 //! runtime exposes the same surface from `global_fns.rs`'s `HELPER_SOURCE`).
 //!
 //! `crate::dotnet` (the hostfxr-based CLR host, `call_dotnet` / `call_dotnet_binary`) has zero
-//! `v8::` references and is reused completely unmodified here — see
+//! `v8::` references and is reused completely unmodified here: see
 //! `[[project_engine_framework_parity]]` for how that was confirmed. What this module supplies is
 //! the engine-specific half: the same seven `__ns*` natives the classic engine registers in
 //! `global_fns.rs`, reimplemented against Node-API instead of V8's C++ API, plus the JS half
@@ -11,13 +11,13 @@
 //!
 //! Includes `__nsDotNetCreateJsSubclass` / `NSWinRT.proxy.createManagedSubclass` and the JS-side
 //! managed-subclass system it belongs to (`makeManagedConstructor`, `__extends_winrt`,
-//! `CSharpProxy`, `Interfaces`, proxy `emit`/`compile`/`register`) — this lets JS both extend a C#
+//! `CSharpProxy`, `Interfaces`, proxy `emit`/`compile`/`register`): this lets JS both extend a C#
 //! class (`Object.extend`/`Function.prototype.extend`/TS `extends`) and implement a WinRT
 //! interface, the same as the classic engine, via `Bridge.Proxy.cs`'s `System.Reflection.Emit`
-//! dynamic-subclass path (or a build-time `sbg`-generated static proxy when one exists — both
+//! dynamic-subclass path (or a build-time `sbg`-generated static proxy when one exists: both
 //! funnel through the same `CreateJsSubclass`, unaffected by which JS engine called it). The
 //! `emit`/`compile`/`register` trio is the separate, still-dead ahead-of-time pipeline
-//! (`hostCanLoadAssemblies: false` — compiles but its output is never loaded) — ported for JS
+//! (`hostCanLoadAssemblies: false`: compiles but its output is never loaded), ported for JS
 //! API-surface parity only, not because it works.
 //!
 //! ## Binary wire protocol
@@ -27,7 +27,7 @@
 //! classic engine uses two different string-length-prefix widths depending on direction:
 //! [`napi_bin_write_arg`] (outgoing method arguments, `u16` string length, AddRefs COM pointers
 //! before handing them to managed code) and [`napi_bin_write_value`] (values flowing back to
-//! managed — JS-callback return values — `u32` string length, adds array support, no AddRef). One
+//! managed, i.e. JS-callback return values; `u32` string length, adds array support, no AddRef). One
 //! reader, [`napi_bin_read_value`], covers every response shape in both directions.
 //!
 //! ## JS-callback dispatch
@@ -36,8 +36,8 @@
 //! managed bridge (`RegisterJsCallback`) so delegates/tasks/UI-thread hops can call back into JS.
 //! The classic engine never registers one explicitly, so `crate::dotnet` falls back to its own
 //! `global_fns::invoke_dotnet_js_callback` (isolate found via a thread-local). This module instead
-//! calls `crate::dotnet::set_js_callback_dispatcher` during [`install_dotnet`] — before any JS can
-//! reach `ensure_dotnet_initialized` — so [`napi_invoke_dotnet_js_callback`] wins for napi hosts.
+//! calls `crate::dotnet::set_js_callback_dispatcher` during [`install_dotnet`]: before any JS can
+//! reach `ensure_dotnet_initialized`: so [`napi_invoke_dotnet_js_callback`] wins for napi hosts.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ const LMEM_FIXED: u32 = 0x0000;
 
 // Pinned JS callbacks reachable from managed code: delegate/task-callback ids -> (owning env, a
 // napi_ref keeping the function alive). A plain HashMap doesn't auto-release like the classic
-// engine's `HashMap<i32, v8::Global<Function>>` does on removal — every remove site here must
+// engine's `HashMap<i32, v8::Global<Function>>` does on removal: every remove site here must
 // pair with an explicit `napi_delete_reference`.
 thread_local!(static NAPI_DOTNET_CALLBACKS: RefCell<HashMap<i32, (sys::napi_env, sys::napi_ref)>> = RefCell::new(HashMap::new()));
 
@@ -94,7 +94,7 @@ fn napi_array_get(env: &Env, arg: &JsUnknown, index: u32) -> Option<JsUnknown> {
     }
 }
 
-/// AddRef a raw WinRT COM pointer read off a `__native_ptr` BigInt — the outgoing arg is about to
+/// AddRef a raw WinRT COM pointer read off a `__native_ptr` BigInt: the outgoing arg is about to
 /// be handed to managed code, which will wrap and `Release` it later (matches the rusty_v8
 /// original's ownership contract for `__nsDotNetInvokeBin` request args exactly).
 unsafe fn addref_native_ptr(ptr: u64) {
@@ -227,8 +227,8 @@ fn napi_bin_write_value(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
     }
 }
 
-/// Decode one tagged value (response or JS-callback argument). Mirrors `global_fns::bin_read_value`
-/// — the classic engine shares this same reader between both call sites, so this does too.
+/// Decode one tagged value (response or JS-callback argument). Mirrors `global_fns::bin_read_value`:
+/// the classic engine shares this same reader between both call sites, so this does too.
 fn napi_bin_read_value(env: &Env, bytes: &[u8], pos: &mut usize) -> Result<JsUnknown, String> {
     let map_err = |e: napi::Error| e.to_string();
     let tag = *bytes.get(*pos).ok_or("response truncated")?;
@@ -387,7 +387,7 @@ fn native_invoke(ctx: &CallContext) -> napi::Result<JsUnknown> {
 
 /// Binary-protocol bridge: builds a compact request packet from structured napi arguments, calls
 /// the C# `InvokeBinary` entry point, and converts the binary response directly into a napi
-/// value — no JSON on either side. Argument convention matches the JS `_invoke` wrapper: `args[0]`
+/// value: no JSON on either side. Argument convention matches the JS `_invoke` wrapper: `args[0]`
 /// handle (i32, or null/undefined for a static call), `args[1]` typeName, `args[2]` assembly,
 /// `args[3]` method, `args[4..]` the method's own arguments.
 fn native_invoke_bin(ctx: &CallContext) -> napi::Result<JsUnknown> {
@@ -509,7 +509,7 @@ fn napi_read_string_array(env: &Env, arg: &JsUnknown) -> Vec<String> {
 /// none), typeName (string), interfaceNames (string[]), memberNames (string[]), fn (callback that
 /// receives dispatched virtual/interface-member invocations). Mirrors the classic engine's
 /// `handle_dotnet_create_js_subclass` exactly, including its "never cleans up the callback ref on
-/// error" leak profile — parity, not a fix, matches this module's other natives.
+/// error" leak profile: parity, not a fix, matches this module's other natives.
 fn native_create_js_subclass(ctx: &CallContext) -> napi::Result<JsUnknown> {
     if ctx.length < 5 {
         return Err(napi::Error::from_reason(
@@ -744,7 +744,7 @@ fn parse_callback_args(env: &Env, bytes: &[u8]) -> Vec<sys::napi_value> {
 }
 
 /// Called by the managed bridge (via the stored function pointer) when a .NET delegate or task
-/// fires. Runs on the JS thread — same pattern as the napi `JsDelegate` COM bridge
+/// fires. Runs on the JS thread: same pattern as the napi `JsDelegate` COM bridge
 /// (`napi_engine::delegate`). Wire format for `args_ptr`: `[count: u8] [tagged values...]`.
 ///
 /// # Safety
@@ -859,7 +859,7 @@ pub(crate) unsafe extern "C" fn napi_invoke_dotnet_js_callback(
 
 /// Install the `__nsDotNet*` / `__nsRunOnUIThread` natives + the `NSWinRT.dotnet` JS layer,
 /// shared by the Node addon and every standalone engine. Idempotent. Registers this module's
-/// `napi_invoke_dotnet_js_callback` as the dispatcher the managed bridge calls back into — see the
+/// `napi_invoke_dotnet_js_callback` as the dispatcher the managed bridge calls back into: see the
 /// module doc comment.
 pub fn install_dotnet(env: &Env) -> napi::Result<()> {
     let mut global = env.get_global()?;
@@ -921,7 +921,7 @@ pub fn install_dotnet(env: &Env) -> napi::Result<()> {
 }
 
 /// The JS half of `NSWinRT.dotnet`, copied verbatim from the classic runtime's
-/// `global_fns.rs` `HELPER_SOURCE` (the native names match exactly, so nothing needed adapting) —
+/// `global_fns.rs` `HELPER_SOURCE` (the native names match exactly, so nothing needed adapting):
 /// keep the two in sync. Requires the dotnet-bridge project to be published into
 /// `<app-root>/dotnet-bridge/publish/DotNetBridge.dll`; a no-op if `__nsDotNetInvokeBin` is absent.
 const DOTNET_HELPERS_JS: &str = r#"
@@ -929,12 +929,12 @@ const DOTNET_HELPERS_JS: &str = r#"
 (function () {
     // Managed-subclass / proxy system, ported verbatim from the classic engine's
     // `HELPER_SOURCE` (the giant bootstrap IIFE spanning `var proxyExtensions = []` through the
-    // `NSWinRT.proxy = {...}` object literal) — see the module doc comment. Runs unconditionally,
+    // `NSWinRT.proxy = {...}` object literal): see the module doc comment. Runs unconditionally,
     // same as classic: `Function.prototype.extend`/`Object.extend`/pure-JS `makeExtendedConstructor`
     // fallback are useful even without a .NET bridge (e.g. WinRT-only class extension). Only
     // `createManagedSubclass` itself requires `__nsDotNetCreateJsSubclass`, which by the time this
     // whole script runs is guaranteed to already be registered (both are installed together, see
-    // `install_dotnet` below) — so no extra guard is needed here.
+    // `install_dotnet` below): so no extra guard is needed here.
     globalThis.NSWinRT = globalThis.NSWinRT || {};
 
     var proxyExtensions = [];
@@ -946,7 +946,7 @@ const DOTNET_HELPERS_JS: &str = r#"
     }
 
     // Wraps a raw tagged handle value into a live DotNet instance proxy exactly like the
-    // NSWinRT.dotnet block below's own private `_wrap` — reused here via the public `wrap` alias
+    // NSWinRT.dotnet block below's own private `_wrap`: reused here via the public `wrap` alias
     // that block exposes on `NSWinRT.dotnet` (see below), since this code has no direct access to
     // that other IIFE's closure. Both IIFEs run synchronously during the same `install_dotnet`
     // call, so by the time createManagedSubclass is actually CALLED, NSWinRT.dotnet.wrap exists.
@@ -1550,7 +1550,38 @@ const DOTNET_HELPERS_JS: &str = r#"
         };
     }
 
-    // @Interfaces([IFoo, IBar]) — attach WinRT interface list to a class.
+    // TypeScript decorator helpers, as the iOS/Android runtimes provide them: compiled
+    // (`experimentalDecorators`) code calls a bare `__decorate(...)`. Core's globals module
+    // binds tslib's copies too, but an ES-module bundle can evaluate decorated core modules
+    // before it runs.
+    if (typeof globalThis.__decorate !== 'function') {
+        globalThis.__decorate = function (decorators, target, key, desc) {
+            var c = arguments.length;
+            var r = c < 3 ? target : desc === null ? (desc = Object.getOwnPropertyDescriptor(target, key)) : desc, d;
+            if (typeof Reflect === 'object' && typeof Reflect.decorate === 'function') {
+                r = Reflect.decorate(decorators, target, key, desc);
+            } else {
+                for (var i = decorators.length - 1; i >= 0; i--) {
+                    if ((d = decorators[i])) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+                }
+            }
+            return c > 3 && r && Object.defineProperty(target, key, r), r;
+        };
+    }
+    if (typeof globalThis.__param !== 'function') {
+        globalThis.__param = function (paramIndex, decorator) {
+            return function (target, key) { decorator(target, key, paramIndex); };
+        };
+    }
+    if (typeof globalThis.__metadata !== 'function') {
+        globalThis.__metadata = function (metadataKey, metadataValue) {
+            if (typeof Reflect === 'object' && typeof Reflect.metadata === 'function') {
+                return Reflect.metadata(metadataKey, metadataValue);
+            }
+        };
+    }
+
+    // @Interfaces([IFoo, IBar]): attach WinRT interface list to a class.
     if (typeof globalThis.Interfaces !== 'function') {
         Object.defineProperty(globalThis, 'Interfaces', {
             value: function Interfaces(interfacesList) {
@@ -1683,7 +1714,7 @@ const DOTNET_HELPERS_JS: &str = r#"
             // through to the real base implementation) and implements exactly these
             // interface members from JS (others fall back to default/no-op). Plain
             // functions are method overrides; accessor descriptors become get_/set_-
-            // prefixed property overrides — matching the literal CLR accessor names the
+            // prefixed property overrides: matching the literal CLR accessor names the
             // dynamic proxy already dispatches by. Read via getOwnPropertyDescriptor
             // throughout so collecting names never invokes a JS getter as a side effect.
             var memberNames = [];
@@ -1730,7 +1761,7 @@ const DOTNET_HELPERS_JS: &str = r#"
 (function () {
     if (typeof globalThis.__nsDotNetInvokeBin !== 'function') return;
     // installDotnet() is independently callable (unlike the classic engine's single monolithic
-    // HELPER_SOURCE, where some earlier block always creates NSWinRT first) — don't assume
+    // HELPER_SOURCE, where some earlier block always creates NSWinRT first): don't assume
     // install_interop ran first.
     globalThis.NSWinRT = globalThis.NSWinRT || {};
 
@@ -1839,12 +1870,12 @@ const DOTNET_HELPERS_JS: &str = r#"
                 if (prop === 'then') return undefined;
                 // Re-read info in case it was populated after construction.
                 var i = _typeInfoCache[typeName] || _emptyInfo;
-                // Write-only: has setter but no getter — reading it is an error.
+                // Write-only: has setter but no getter: reading it is an error.
                 if (i.writeonlyProperties && i.writeonlyProperties.indexOf(prop) >= 0)
                     throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
                 if (i.properties && i.properties.indexOf(prop) >= 0)
                     return _wrap(_invoke({ handle: handle, method: 'get_' + prop, args: [] }));
-                // Not a native property — return a callable for method dispatch.
+                // Not a native property: return a callable for method dispatch.
                 return function () {
                     var args = Array.prototype.slice.call(arguments).map(_unwrap);
                     return _wrap(_invoke({ handle: handle, method: prop, args: args }));
@@ -1853,14 +1884,14 @@ const DOTNET_HELPERS_JS: &str = r#"
             set: function (_, prop, value) {
                 if (typeof prop === 'symbol') return true;
                 var i = _typeInfoCache[typeName] || _emptyInfo;
-                // Read-only: has getter but no setter — assignment is an error.
+                // Read-only: has getter but no setter: assignment is an error.
                 if (i.readonlyProperties && i.readonlyProperties.indexOf(prop) >= 0)
                     throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
-                // Writable (read-write or write-only) — invoke the setter.
+                // Writable (read-write or write-only): invoke the setter.
                 if ((i.properties && i.properties.indexOf(prop) >= 0) ||
                     (i.writeonlyProperties && i.writeonlyProperties.indexOf(prop) >= 0))
                     _invoke({ handle: handle, method: 'set_' + prop, args: [_unwrap(value)] });
-                // Not a native property — don't intercept, let JS do its thing.
+                // Not a native property: don't intercept, let JS do its thing.
                 return true;
             },
         });
@@ -1945,7 +1976,7 @@ const DOTNET_HELPERS_JS: &str = r#"
                     return function() { return '[.NET ' + path + ']'; };
                 var assembly = _resolveAssembly(path);
                 var info = _getTypeInfo(assembly, path);
-                // Write-only static property — reading it is an error.
+                // Write-only static property: reading it is an error.
                 if (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0)
                     throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + path + '\'');
                 // Readable static property: resolve value immediately.
@@ -1965,19 +1996,19 @@ const DOTNET_HELPERS_JS: &str = r#"
                 if (typeof prop === 'symbol') return true;
                 var assembly = _resolveAssembly(path);
                 var info = _getTypeInfo(assembly, path);
-                // Read-only static property — assignment is an error.
+                // Read-only static property: assignment is an error.
                 if (info.readonlyStaticProperties && info.readonlyStaticProperties.indexOf(prop) >= 0)
                     throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + path + '\'');
-                // Writable (read-write or write-only) — invoke the setter.
+                // Writable (read-write or write-only): invoke the setter.
                 if ((info.staticProperties && info.staticProperties.indexOf(prop) >= 0) ||
                     (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0))
                     _invoke({ assembly: assembly, typeName: path, method: 'set_' + prop, args: [_unwrap(value)] });
-                // Not a native property — don't intercept.
+                // Not a native property: don't intercept.
                 return true;
             },
             apply: function (_, _this, args) {
                 var lastDot  = path.lastIndexOf('.');
-                // No dot means this is a top-level name being called directly —
+                // No dot means this is a top-level name being called directly:
                 // there is no type+method pair to dispatch, so bail out.
                 if (lastDot <= 0) return undefined;
                 var typeName = path.substring(0, lastDot);
