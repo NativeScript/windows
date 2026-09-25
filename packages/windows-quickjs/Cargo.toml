@@ -27,7 +27,7 @@ host_dll = ["napi_shim"]
 [dependencies]
 # napi-rs: its `Env` operates against the shim's napi_env (Env::from_raw).
 napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
-runtime = { path = "../../runtime", features = ["napi_engine", "module_runner"], optional = true }
+runtime = { path = "../../runtime", default-features = false, features = ["napi_engine", "module_runner"], optional = true }
 # Shared JS prelude + URL polyfill: used by both the cdylib (abi.rs) and the demo bin (main.rs).
 ns-windows-common = { path = "../common", optional = true }
 # Crash reporter + self-test harness for the demo bin (main.rs) only: never linked into the cdylib.

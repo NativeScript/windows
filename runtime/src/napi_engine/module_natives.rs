@@ -85,7 +85,7 @@ pub fn install_module_natives(env: &Env, app_root: &str) -> napi::Result<()> {
 
             let mut candidate = if specifier.starts_with("./") || specifier.starts_with("../") {
                 let parent = parent_path
-                    .map(|v| crate::global_fns::normalize_js_path(&v))
+                    .map(|v| crate::normalize_js_path(&v))
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
                 // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`,
                 // so also check the sealed bundle's table — otherwise a relative require() from a
@@ -99,7 +99,7 @@ pub fn install_module_natives(env: &Env, app_root: &str) -> napi::Result<()> {
                 };
                 base.join(&specifier)
             } else {
-                let direct = crate::global_fns::normalize_js_path(&specifier);
+                let direct = crate::normalize_js_path(&specifier);
                 if direct.is_absolute() {
                     direct
                 } else {
@@ -117,7 +117,7 @@ pub fn install_module_natives(env: &Env, app_root: &str) -> napi::Result<()> {
                 }
             };
 
-            candidate = crate::global_fns::try_resolve_with_known_extensions(candidate);
+            candidate = crate::try_resolve_with_known_extensions(candidate);
             let resolved = candidate.canonicalize().unwrap_or(candidate);
             match resolved.to_str() {
                 Some(p) => Ok(as_unknown(env, env.create_string(p)?)),

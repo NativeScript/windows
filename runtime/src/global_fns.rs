@@ -13,7 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::type_description::build_runtime_type_descriptor;
-use crate::{proxy_manifests, throw_js_error, Runtime, ASYNC_PUMP_HOOK};
+use crate::dotnet::{bin_write_str16, bin_write_str32};
+use crate::{normalize_js_path, proxy_manifests, throw_js_error, try_resolve_with_known_extensions, Runtime, ASYNC_PUMP_HOOK};
 use std::cell::RefCell;
 use std::ffi::c_void;
 
@@ -196,39 +197,7 @@ fn try_get_async_status(
     Err("Async Status is not a numeric value".to_string())
 }
 
-pub(crate) fn normalize_js_path(path: &str) -> PathBuf {
-    if let Some(raw) = path.strip_prefix("file:///") {
-        return PathBuf::from(raw.replace('/', "\\"));
-    }
-    if let Some(raw) = path.strip_prefix("file://") {
-        return PathBuf::from(raw.replace('/', "\\"));
-    }
-    PathBuf::from(path)
-}
 
-pub(crate) fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
-    // Each `.exists()` probe also checks the sealed app.nsbundle's decrypted table (a no-op,
-    // cheap OnceLock read when no bundle is loaded) — a packed app has no real `app/` directory
-    // on disk, so `is_dir()`/`.exists()` alone would never resolve anything.
-    if candidate.exists() || crate::source_protect::contains(&candidate.to_string_lossy()) {
-        return candidate;
-    }
-    if candidate.extension().is_none() {
-        for ext in ["js", "mjs", "cjs"] {
-            let with_ext = candidate.with_extension(ext);
-            if with_ext.exists() || crate::source_protect::contains(&with_ext.to_string_lossy()) {
-                return with_ext;
-            }
-        }
-    }
-    for index_file in ["index.js", "index.mjs", "index.cjs"] {
-        let with_index = candidate.join(index_file);
-        if with_index.exists() || crate::source_protect::contains(&with_index.to_string_lossy()) {
-            return with_index;
-        }
-    }
-    candidate
-}
 
 fn default_auto_capture_path() -> PathBuf {
     if let Ok(explicit) = std::env::var("NSWINRT_AUTO_METADATA_PATH") {
@@ -4244,10 +4213,6 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     }
 }
 
-pub(crate) fn bin_write_str16(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
 
 pub(crate) fn handle_dotnet_await_task(
     scope: &mut v8::PinScope<'_, '_>,
@@ -4414,10 +4379,6 @@ fn bin_write_v8_arg(
     buf.push(0x00);
 }
 
-pub(crate) fn bin_write_str32(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
 
 fn bin_write_v8_value(
     buf: &mut Vec<u8>,

@@ -2,8 +2,8 @@
 // parsing, write/read native slots, out-params, struct field bytes.
 const ns = require('../index.js');
 
-// PropertyValue boxing needs WinRT initialized on this thread.
-ns.init(process.cwd());
+// PropertyValue boxing needs WinRT initialized on this thread (installInterop brings it up).
+ns.installInterop();
 
 let pass = 0, fail = 0;
 function check(name, got, expected) {

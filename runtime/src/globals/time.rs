@@ -5,6 +5,7 @@ use std::time::Instant;
 /// Initialized on first use (earliest of the two callers wins).
 pub(crate) static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
+#[cfg(feature = "classic")]
 fn handle_time(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -14,6 +15,7 @@ fn handle_time(
     retval.set_double(start.elapsed().as_nanos() as f64 / 1_000_000.0);
 }
 
+#[cfg(feature = "classic")]
 pub fn init_time(scope: &mut v8::PinScope<'_, '_, ()>, global: &mut v8::Local<v8::ObjectTemplate>) {
     // Capture the start time as early as possible.
     PROCESS_START.get_or_init(Instant::now);

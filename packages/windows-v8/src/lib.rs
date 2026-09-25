@@ -5,6 +5,11 @@
 //! sandbox), so the shim needs no ABI-matching defines. The Android bring-up (`jsr.cpp`) is
 //! replaced by `csrc/win_jsr.cpp`.
 
+// The C++ shim (v8-api.cpp, win_jsr.cpp) calls into V8. Keeps the v8 crate, and with it rusty_v8's
+// static lib, in the link even where no Rust code here names it (the runtime crate is built without
+// its V8-based classic engine).
+extern crate v8;
+
 pub mod ffi {
     use napi::sys::{napi_env, napi_value};
     use std::os::raw::c_char;

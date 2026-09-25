@@ -27,7 +27,9 @@ Same convention as `@nativescript/android` / `@nativescript/ios`:
 - **`@nativescript/windows`** — the **classic V8** app runtime (the `runtime` crate + rusty_v8,
   default features), built via the `nativescript` cdylib. The current/default runtime.
 - **`@nativescript/windows-<engine>`** — the engine variants in this dir (`-quickjs`, `-hermes`,
-  `-v8`, `-jsc`), each a napi-backed runtime. Like `@nativescript/android-jsc`.
+  `-v8`, `-jsc`), each a napi-backed runtime. Like `@nativescript/android-jsc`. They build the
+  `runtime` crate without its default `classic` feature (the rusty_v8 engine), so only `-v8` links
+  V8, as its engine.
 - **`@nativescript/windows-napi`** — a separate consumption mode (the `.node` in `../windows-napi`):
   run WinRT interop from an existing **Node/Bun/Deno** host. Not an app runtime; Windows-specific.
 

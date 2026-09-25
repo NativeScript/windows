@@ -67,19 +67,9 @@ export declare function structFieldBytes(value: unknown, ty: string): Array<numb
  */
 export declare function boxTyped(value: unknown, ty: string): number
 /**
- * Create the runtime rooted at `appRoot` (defaults to the empty string). Idempotent: a second
- * call while a runtime already exists is a no-op and returns `true`.
+ * Pump the calling thread's Win32 messages (WinRT async completions, cross-apartment
+ * delegate invokes, `createWindow` input). Returns `true` if a message was dispatched.
  */
-export declare function init(appRoot?: string | undefined | null): boolean
-/** Evaluate `script` under `filename` (defaults to `main.js`) in the runtime's context. */
-export declare function runScript(script: string, filename?: string | undefined | null): void
-/**
- * Drain JS timers and pump the appropriate message/dispatcher loop for one tick. Wire this to
- * a libuv `check`/`prepare` handle (or an `setImmediate` loop) so `setTimeout`, WinRT async
- * `Completed` callbacks, and their promise continuations fire.
- */
-export declare function pumpTimers(): void
-/** Pump Win32 messages and flush microtasks. Returns `true` if a message was dispatched. */
 export declare function pumpMessages(): boolean
 /** The last JS error (message + stack), if any. */
 export declare function lastError(): string | null
@@ -141,5 +131,3 @@ export declare function installInterop(): void
  * `dotnet-bridge/publish/DotNetBridge.dll` exists next to the app.
  */
 export declare function installDotnet(): void
-/** Tear the runtime down on this thread. */
-export declare function deinit(): void

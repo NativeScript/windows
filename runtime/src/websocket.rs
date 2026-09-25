@@ -11,6 +11,7 @@
 //! The socket threads and event channel (`connect` / `send` / `shutdown` / `take_events`) are
 //! engine-neutral; the napi engines bind the same natives in `napi_engine::websocket`.
 
+#[cfg(feature = "classic")]
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -27,6 +28,7 @@ use windows::Win32::Networking::WinHttp::{
 };
 
 use crate::winhttp::Handle;
+#[cfg(feature = "classic")]
 use crate::DELEGATE_ISOLATE_PTR;
 
 pub(crate) enum Event {
@@ -50,17 +52,20 @@ fn sockets() -> &'static Mutex<HashMap<i32, Arc<Socket>>> {
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
 
 thread_local! {
+    #[cfg(feature = "classic")]
     static CALLBACKS: RefCell<HashMap<i32, v8::Global<v8::Function>>> = RefCell::new(HashMap::new());
     static CHANNEL: (Sender<(i32, Event)>, Receiver<(i32, Event)>) = mpsc::channel();
 }
 
 /// Called from `Runtime::drop` while the isolate is alive.
+#[cfg(feature = "classic")]
 pub(crate) fn clear_thread_sockets() {
     let ids: Vec<i32> = CALLBACKS.with(|c| c.borrow_mut().drain().map(|(id, _)| id).collect());
     drop_sockets(&ids);
 }
 
 /// Close (1001, going away) and forget sockets whose JS side is gone.
+#[cfg(feature = "classic")]
 pub(crate) fn drop_sockets(ids: &[i32]) {
     if let Ok(mut map) = sockets().lock() {
         for id in ids {
@@ -192,6 +197,7 @@ fn run_socket(id: i32, url: String, protocols: Vec<String>, tx: Sender<(i32, Eve
 /// `__nsWebSocketOpen(url, protocols, onEvent) → id`. `onEvent(type, a, b, c)` receives
 /// `('open', protocol)`, `('message', data)`, `('error', message)` and
 /// `('close', code, reason, wasClean)`.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_open(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -217,6 +223,7 @@ pub(crate) fn handle_open(
 
 /// `__nsWebSocketSend(id, data)`: a string (text frame) or ArrayBuffer/view (binary frame).
 /// Returns false when the socket isn't open.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_send(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -244,6 +251,7 @@ pub(crate) fn handle_send(
 }
 
 /// `__nsWebSocketClose(id, code, reason)`.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -255,6 +263,7 @@ pub(crate) fn handle_close(
     shutdown(id, code, &reason);
 }
 
+#[cfg(feature = "classic")]
 fn str_val<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::Value> {
     match v8::String::new(scope, s) {
         Some(v) => v.into(),
@@ -263,6 +272,7 @@ fn str_val<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::V
 }
 
 /// Deliver queued socket events to JS. Runs from `timers::pump()` on the JS thread.
+#[cfg(feature = "classic")]
 pub(crate) fn pump() {
     let events = take_events();
     if events.is_empty() {

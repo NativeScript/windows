@@ -8,97 +8,150 @@ pub mod esm_http;
 pub(crate) mod dotnet;
 mod error;
 mod ffi;
+#[cfg(feature = "classic")]
 mod generic_method_call;
+#[cfg(feature = "classic")]
 mod global_fns;
 mod globals;
 mod helpers;
+#[cfg(feature = "classic")]
 mod hmr_support;
+#[cfg(feature = "classic")]
 pub mod inspector;
+#[cfg(feature = "classic")]
 mod interop;
 mod js_observable_vector;
+#[cfg(feature = "classic")]
 mod livesync;
+#[cfg(feature = "classic")]
 mod message_port;
 mod method_call;
+#[cfg(feature = "classic")]
 mod name_space;
 #[cfg(feature = "napi_engine")]
 pub mod napi_engine;
+#[cfg(feature = "classic")]
 mod ns_proxy;
 mod property_call;
+#[cfg(feature = "classic")]
 mod proxy_manifest_loader;
 pub mod source_protect;
+#[cfg(feature = "classic")]
 pub mod timers;
+#[cfg(feature = "classic")]
 mod type_description;
 pub mod ui_dispatcher;
 mod value;
+#[cfg(feature = "classic")]
 pub(crate) mod win32;
+#[cfg(feature = "classic")]
 pub(crate) mod win32_fast;
+#[cfg(feature = "classic")]
 pub(crate) mod win32_known_fns;
 mod websocket;
 mod winhttp;
+#[cfg(feature = "classic")]
 mod worker_support;
+#[cfg(feature = "classic")]
 mod worker_threads;
 
+#[cfg(feature = "classic")]
 use crate::ns_proxy::CallbackThisObject;
+#[cfg(feature = "classic")]
 use crate::proxy_manifest_loader::SbgManifestLoader;
+#[cfg(feature = "classic")]
 use crate::value::{
     ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg,
     ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg,
     ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg,
     ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg,
-    ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr, set_ret_val, NativeType,
-    NativeValue, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER,
+    ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr, set_ret_val, MAX_SAFE_INTEGER,
+    MIN_SAFE_INTEGER,
 };
-use ahash::{AHashMap, AHashSet, AHasher};
+use crate::value::NativeType;
+#[cfg(feature = "classic")]
+use crate::value::NativeValue;
+use ahash::AHashSet;
+#[cfg(feature = "classic")]
+use ahash::{AHashMap, AHasher};
+#[cfg(feature = "classic")]
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+#[cfg(feature = "classic")]
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
 use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
 use metadata::declarations::delegate_declaration::DelegateDeclaration;
 use metadata::declarations::delegate_declaration::DelegateDeclarationImpl;
+#[cfg(feature = "classic")]
 use metadata::declarations::enum_declaration::EnumDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::event_declaration::EventDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::property_declaration::PropertyDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::generic_instance_id_builder::GenericInstanceIdBuilder;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
+#[cfg(feature = "classic")]
 use metadata::value::Value;
-use parking_lot::lock_api::{
-    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard,
-};
-use parking_lot::{Mutex, RawRwLock, RwLock};
+use parking_lot::lock_api::{MappedRwLockReadGuard, RwLockReadGuard};
+#[cfg(feature = "classic")]
+use parking_lot::lock_api::{MappedRwLockWriteGuard, RwLockWriteGuard};
+use parking_lot::{RawRwLock, RwLock};
+#[cfg(feature = "classic")]
+use parking_lot::Mutex;
+#[cfg(feature = "classic")]
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::fs;
+#[cfg(feature = "classic")]
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering as AtomicOrdering};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
+#[cfg(feature = "classic")]
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, OnceLock};
+#[cfg(feature = "classic")]
+use std::sync::Once;
+#[cfg(feature = "classic")]
 use v8::{FunctionTemplate, Local};
-use windows::core::{Error, IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING, PCWSTR};
+use windows::core::{IUnknown, Interface, GUID, HSTRING, PCWSTR};
+#[cfg(feature = "classic")]
+use windows::core::{Error, HRESULT};
+#[cfg(feature = "classic")]
+use windows::core::IInspectable;
+#[cfg(feature = "classic")]
 use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+use windows::Win32::System::WinRT::RoGetActivationFactory;
+#[cfg(feature = "classic")]
 use windows::Win32::System::WinRT::{
-    IActivationFactory, RoGetActivationFactory, RoInitialize, RoUninitialize,
-    RO_INIT_SINGLETHREADED,
+    IActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED,
 };
+#[cfg(feature = "classic")]
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
+#[cfg(feature = "classic")]
 thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCell::new(None));
 
 // Raw pointer to the V8 isolate, set once during Runtime::new so that
 // JS delegate Invoke trampolines can enter V8 without a scope on the stack.
+#[cfg(feature = "classic")]
 thread_local!(pub(crate) static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(std::ptr::null_mut()));
 // Re-entrancy depth for JsDelegate::Invoke. When > 0 a delegate is firing while we're
 // already inside a V8 scope (e.g. XAML re-entering ContainerContentChanging), so we must
@@ -112,6 +165,7 @@ thread_local!(pub(crate) static MICROTASK_DRAIN_QUEUED: Cell<bool> = Cell::new(f
 // JS functions registered via NSWinRT.asDelegate so managed .NET delegates can
 // call back into V8. Keyed by the integer id sent to C# as the callback id.
 // Thread-local because V8 globals must be accessed on the isolate's thread.
+#[cfg(feature = "classic")]
 thread_local!(pub(crate) static DOTNET_JS_CALLBACKS: RefCell<HashMap<i32, v8::Global<v8::Function>>> = RefCell::new(HashMap::new()));
 pub(crate) static DOTNET_NEXT_CB_ID: AtomicI32 = AtomicI32::new(1);
 // JS callbacks that should be removed after a single invocation (oneshot).
@@ -124,6 +178,7 @@ thread_local!(pub static ASYNC_PUMP_HOOK: RefCell<Option<Box<dyn FnMut()>>> = Re
 
 // Native ESM module registry: resolved absolute path → compiled V8 Module handle.
 // Pre-populated by `compile_module_graph` before `instantiate_module` is called.
+#[cfg(feature = "classic")]
 thread_local!(static ESM_MODULE_REGISTRY: RefCell<HashMap<String, v8::Global<v8::Module>>> = RefCell::new(HashMap::new()));
 
 // Maps a V8 Module identity hash (i32) to its resolved absolute path.
@@ -165,6 +220,7 @@ pub fn store_last_js_error(error: String) {
 /// called from `CompositionTarget.Rendering` via `runtime_pump_timers`, and
 /// pumping Win32 messages inside a XAML rendering callback causes reentrancy
 /// in XAML's internal rendering state machine.
+#[cfg(feature = "classic")]
 pub fn pump_dispatcher() {
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
     if isolate_ptr.is_null() {
@@ -199,6 +255,7 @@ pub fn pump_dispatcher() {
 /// must skip its inline checkpoint. Returns `false` when this thread has no
 /// XAML dispatcher: console hosts, workers and tests keep the inline
 /// checkpoint, where no render walk exists and prompt draining is preferable.
+#[cfg(feature = "classic")]
 pub(crate) fn defer_microtask_drain() -> bool {
     MICROTASK_DRAIN_QUEUED.with(|queued| {
         if queued.get() {
@@ -222,7 +279,8 @@ pub(crate) fn defer_microtask_drain() -> bool {
     })
 }
 
-/// Pump Win32 messages and flush V8 microtasks.
+/// Pump Win32 messages and, on the classic engine, flush V8 microtasks (napi hosts drain their
+/// own engine's queue around this call).
 ///
 /// Safe to call from a console app's own event loop (no XAML renderer active).
 /// Do NOT call this from `CompositionTarget.Rendering`: use `pump_dispatcher()`
@@ -239,6 +297,7 @@ pub fn pump_messages() -> bool {
             dispatched = true;
         }
     }
+    #[cfg(feature = "classic")]
     pump_dispatcher();
     dispatched
 }
@@ -346,6 +405,7 @@ pub fn diag_libffi_create_string_value_via_runtime(s: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "classic")]
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
@@ -353,7 +413,9 @@ pub struct Runtime {
     winrt_initialized: bool,
 }
 
+#[cfg(feature = "classic")]
 static INIT: Once = Once::new();
+#[cfg(feature = "classic")]
 static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static LOG_TO_CONSOLE: OnceLock<AtomicBool> = OnceLock::new();
 /// Directory for the runtime trace log (`console.log`). Set by the host via
@@ -365,16 +427,19 @@ static LOG_DIR: OnceLock<String> = OnceLock::new();
 // COM identity → JS wrapper object cache. Keyed on the canonical IUnknown pointer
 // (obtained via QueryInterface(IID_IUnknown)), so the same underlying COM object
 // always maps to the same JS proxy.
+#[cfg(feature = "classic")]
 thread_local!(pub(crate) static INSTANCE_CACHE: RefCell<HashMap<usize, v8::Weak<v8::Object>>> = RefCell::new(HashMap::new()));
 
 /// When the cache exceeds this size, request an incremental GC so that weak
 /// finalizers can drain dead entries.
+#[cfg(feature = "classic")]
 pub(crate) const INSTANCE_CACHE_GC_THRESHOLD: usize = 512;
 
 // Next cache size at which to deliver a GC nudge. Doubles after each nudge:
 // a fixed threshold oscillates in allocation loops (nudge → GC prunes below
 // threshold → next insert re-nudges), serializing every creation behind
 // incremental-marking work.
+#[cfg(feature = "classic")]
 thread_local!(pub(crate) static GC_NUDGE_NEXT_AT: std::cell::Cell<usize> = std::cell::Cell::new(INSTANCE_CACHE_GC_THRESHOLD));
 
 // IActivationFactory cache: RoGetActivationFactory is expensive (COM broker round-trip) but factories
@@ -382,6 +447,7 @@ thread_local!(pub(crate) static GC_NUDGE_NEXT_AT: std::cell::Cell<usize> = std::
 // Keyed on the WinRT class full name (e.g. "Microsoft.UI.Xaml.Controls.TextBlock").
 thread_local!(static ACTIVATION_FACTORY_CACHE: RefCell<HashMap<String, IUnknown>> = RefCell::new(HashMap::new()));
 
+#[cfg(feature = "classic")]
 pub(crate) struct EventRegistration {
     pub(crate) token: i64,
     pub(crate) handler: v8::Global<v8::Value>,
@@ -389,6 +455,7 @@ pub(crate) struct EventRegistration {
 
 // Keyed on COM identity, not the JS proxy: if a proxy is GC'd and the same native
 // object is re-wrapped, the old token must still be findable to avoid double-fire.
+#[cfg(feature = "classic")]
 thread_local!(pub(crate) static EVENT_REGISTRY: RefCell<HashMap<usize, HashMap<String, EventRegistration>>> = RefCell::new(HashMap::new()));
 
 pub(crate) fn com_identity(unk: &IUnknown) -> Option<usize> {
@@ -397,6 +464,7 @@ pub(crate) fn com_identity(unk: &IUnknown) -> Option<usize> {
 
 /// Called after inserting into the cache; re-arms once the cache genuinely
 /// shrinks back under the base threshold.
+#[cfg(feature = "classic")]
 #[inline]
 pub(crate) fn maybe_request_gc_nudge(cache_size: usize, isolate: &mut v8::Isolate) {
     GC_NUDGE_NEXT_AT.with(|next| {
@@ -427,27 +495,33 @@ pub(crate) fn maybe_request_gc_nudge(cache_size: usize, isolate: &mut v8::Isolat
     });
 }
 
+#[cfg(feature = "classic")]
 const GC_NUDGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 thread_local!(static GC_NUDGE_LAST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
 
+#[cfg(feature = "classic")]
 pub(crate) fn proxy_manifests() -> &'static Mutex<Vec<String>> {
     PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Tracks hashes of already-loaded manifests to avoid O(N×size) string comparison.
+#[cfg(feature = "classic")]
 static MANIFEST_HASHES: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
 
+#[cfg(feature = "classic")]
 pub(crate) fn manifest_hashes() -> &'static Mutex<HashSet<u64>> {
     MANIFEST_HASHES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn content_hash(s: &str) -> u64 {
     let mut h = AHasher::default();
     s.hash(&mut h);
     h.finish()
 }
 
+#[cfg(feature = "classic")]
 fn default_sbg_manifest_path() -> PathBuf {
     if let Ok(explicit) = std::env::var("SBG_MANIFEST_PATH") {
         return PathBuf::from(explicit);
@@ -461,6 +535,7 @@ fn default_sbg_manifest_path() -> PathBuf {
         .join("sbg-manifest.json")
 }
 
+#[cfg(feature = "classic")]
 fn preload_sbg_manifest() {
     let manifest_path = default_sbg_manifest_path();
     if !manifest_path.exists() {
@@ -486,6 +561,7 @@ fn preload_sbg_manifest() {
     }
 }
 
+#[cfg(feature = "classic")]
 fn split_type_name(type_name: &str) -> (Option<String>, String) {
     match type_name.rsplit_once('.') {
         Some((namespace, class_name)) => (Some(namespace.to_string()), class_name.to_string()),
@@ -493,6 +569,7 @@ fn split_type_name(type_name: &str) -> (Option<String>, String) {
     }
 }
 
+#[cfg(feature = "classic")]
 fn extend_class_methods(
     class_declaration: &ClassDeclaration,
     methods: &mut Vec<MethodDeclaration>,
@@ -552,6 +629,7 @@ fn extend_class_methods(
     }
 }
 
+#[cfg(feature = "classic")]
 fn extend_class_properties(
     class_declaration: &ClassDeclaration,
     properties: &mut Vec<PropertyDeclaration>,
@@ -597,6 +675,7 @@ fn extend_class_properties(
     }
 }
 
+#[cfg(feature = "classic")]
 fn collect_class_methods(class_declaration: &ClassDeclaration) -> Vec<MethodDeclaration> {
     let mut methods = Vec::new();
     let mut seen = HashSet::new();
@@ -604,6 +683,7 @@ fn collect_class_methods(class_declaration: &ClassDeclaration) -> Vec<MethodDecl
     methods
 }
 
+#[cfg(feature = "classic")]
 fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<PropertyDeclaration> {
     let mut properties = Vec::new();
     let mut seen = HashSet::new();
@@ -611,6 +691,7 @@ fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<Propert
     properties
 }
 
+#[cfg(feature = "classic")]
 struct ClassMembers {
     properties: AHashMap<String, PropertyDeclaration>,
     /// Keyed by overload name when present, plain name otherwise.
@@ -620,8 +701,10 @@ struct ClassMembers {
 // Per-thread because `PropertyDeclaration` / `MethodDeclaration` carry raw
 // WinMD pointers that aren't `Send`. UWP runs single-threaded, so this is
 // effectively a global cache.
+#[cfg(feature = "classic")]
 thread_local!(static CLASS_MEMBERS_CACHE: RefCell<AHashMap<String, ClassMembers>> = RefCell::new(AHashMap::new()));
 
+#[cfg(feature = "classic")]
 fn fill_class_members(
     class_declaration: &ClassDeclaration,
     properties: &mut AHashMap<String, PropertyDeclaration>,
@@ -670,6 +753,7 @@ fn fill_class_members(
     }
 }
 
+#[cfg(feature = "classic")]
 fn with_class_members<R>(
     class_declaration: &ClassDeclaration,
     f: impl FnOnce(&ClassMembers) -> R,
@@ -701,6 +785,7 @@ fn with_class_members<R>(
     })
 }
 
+#[cfg(feature = "classic")]
 fn find_class_property(
     class_declaration: &ClassDeclaration,
     name: &str,
@@ -708,6 +793,7 @@ fn find_class_property(
     with_class_members(class_declaration, |m| m.properties.get(name).cloned())
 }
 
+#[cfg(feature = "classic")]
 fn find_class_method(
     class_declaration: &ClassDeclaration,
     name: &str,
@@ -715,6 +801,7 @@ fn find_class_method(
     with_class_members(class_declaration, |m| m.methods.get(name).cloned())
 }
 
+#[cfg(feature = "classic")]
 fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
     let method_match = |m: &MethodDeclaration| {
         let on = m.overload_name();
@@ -748,6 +835,7 @@ fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> boo
     false
 }
 
+#[cfg(feature = "classic")]
 fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
     if class_declaration
         .properties()
@@ -780,10 +868,12 @@ fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> b
     false
 }
 
+#[cfg(feature = "classic")]
 fn class_has_member_named(class_declaration: &ClassDeclaration, name: &str) -> bool {
     class_method_matches(class_declaration, name) || class_property_matches(class_declaration, name)
 }
 
+#[cfg(feature = "classic")]
 fn find_event_methods(
     class_declaration: &ClassDeclaration,
     name: &str,
@@ -818,6 +908,9 @@ fn find_event_methods(
     None
 }
 
+// The payloads are read by the classic engine's return conversion; the napi engines convert
+// from the raw result and only match on the variant.
+#[cfg_attr(not(feature = "classic"), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) enum ReturnKind {
     Void,
@@ -880,12 +973,14 @@ pub(crate) fn classify_return(return_type: &str, is_void: bool) -> ReturnKind {
 pub(crate) struct DeclarationFFI {
     pub(crate) inner: Arc<RwLock<dyn Declaration>>,
     pub(crate) instance: Option<IUnknown>,
+    #[cfg(feature = "classic")]
     pub(crate) parent: Option<Arc<RwLock<dyn Declaration>>>,
     pub(crate) struct_instance: Option<(Vec<u8>, Vec<NativeType>)>,
     /// For inherited static properties/methods: the fully-qualified name of the
     /// WinRT class that declares them. Resolved lazily via class_activation_factory
     /// on first access so that constructors don't pay the cost of RoGetActivationFactory
     /// for every inherited static at object-creation time.
+    #[cfg(feature = "classic")]
     pub(crate) static_factory_class: Option<String>,
 }
 
@@ -894,6 +989,7 @@ unsafe impl Sync for DeclarationFFI {}
 unsafe impl Send for DeclarationFFI {}
 
 impl DeclarationFFI {
+    #[cfg(feature = "classic")]
     pub fn new(declaration: Arc<RwLock<dyn Declaration>>) -> Self {
         Self {
             inner: declaration,
@@ -904,6 +1000,7 @@ impl DeclarationFFI {
         }
     }
 
+    #[cfg(feature = "classic")]
     pub fn new_with_instance(
         declaration: Arc<RwLock<dyn Declaration>>,
         instance: Option<IUnknown>,
@@ -917,6 +1014,7 @@ impl DeclarationFFI {
         }
     }
 
+    #[cfg(feature = "classic")]
     pub fn as_any(&self) -> MappedRwLockReadGuard<'_, RawRwLock, dyn Any> {
         RwLockReadGuard::map(self.inner.read(), |dec| dec.as_any())
     }
@@ -925,6 +1023,7 @@ impl DeclarationFFI {
         RwLockReadGuard::map(self.inner.read(), |dec| dec)
     }
 
+    #[cfg(feature = "classic")]
     pub fn write(&self) -> MappedRwLockWriteGuard<'_, RawRwLock, dyn Declaration> {
         RwLockWriteGuard::map(self.inner.write(), |dec| dec)
     }
@@ -938,11 +1037,16 @@ impl Deref for DeclarationFFI {
     }
 }
 
+#[cfg(feature = "classic")]
 use crate::generic_method_call::GenericMethodCall;
+#[cfg(feature = "classic")]
 use crate::method_call::MethodCall;
+#[cfg(feature = "classic")]
 use crate::property_call::PropertyCall;
+#[cfg(feature = "classic")]
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 
+#[cfg(feature = "classic")]
 struct HasInstanceData {
     /// IID used for the COM QueryInterface check.  `None` for classes and open
     /// generic interfaces that don't have a concrete parameterised IID.
@@ -951,9 +1055,12 @@ struct HasInstanceData {
     full_name: String,
 }
 
+#[cfg(feature = "classic")]
 unsafe impl Send for HasInstanceData {}
+#[cfg(feature = "classic")]
 unsafe impl Sync for HasInstanceData {}
 
+#[cfg(feature = "classic")]
 fn symbol_has_instance_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -1048,6 +1155,7 @@ fn symbol_has_instance_callback(
     retval.set_bool(implements);
 }
 
+#[cfg(feature = "classic")]
 fn dotnet_proxy_native_ptr(
     scope: &mut v8::PinScope<'_, '_>,
     obj: v8::Local<v8::Object>,
@@ -1093,6 +1201,7 @@ fn dotnet_proxy_native_ptr(
     std::ptr::null_mut()
 }
 
+#[cfg(feature = "classic")]
 fn attach_has_instance_to_template(
     scope: &mut v8::PinScope<'_, '_>,
     ctor_tmpl: v8::Local<v8::FunctionTemplate>,
@@ -1115,6 +1224,7 @@ fn attach_has_instance_to_template(
     );
 }
 
+#[cfg(feature = "classic")]
 fn init_global(
     scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>,
     context: v8::Local<v8::Context>,
@@ -1242,6 +1352,7 @@ pub(crate) fn log_dir_for_tests() -> Option<String> {
 /// Disk path for a chunk's V8 bytecode cache, keyed by filename + a hash of the source. A livesync
 /// edit changes the source → different hash → cache miss → recompile (never stale bytecode). Lives
 /// under the app's writable local folder (LOG_DIR). Returns None before that folder is known.
+#[cfg(feature = "classic")]
 fn code_cache_path(filename: &str, script: &str) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let dir = LOG_DIR.get()?;
@@ -1286,6 +1397,7 @@ pub extern "C" fn ns_set_log_to_console(enabled: std::os::raw::c_int) -> std::os
 
 thread_local!(static LOG_FILE: RefCell<Option<fs::File>> = RefCell::new(None));
 
+#[cfg(feature = "classic")]
 pub(crate) fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     if let Some(msg) = v8::String::new(scope, message) {
         let err = v8::Exception::error(scope, msg.into());
@@ -1308,6 +1420,7 @@ pub(crate) fn class_activation_factory(full_name: &str) -> windows::core::Result
     Ok(factory)
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn resolve_class_factory_from_parent(
     dec: &DeclarationFFI,
 ) -> windows::core::Result<IUnknown> {
@@ -1338,6 +1451,7 @@ pub(crate) fn resolve_class_factory_from_parent(
     class_activation_factory(clazz.full_name())
 }
 
+#[cfg(feature = "classic")]
 fn value_to_string(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,
@@ -1346,7 +1460,7 @@ fn value_to_string(
     Some(value.to_rust_string_lossy(scope))
 }
 
-fn normalize_js_path(path: &str) -> PathBuf {
+pub(crate) fn normalize_js_path(path: &str) -> PathBuf {
     if let Some(raw) = path.strip_prefix("file:///") {
         return PathBuf::from(raw.replace('/', "\\"));
     }
@@ -1356,7 +1470,7 @@ fn normalize_js_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
+pub(crate) fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
     // Each `.exists()` probe also checks the sealed app.nsbundle's decrypted table (a no-op,
     // cheap OnceLock read when no bundle is loaded): a packed app has no real `app/` directory
     // on disk, so `is_dir()`/`.exists()` alone would never resolve anything.
@@ -1519,6 +1633,7 @@ fn resolve_file_specifier(specifier: &str, referrer_path: Option<&str>) -> Strin
 /// Stateless V8 resolve-module callback used during `instantiate_module`.
 /// All modules must have been pre-compiled by `compile_module_graph` and stored
 /// in `ESM_MODULE_REGISTRY` / `ESM_HASH_TO_PATH` before this is called.
+#[cfg(feature = "classic")]
 fn resolve_module_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -1561,6 +1676,7 @@ fn module_not_found_message(spec: &str, referrer: Option<&str>, resolved: &str) 
 /// `import.meta` for modules loaded through `compile_module_graph`: `url` (a `file:///` URL, as
 /// the iOS/Android runtimes and bundlers' `new URL(x, import.meta.url)` expect), `filename` and
 /// `dirname`.
+#[cfg(feature = "classic")]
 unsafe extern "C" fn esm_import_meta(
     context: v8::Local<v8::Context>,
     module: v8::Local<v8::Module>,
@@ -1592,6 +1708,7 @@ unsafe extern "C" fn esm_import_meta(
 }
 
 /// Message + stack for a thrown/rejected JS value (the `stack` property when it's an Error).
+#[cfg(feature = "classic")]
 fn js_exception_report(scope: &mut v8::PinScope<'_, '_>, exc: v8::Local<v8::Value>) -> String {
     if exc.is_object() {
         if let (Some(obj), Some(key)) = (exc.to_object(scope), v8::String::new(scope, "stack")) {
@@ -1603,6 +1720,7 @@ fn js_exception_report(scope: &mut v8::PinScope<'_, '_>, exc: v8::Local<v8::Valu
     exc.to_rust_string_lossy(scope)
 }
 
+#[cfg(feature = "classic")]
 fn report_module_error(scope: &mut v8::PinScope<'_, '_>, exc: v8::Local<v8::Value>) {
     let report = js_exception_report(scope, exc);
     debug_output(&format!("[NativeScript] Uncaught error evaluating module: {report}\n"));
@@ -1612,6 +1730,7 @@ fn report_module_error(scope: &mut v8::PinScope<'_, '_>, exc: v8::Local<v8::Valu
 /// With top-level await, `Module::evaluate` returns a promise and an exception thrown while the
 /// graph evaluates *rejects* it instead of throwing. Nothing reaches a TryCatch. Surface it: a
 /// settled rejection now, a pending (TLA) graph whenever it rejects.
+#[cfg(feature = "classic")]
 fn report_module_evaluation(scope: &mut v8::PinScope<'_, '_>, result: v8::Local<v8::Value>) {
     let Ok(promise) = v8::Local::<v8::Promise>::try_from(result) else {
         return;
@@ -1638,6 +1757,7 @@ fn report_module_evaluation(scope: &mut v8::PinScope<'_, '_>, result: v8::Local<
     }
 }
 
+#[cfg(feature = "classic")]
 fn js_error_value<'s>(scope: &mut v8::PinScope<'s, '_>, msg: &str) -> v8::Local<'s, v8::Value> {
     match v8::String::new(scope, msg) {
         Some(s) => v8::Exception::error(scope, s),
@@ -1668,6 +1788,7 @@ fn registry_key_for(url: &str) -> String {
 
 /// Drop a module from the registry so the next import compiles (and, over HTTP, fetches) it anew.
 /// Importers already linked keep the old record. The HMR client re-imports the graph above it.
+#[cfg(feature = "classic")]
 fn evict_module_key(key: &str) -> bool {
     let removed = ESM_MODULE_REGISTRY.with(|r| r.borrow_mut().remove(key)).is_some();
     ESM_HASH_TO_PATH.with(|m| m.borrow_mut().retain(|_, v| v != key));
@@ -1675,6 +1796,7 @@ fn evict_module_key(key: &str) -> bool {
     removed
 }
 
+#[cfg(feature = "classic")]
 fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, msg: &str) {
     if let Some(s) = v8::String::new(scope, msg) {
         let err = v8::Exception::type_error(scope, s);
@@ -1683,6 +1805,7 @@ fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, msg: &str) {
 }
 
 /// `ns:module` `configureLoader`: called by the JS wrapper with the config as a JSON string.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_ns_module_configure_loader(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -1696,6 +1819,7 @@ pub(crate) fn handle_ns_module_configure_loader(
 
 /// `ns:module` `invalidateModules(urls)`: registry eviction plus a one-shot cache-bust nonce on
 /// each evicted URL's next fetch. Returns the number of registry entries removed.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_ns_module_invalidate(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -1726,6 +1850,7 @@ pub(crate) fn handle_ns_module_invalidate(
 }
 
 /// `ns:module` `getLoadedModuleUrls()`: the URL-keyed (served) modules currently registered.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_ns_module_loaded_urls(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -1888,8 +2013,10 @@ pub mod esm_loader {
 /// already has the root's text). `Ok` carries the root module and `evaluate`'s result (a promise
 /// under TLA); `Err` the value to throw/reject with. The real exception (SyntaxError, link
 /// error, …), not a stringified summary. Globals, since the TryCatch scope is internal.
+#[cfg(feature = "classic")]
 type EsmEvaluated = (v8::Global<v8::Module>, v8::Global<v8::Value>);
 
+#[cfg(feature = "classic")]
 fn esm_load_and_evaluate(
     scope: &mut v8::PinScope<'_, '_>,
     spec: &str,
@@ -1943,12 +2070,14 @@ fn esm_load_and_evaluate(
 
 thread_local! {
     // Modules compiled without a usable code cache, awaiting `flush_module_code_caches`.
+    #[cfg(feature = "classic")]
     static PENDING_MODULE_CODE_CACHES: RefCell<Vec<(v8::Global<v8::Module>, PathBuf)>> =
         const { RefCell::new(Vec::new()) };
 }
 
 /// Write code caches for modules compiled this run. Called after the entry graph evaluates, so
 /// the cache also covers the functions startup compiled lazily, not just top-level code.
+#[cfg(feature = "classic")]
 fn flush_module_code_caches(scope: &mut v8::PinScope<'_, '_>) {
     let pending = PENDING_MODULE_CODE_CACHES.with(|q| std::mem::take(&mut *q.borrow_mut()));
     for (module, path) in pending {
@@ -1968,6 +2097,7 @@ fn flush_module_code_caches(scope: &mut v8::PinScope<'_, '_>) {
 /// Walk and pre-compile the entire transitive module graph starting from `path`.
 /// Compiled modules are stored in `ESM_MODULE_REGISTRY` and `ESM_HASH_TO_PATH`.
 /// Must be called before `instantiate_module`.
+#[cfg(feature = "classic")]
 fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &str) -> bool {
     if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(path)) {
         return true;
@@ -2089,6 +2219,7 @@ fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &s
     true
 }
 
+#[cfg(feature = "classic")]
 fn create_ns_object<'a>(
     name: &str,
     declaration: Arc<RwLock<dyn Declaration>>,
@@ -2129,6 +2260,7 @@ fn create_ns_object<'a>(
 ///   .data3: UInt16
 ///   .data4: Array<number> (8 bytes)
 ///   .toString() / .valueOf(): "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+#[cfg(feature = "classic")]
 unsafe fn guid_ptr_to_js_object<'a>(
     ptr: *mut std::ffi::c_void,
     scope: &mut v8::PinScope<'a, '_>,
@@ -2200,6 +2332,7 @@ unsafe fn guid_ptr_to_js_object<'a>(
 }
 
 /// Captured data for calling a method on a `GenericInterfaceInstance` via the getter interceptor.
+#[cfg(feature = "classic")]
 struct IfaceMethodCallData {
     method: MethodDeclaration,
     instance: IUnknown,
@@ -2247,6 +2380,7 @@ pub(crate) fn extract_generic_type_args(full_name: &str) -> Vec<String> {
     args
 }
 
+#[cfg(feature = "classic")]
 fn create_ns_ctor_instance_object<'a>(
     name: &str,
     factory: Option<IUnknown>,
@@ -5311,6 +5445,7 @@ fn create_ns_ctor_instance_object<'a>(
 /// Converts a raw WinRT out-parameter result pointer to a `Local<v8::Value>`.
 /// Returns `None` for void returns, null COM pointers, or unrecognised types.
 /// The `parent_decl` is forwarded to `create_ns_ctor_instance_object` for COM returns.
+#[cfg(feature = "classic")]
 unsafe fn raw_result_to_local<'s>(
     result: *mut c_void,
     signature: &str,
@@ -5426,6 +5561,7 @@ unsafe fn raw_result_to_local<'s>(
     }
 }
 
+#[cfg(feature = "classic")]
 fn create_ns_ctor_object<'a>(
     name: &str,
     parent: Option<Arc<RwLock<dyn Declaration>>>,
@@ -6586,6 +6722,7 @@ fn create_ns_ctor_object<'a>(
     ret.into()
 }
 
+#[cfg(feature = "classic")]
 fn create_ns_struct_ctor_object<'a>(
     name: &str,
     declaration: Arc<RwLock<dyn Declaration>>,
@@ -7058,6 +7195,7 @@ fn create_ns_struct_ctor_object<'a>(
     ret.into()
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn create_struct_object_from_raw<'a>(
     declaration: Arc<RwLock<dyn Declaration>>,
     raw_data: *mut c_void,
@@ -7125,6 +7263,7 @@ pub(crate) fn create_struct_object_from_raw<'a>(
     object
 }
 
+#[cfg(feature = "classic")]
 fn init_meta(
     scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>,
     context: Local<v8::Context>,
@@ -7166,6 +7305,7 @@ fn init_meta(
 //   - Names that resolve to real WinRT metadata are immutable (writes are ignored).
 //   - Anything else is stored in the per-object side map so user code can stash
 //     custom properties (e.g. `Windows.myShim = ...`) without breaking lookups.
+#[cfg(feature = "classic")]
 fn handle_named_property_setter(
     scope: &mut v8::PinScope<'_, '_>,
     key: Local<v8::Name>,
@@ -7274,6 +7414,7 @@ fn handle_named_property_setter(
     }
 }
 
+#[cfg(feature = "classic")]
 fn handle_named_property_query(
     _scope: &mut v8::PinScope<'_, '_>,
     _key: v8::Local<v8::Name>,
@@ -7285,6 +7426,7 @@ fn handle_named_property_query(
     v8::Intercepted::kNo
 }
 
+#[cfg(feature = "classic")]
 fn handle_named_property_getter(
     scope: &mut v8::PinScope<'_, '_>,
     key: v8::Local<v8::Name>,
@@ -7581,6 +7723,7 @@ fn handle_named_property_getter(
     v8::Intercepted::kNo
 }
 
+#[cfg(feature = "classic")]
 fn handle_indexed_property_setter(
     _scope: &mut v8::PinScope<'_, '_>,
     _index: u32,
@@ -7591,6 +7734,7 @@ fn handle_indexed_property_setter(
     v8::Intercepted::kNo
 }
 
+#[cfg(feature = "classic")]
 fn handle_indexed_property_getter(
     _scope: &mut v8::PinScope<'_, '_>,
     _index: u32,
@@ -7600,6 +7744,7 @@ fn handle_indexed_property_getter(
     v8::Intercepted::kNo
 }
 
+#[cfg(feature = "classic")]
 fn handle_ns_func(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -7613,6 +7758,7 @@ fn handle_ns_func(
 // type shares a single vtable; the per-instance GUID stored in the struct
 // makes QueryInterface work correctly for each concrete type.
 
+#[cfg(feature = "classic")]
 #[repr(C)]
 struct JsDelegateVtbl {
     query_interface:
@@ -7625,6 +7771,7 @@ struct JsDelegateVtbl {
     invoke: unsafe extern "system" fn(*mut JsDelegate, usize, usize, usize, usize) -> HRESULT,
 }
 
+#[cfg(feature = "classic")]
 pub(crate) static JS_DELEGATE_VTBL: JsDelegateVtbl = JsDelegateVtbl {
     query_interface: js_delegate_query_interface,
     add_ref: js_delegate_add_ref,
@@ -7632,11 +7779,13 @@ pub(crate) static JS_DELEGATE_VTBL: JsDelegateVtbl = JsDelegateVtbl {
     invoke: js_delegate_invoke,
 };
 
+#[cfg(feature = "classic")]
 pub(crate) struct JsDelegateData {
     pub(crate) js_func: v8::Global<v8::Function>,
     pub(crate) param_types: Vec<NativeType>,
 }
 
+#[cfg(feature = "classic")]
 #[repr(C)]
 pub(crate) struct JsDelegate {
     pub(crate) vtable: *const JsDelegateVtbl,
@@ -7645,9 +7794,12 @@ pub(crate) struct JsDelegate {
     pub(crate) data: *mut JsDelegateData,
 }
 
+#[cfg(feature = "classic")]
 unsafe impl Send for JsDelegate {}
+#[cfg(feature = "classic")]
 unsafe impl Sync for JsDelegate {}
 
+#[cfg(feature = "classic")]
 unsafe extern "system" fn js_delegate_query_interface(
     this: *mut JsDelegate,
     iid: *const GUID,
@@ -7664,10 +7816,12 @@ unsafe extern "system" fn js_delegate_query_interface(
     }
 }
 
+#[cfg(feature = "classic")]
 unsafe extern "system" fn js_delegate_add_ref(this: *mut JsDelegate) -> u32 {
     (*this).ref_count.fetch_add(1, AtomicOrdering::Relaxed) + 1
 }
 
+#[cfg(feature = "classic")]
 unsafe extern "system" fn js_delegate_release(this: *mut JsDelegate) -> u32 {
     let prev = (*this).ref_count.fetch_sub(1, AtomicOrdering::Release);
     if prev == 1 {
@@ -7679,6 +7833,7 @@ unsafe extern "system" fn js_delegate_release(this: *mut JsDelegate) -> u32 {
     prev - 1
 }
 
+#[cfg(feature = "classic")]
 unsafe extern "system" fn js_delegate_invoke(
     this: *mut JsDelegate,
     p0: usize,
@@ -7697,6 +7852,7 @@ unsafe extern "system" fn js_delegate_invoke(
     }
 }
 
+#[cfg(feature = "classic")]
 fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usize) -> HRESULT {
     if this.is_null() {
         return HRESULT(0x80004005u32 as i32);
@@ -7763,6 +7919,7 @@ fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usi
 
 /// Builds the JS argument list and invokes the delegate function within an already
 /// context-entered scope. Shared by both the top-level and re-entrant paths above.
+#[cfg(feature = "classic")]
 fn js_delegate_run(
     data: &JsDelegateData,
     scope: &mut v8::PinScope<'_, '_>,
@@ -7974,6 +8131,7 @@ pub(crate) fn delegate_info_from_add_method(
 /// input-parameter NativeTypes via `js_delegate_params_from_declaration`, then
 /// allocates a `JsDelegate` COM object and returns `{ handle: External }`:
 /// the same shape that WinRT event-add methods expect.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_as_delegate(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8023,6 +8181,7 @@ pub(crate) fn handle_as_delegate(
 
 /// __nsMakeItemsSource(count) → { handle } wrapping a native IVector<IInspectable>
 /// of `count` boxed Int32 indices, assignable to a XAML ItemsSource so WinUI virtualizes.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_make_items_source(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8056,6 +8215,7 @@ pub(crate) fn handle_make_items_source(
 /// __nsMakeItemsSource) in place to `newCount` items, firing VectorChanged so WinUI adds only the new
 /// rows (preserves scroll position + already-realized cells). Used by the ListView for infinite-scroll
 /// append instead of replacing the whole ItemsSource.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_extend_items_source(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8092,6 +8252,7 @@ pub(crate) fn handle_extend_items_source(
 /// Borrow (without releasing) the IInspectable that __nsMakeItemsSource's `{ handle }` External owns.
 /// Returns None when the handle arg is missing/non-external/null. The External keeps ownership, so the
 /// returned value is wrapped in ManuallyDrop and must not be dropped by the caller.
+#[cfg(feature = "classic")]
 fn items_source_handle(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments,
@@ -8115,6 +8276,7 @@ fn items_source_handle(
 /// __nsInsertItemsSource({ handle }, index, count): insert `count` rows at `index` into an items
 /// source (from __nsMakeItemsSource), firing VectorChanged(ItemInserted) so WinUI adds only the new
 /// rows. Used by the ListView for granular ObservableArray add/splice without a full rebuild.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_insert_items_source(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8130,6 +8292,7 @@ pub(crate) fn handle_insert_items_source(
 
 /// __nsRemoveItemsSource({ handle }, index, count): remove `count` rows at `index`, firing
 /// VectorChanged(ItemRemoved) so WinUI drops only those rows. Granular ObservableArray delete/splice.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_remove_items_source(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8146,6 +8309,7 @@ pub(crate) fn handle_remove_items_source(
 /// __nsResetItemsSource({ handle }, newCount): rebuild the items source to `newCount` rows and fire a
 /// SINGLE VectorChanged(Reset). WinRT has no range event, so this is the one-event way to apply a bulk
 /// change (wholesale replace / large splice / filter); WinUI re-realizes only the visible containers.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_reset_items_source(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8164,6 +8328,7 @@ pub(crate) fn handle_reset_items_source(
 
 /// __nsUpdateItemsSource({ handle }, index, count): fire VectorChanged(ItemChanged) for `count` rows
 /// at `index` (count unchanged) so WinUI re-realizes just those containers. Granular setItem/update.
+#[cfg(feature = "classic")]
 pub(crate) fn handle_update_items_source(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -8177,7 +8342,9 @@ pub(crate) fn handle_update_items_source(
     let _ = crate::js_observable_vector::update_index_vector(&inspectable, index, count);
 }
 
+#[cfg(feature = "classic")]
 impl Runtime {
+    #[cfg(feature = "classic")]
     pub fn new(app_root: &str) -> Self {
         // Look for a sealed app.nsbundle next to app_root before anything else touches the
         // filesystem for JS source: every read/resolve point below consults the decrypted
@@ -8361,6 +8528,7 @@ impl Runtime {
 
     /// Must be called after the Runtime is at a stable address (e.g. boxed),
     /// so the captured isolate pointer doesn't dangle.
+    #[cfg(feature = "classic")]
     pub fn register_delegate_isolate_ptr(&mut self) {
         let raw_isolate: *mut v8::Isolate = &mut *self.isolate as *mut v8::Isolate;
         DELEGATE_ISOLATE_PTR.with(|cell| cell.set(raw_isolate));
@@ -8368,16 +8536,19 @@ impl Runtime {
 
     /// Provides mutable access to the underlying V8 isolate.
     /// Used by the devtools integration to attach a `V8Inspector`.
+    #[cfg(feature = "classic")]
     pub fn isolate_mut(&mut self) -> &mut v8::Isolate {
         &mut self.isolate
     }
 
     /// Returns the persistent context handle.
     /// Used by the devtools integration to register the context with the inspector.
+    #[cfg(feature = "classic")]
     pub fn global_context(&self) -> &v8::Global<v8::Context> {
         &self.global_context
     }
 
+    #[cfg(feature = "classic")]
     pub fn run_module(&mut self, script: &str, filename: &str) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -8468,6 +8639,7 @@ impl Runtime {
         flush_module_code_caches(tc);
     }
 
+    #[cfg(feature = "classic")]
     pub fn run_script(&mut self, script: &str, filename: &str) {
         // Delegate ESM bundles to the native V8 module loader.
         let is_esm = filename.ends_with(".mjs") || {
@@ -8599,6 +8771,7 @@ impl Runtime {
         tc.perform_microtask_checkpoint();
     }
 
+    #[cfg(feature = "classic")]
     pub fn eval_script_to_string(&mut self, script: &str) -> Option<String> {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -8629,6 +8802,7 @@ impl Runtime {
 
     /// Invokes the JS global `__nsOnAppEvent(kind, message)` if defined. Called by the host
     /// (via `runtime_notify_app_event`) to forward lifecycle events; runs on the V8/UI thread.
+    #[cfg(feature = "classic")]
     pub fn notify_app_event(&mut self, kind: i32, message: Option<&str>) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -8667,6 +8841,7 @@ impl Runtime {
     pub fn dispose(&self) {}
 }
 
+#[cfg(feature = "classic")]
 impl Drop for Runtime {
     fn drop(&mut self) {
         // Every thread-local that holds isolate-tied state (v8::Global, v8::Weak,
@@ -8703,8 +8878,10 @@ impl Drop for Runtime {
     }
 }
 
+#[cfg(feature = "classic")]
 struct WorkerValueSerializer;
 
+#[cfg(feature = "classic")]
 impl v8::ValueSerializerImpl for WorkerValueSerializer {
     fn throw_data_clone_error<'s>(
         &self,
@@ -8716,15 +8893,19 @@ impl v8::ValueSerializerImpl for WorkerValueSerializer {
     }
 }
 
+#[cfg(feature = "classic")]
 struct WorkerValueDeserializer;
 
+#[cfg(feature = "classic")]
 impl v8::ValueDeserializerImpl for WorkerValueDeserializer {}
 
+#[cfg(feature = "classic")]
 impl Runtime {
     /// Serialize a single V8 value to structured-clone bytes using V8's own
     /// `ValueSerializer`.  Returns `None` if the value is not cloneable (e.g.
     /// a function or a circular object); in that case an exception has already
     /// been thrown into `scope`.
+    #[cfg(feature = "classic")]
     pub fn serialize_value<'s, 'v>(
         scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'v, v8::Value>,
@@ -8742,6 +8923,7 @@ impl Runtime {
 
     /// Deserialize structured-clone bytes produced by `serialize_value` back
     /// into a V8 value in the current context.
+    #[cfg(feature = "classic")]
     pub fn deserialize_value<'s>(
         scope: &mut v8::PinScope<'s, '_>,
         bytes: &[u8],
@@ -8757,6 +8939,7 @@ impl Runtime {
 
     /// Drain `globalThis.__nsWorkerOutbox`, serialize every item with V8's
     /// structured-clone algorithm, and return the resulting byte blobs.
+    #[cfg(feature = "classic")]
     pub fn drain_outbox_bytes(&mut self) -> Vec<Result<Vec<u8>, String>> {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -8808,6 +8991,7 @@ impl Runtime {
 
     /// Deserialize `payload_bytes` and deliver them to the worker's
     /// `__nsDispatchToWorker` JS function.
+    #[cfg(feature = "classic")]
     pub fn dispatch_to_worker(&mut self, payload_bytes: &[u8]) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -8840,28 +9024,28 @@ impl Runtime {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod color_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod error_handling_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod module_load_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod esm_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod esm_http_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod instance_cache_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod interop_test;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "classic"))]
 mod js_delegate_tests {
     use super::{
         js_delegate_add_ref, js_delegate_query_interface, js_delegate_release, JsDelegate,

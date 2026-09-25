@@ -7,6 +7,7 @@ use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 use std::collections::HashSet;
 
+#[cfg(feature = "classic")]
 pub(crate) fn split_type_name(type_name: &str) -> (Option<String>, String) {
     match type_name.rsplit_once('.') {
         Some((namespace, class_name)) => (Some(namespace.to_string()), class_name.to_string()),
@@ -299,6 +300,7 @@ pub(crate) fn find_class_methods(
 /// Falls back to the first name match when no candidate's arity matches exactly (e.g. the
 /// metadata-reported arity is off, or `name` isn't a method at all) so callers can still surface
 /// a normal WinRT-call error instead of silently doing nothing.
+#[cfg(feature = "classic")]
 pub(crate) fn find_class_method_by_arity(
     class_declaration: &ClassDeclaration,
     name: &str,
@@ -319,6 +321,7 @@ thread_local! {
         std::cell::RefCell::new(ahash::AHashMap::new());
 }
 
+#[cfg(feature = "classic")]
 fn method_identity(m: &MethodDeclaration) -> (usize, i32) {
     use windows::core::Interface;
     (m.metadata().map(|md| md.as_raw() as usize).unwrap_or(0), m.token().0)
@@ -329,6 +332,7 @@ fn method_identity(m: &MethodDeclaration) -> (usize, i32) {
 /// (`CreateColorBrush(Color)` is `CreateColorBrushWithColor`), so a lookup of the public name binds
 /// only one of them. Record the others so the call can switch arity (`overload_for_argc`).
 /// Only public-name lookups register; an `[Overload]`-name lookup stays bound to exactly that method.
+#[cfg(feature = "classic")]
 pub(crate) fn register_overload_siblings(
     class_declaration: &ClassDeclaration,
     js_name: &str,
@@ -359,6 +363,7 @@ pub(crate) fn register_overload_siblings(
 
 /// The overload of `bound` matching `argc`, when `bound` itself doesn't (see
 /// `register_overload_siblings`). `None` means call `bound` as-is.
+#[cfg(feature = "classic")]
 #[inline]
 pub(crate) fn overload_for_argc(bound: &MethodDeclaration, argc: usize) -> Option<MethodDeclaration> {
     if bound.number_of_parameters() == argc {
@@ -404,6 +409,7 @@ pub(crate) fn class_method_matches(class_declaration: &ClassDeclaration, name: &
     false
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
     if class_declaration
         .properties()
@@ -436,6 +442,7 @@ pub(crate) fn class_property_matches(class_declaration: &ClassDeclaration, name:
     false
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn class_has_member_named(class_declaration: &ClassDeclaration, name: &str) -> bool {
     class_method_matches(class_declaration, name) || class_property_matches(class_declaration, name)
 }
@@ -444,6 +451,7 @@ pub(crate) fn class_has_member_named(class_declaration: &ClassDeclaration, name:
 /// name of the WinRT class that declares that property. For static properties
 /// this lets callers retrieve the correct activation factory (e.g. UIElement's
 /// factory, not Panel's, for `UIElement.PointerPressedEvent`).
+#[cfg(feature = "classic")]
 pub(crate) fn collect_class_properties_with_declaring(
     class_declaration: &ClassDeclaration,
 ) -> Vec<(PropertyDeclaration, String)> {
@@ -458,6 +466,7 @@ pub(crate) fn collect_class_properties_with_declaring(
     result
 }
 
+#[cfg(feature = "classic")]
 fn extend_properties_with_declaring(
     class_declaration: &ClassDeclaration,
     declaring_name: &str,
@@ -495,6 +504,7 @@ fn extend_properties_with_declaring(
 
 /// Walk the class hierarchy to find which WinRT class actually declares a given
 /// static property. Returns the full class name (e.g. "Windows.UI.Xaml.UIElement").
+#[cfg(feature = "classic")]
 pub(crate) fn find_static_property_declaring_class(
     class_declaration: &ClassDeclaration,
     name: &str,
@@ -552,6 +562,7 @@ pub(crate) fn find_event_methods(
     None
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn find_interface_event_methods(
     declaration: &dyn Declaration,
     name: &str,

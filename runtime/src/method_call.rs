@@ -1,14 +1,18 @@
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
+#[cfg(feature = "classic")]
 use crate::value::{
     ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg,
     ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg,
     ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg,
     ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg,
     ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr,
-    set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr, NativeType, NativeValue,
+    set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr,
 };
-use crate::{DeclarationFFI, ReturnKind};
+use crate::value::{NativeType, NativeValue};
+use crate::ReturnKind;
+#[cfg(feature = "classic")]
+use crate::DeclarationFFI;
 use libffi::middle::*;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
@@ -242,6 +246,7 @@ impl MethodCall {
         self.si.return_type.as_str()
     }
 
+    #[cfg(feature = "classic")]
     pub(crate) fn return_kind(&self) -> &ReturnKind {
         &self.si.return_kind
     }
@@ -618,6 +623,7 @@ impl MethodCall {
         }
     }
 
+    #[cfg(feature = "classic")]
     pub fn call<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,

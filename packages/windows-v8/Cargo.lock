@@ -1106,7 +1106,6 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
- "v8",
  "windows",
  "windows-collections",
  "windows-core",

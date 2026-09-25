@@ -2,10 +2,14 @@ use crate::value::NativeType;
 use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
+#[cfg(feature = "classic")]
 use regex::Regex;
+#[cfg(feature = "classic")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "classic")]
 static RE_GENERIC_COUNT: OnceLock<Regex> = OnceLock::new();
+#[cfg(feature = "classic")]
 static RE_GENERIC_PARAMS: OnceLock<Regex> = OnceLock::new();
 
 /// Returns the open-generic type name without the closed `<T, U, …>` arguments,
@@ -20,11 +24,13 @@ pub fn strip_generic_suffix(name: &str) -> &str {
     name
 }
 
+#[cfg(feature = "classic")]
 pub struct GenericReturnTypes<'s> {
     names: Vec<&'s str>,
     types: usize,
 }
 
+#[cfg(feature = "classic")]
 impl GenericReturnTypes<'_> {
     pub fn names(&self) -> &[&str] {
         self.names.as_slice()
@@ -35,6 +41,7 @@ impl GenericReturnTypes<'_> {
     }
 }
 
+#[cfg(feature = "classic")]
 pub fn get_generic_return_types(name: &str) -> GenericReturnTypes<'_> {
     let re_count = RE_GENERIC_COUNT.get_or_init(|| Regex::new(r"`(\d+)").unwrap());
     let re_params = RE_GENERIC_PARAMS.get_or_init(|| Regex::new(r"<(.*?)>").unwrap());

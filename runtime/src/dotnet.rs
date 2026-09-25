@@ -371,10 +371,19 @@ fn ensure_dotnet_initialized() {
     // delegates can call back into V8. This is idempotent because init_js_callbacks
     // is a no-op when the host isn't available.
     if DOTNET_HOST.get().and_then(|r| r.as_ref().ok()).is_some() {
-        let dispatcher =
-            *JS_CALLBACK_DISPATCHER.get_or_init(|| crate::global_fns::invoke_dotnet_js_callback);
-        init_js_callbacks(dispatcher);
+        if let Some(dispatcher) = js_callback_dispatcher() {
+            init_js_callbacks(dispatcher);
+        }
     }
+}
+
+/// The dispatcher managed delegates call back into JS through: the one a napi engine registered
+/// (`set_js_callback_dispatcher`), else the classic engine's V8 dispatcher.
+fn js_callback_dispatcher() -> Option<FnJsCallback> {
+    #[cfg(feature = "classic")]
+    return Some(*JS_CALLBACK_DISPATCHER.get_or_init(|| crate::global_fns::invoke_dotnet_js_callback));
+    #[cfg(not(feature = "classic"))]
+    JS_CALLBACK_DISPATCHER.get().copied()
 }
 
 /// Calls the managed bridge with a JSON request string and returns the JSON
@@ -539,4 +548,16 @@ mod tests {
         let _ = std::fs::remove_file(found_cfg);
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Length-prefixed (u16) string for the bridge's tagged binary wire format.
+pub(crate) fn bin_write_str16(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Length-prefixed (u32) string for the bridge's tagged binary wire format.
+pub(crate) fn bin_write_str32(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
 }

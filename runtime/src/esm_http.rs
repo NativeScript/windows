@@ -41,6 +41,7 @@ thread_local! {
     static VOCABULARY: RefCell<LoaderVocabulary> = RefCell::new(LoaderVocabulary::default());
 }
 
+#[cfg(any(feature = "classic", test))]
 pub(crate) fn clear_thread_vocabulary() {
     VOCABULARY.with(|v| *v.borrow_mut() = LoaderVocabulary::default());
 }

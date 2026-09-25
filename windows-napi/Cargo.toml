@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 # Node-API 8 surface, no tokio/async runtime pulled in — this is a thin bridge.
 napi = { version = "2", default-features = false, features = ["napi8"] }
 napi-derive = "2"
-runtime = { path = "../runtime", features = ["napi_engine"] }
+runtime = { path = "../runtime", default-features = false, features = ["napi_engine"] }
 metadata = { path = "../metadata" }
 windows-core = "0.62.2"
 

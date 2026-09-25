@@ -22,10 +22,11 @@ host_dll = []
 
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi8"] }
-# Brings rusty_v8 (V8 14.7, plain config) into the link — the shim's v8:: symbols resolve from it.
-runtime = { path = "../../runtime", features = ["napi_engine"] }
-# Direct rusty_v8 handle: initialize the V8 platform from Rust (its NewDefaultPlatform returns a
-# libc++ std::unique_ptr that can't be linked from the MSVC C++ shim).
+# The engine-neutral WinRT runtime over Node-API, without its V8-based classic engine.
+runtime = { path = "../../runtime", default-features = false, features = ["napi_engine"] }
+# rusty_v8 (V8 14.7, plain config): the V8 the C++ shim compiles and links against (src/lib.rs keeps
+# it in the link), and the V8 platform init from Rust (its NewDefaultPlatform returns a libc++
+# std::unique_ptr that can't be linked from the MSVC C++ shim).
 v8 = "147"
 # Shared JS prelude + URL polyfill — used by both the cdylib (abi.rs) and the demo bin (main.rs).
 ns-windows-common = { path = "../common" }

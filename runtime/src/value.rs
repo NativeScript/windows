@@ -1,12 +1,17 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 
+#[cfg(feature = "classic")]
 use crate::dotnet::call_dotnet;
 use crate::error::*;
+#[cfg(feature = "classic")]
 use crate::DeclarationFFI;
 use libffi::low::*;
 use libffi::middle::Arg;
-use windows::core::{IUnknown, Interface, GUID, HSTRING};
+use windows::core::HSTRING;
+#[cfg(feature = "classic")]
+use windows::core::{IUnknown, Interface, GUID};
+#[cfg(feature = "classic")]
 use windows::Foundation::PropertyValue;
 
 pub(crate) const MAX_SAFE_INTEGER: isize = 9007199254740991;
@@ -232,6 +237,7 @@ impl NativeValue {
     }
 
     // SAFETY: native_type must correspond to the type of value represented by the union field
+    #[cfg(feature = "classic")]
     #[inline]
     pub unsafe fn to_v8<'a>(
         &'a self,
@@ -360,6 +366,7 @@ unsafe impl Send for NativeValue {}
 /// `to_rust_string_lossy()` + `HSTRING::from()` incur. V8 strings and HSTRING are both UTF-16, so
 /// `write_v2` fills a u16 buffer and `HSTRING::from_wide` copies it in — one transcode-free copy each
 /// way.
+#[cfg(feature = "classic")]
 #[inline]
 fn hstring_from_v8_string(scope: &mut v8::PinScope<'_, '_>, s: v8::Local<v8::String>) -> HSTRING {
     let len = s.length();
@@ -373,6 +380,7 @@ fn hstring_from_v8_string(scope: &mut v8::PinScope<'_, '_>, s: v8::Local<v8::Str
 
 /// As `hstring_from_v8_string`, but coerces a non-string JS value via ToString first (matching
 /// `Value::to_rust_string_lossy`'s behavior). Empty HSTRING if coercion fails.
+#[cfg(feature = "classic")]
 #[inline]
 fn hstring_from_v8_value(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> HSTRING {
     match value.to_string(scope) {
@@ -381,6 +389,7 @@ fn hstring_from_v8_value(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::
     }
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_string_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -417,6 +426,7 @@ pub fn ffi_parse_string_arg(
 /// Create a JS object that carries an `HSTRING` pointer in `__hstring_ptr`.
 /// This is a convenience helper; callers should avoid creating these unless
 /// they expect the JS value to be passed back to native code later.
+#[cfg(feature = "classic")]
 pub fn create_hstring_backed_js_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     h: HSTRING,
@@ -438,6 +448,7 @@ pub fn create_hstring_backed_js_value<'s>(
     obj
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_bool_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     let bool_value = v8::Local::<v8::Boolean>::try_from(arg)
@@ -446,6 +457,7 @@ pub fn ffi_parse_bool_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nati
     Ok(NativeValue { bool_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_u8_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     if let Ok(v) = v8::Local::<v8::Uint32>::try_from(arg) {
@@ -462,6 +474,7 @@ pub fn ffi_parse_u8_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Native
     Err(type_error("Invalid FFI u8 type, expected unsigned integer"))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_i8_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     if let Ok(v) = v8::Local::<v8::Int32>::try_from(arg) {
@@ -478,6 +491,7 @@ pub fn ffi_parse_i8_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Native
     Err(type_error("Invalid FFI i8 type, expected integer"))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_u16_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     if let Ok(v) = v8::Local::<v8::Uint32>::try_from(arg) {
@@ -498,6 +512,7 @@ pub fn ffi_parse_u16_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     ))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_i16_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     if let Ok(v) = v8::Local::<v8::Int32>::try_from(arg) {
@@ -516,6 +531,7 @@ pub fn ffi_parse_i16_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     Err(type_error("Invalid FFI i16 type, expected integer"))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_u32_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     if let Ok(v) = v8::Local::<v8::Uint32>::try_from(arg) {
@@ -536,6 +552,7 @@ pub fn ffi_parse_u32_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     ))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_i32_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     // Accept both Smi (Int32) and HeapNumber (Number) — WinRT enum values are
@@ -557,6 +574,7 @@ pub fn ffi_parse_i32_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     Err(type_error("Invalid FFI i32 type, expected integer"))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_u64_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -577,6 +595,7 @@ pub fn ffi_parse_u64_arg(
     Ok(NativeValue { u64_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_i64_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -595,6 +614,7 @@ pub fn ffi_parse_i64_arg(
     Ok(NativeValue { i64_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_usize_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -613,6 +633,7 @@ pub fn ffi_parse_usize_arg(
     Ok(NativeValue { usize_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_isize_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -631,6 +652,7 @@ pub fn ffi_parse_isize_arg(
     Ok(NativeValue { isize_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_f32_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     let f32_value = v8::Local::<v8::Number>::try_from(arg)
@@ -639,6 +661,7 @@ pub fn ffi_parse_f32_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     Ok(NativeValue { f32_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_f64_arg(arg: v8::Local<v8::Value>) -> std::result::Result<NativeValue, AnyError> {
     let f64_value = v8::Local::<v8::Number>::try_from(arg)
@@ -647,6 +670,7 @@ pub fn ffi_parse_f64_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     Ok(NativeValue { f64_value })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 fn try_get_external_handle(
     scope: &mut v8::PinScope<'_, '_>,
@@ -890,6 +914,7 @@ fn try_get_external_handle(
 /// Returns `None` when the value/type combination cannot be boxed.
 /// Read a JS value as i64, accepting Number or BigInt. i64 struct fields (DateTime.UniversalTime)
 /// exceed 2^53, so callers pass a BigInt; `number_value()` returns 0 on a BigInt.
+#[cfg(feature = "classic")]
 fn v8_to_i64(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> i64 {
     if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(value) {
         return bi.i64_value().0;
@@ -898,6 +923,7 @@ fn v8_to_i64(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> i
 }
 
 /// Read an i64 field (Number or BigInt) off a JS object; 0 if absent.
+#[cfg(feature = "classic")]
 fn read_i64_field(scope: &mut v8::PinScope<'_, '_>, obj_val: v8::Local<v8::Value>, field: &str) -> i64 {
     if let Some(obj) = obj_val.to_object(scope) {
         if let Some(k) = v8::String::new(scope, field) {
@@ -909,6 +935,7 @@ fn read_i64_field(scope: &mut v8::PinScope<'_, '_>, obj_val: v8::Local<v8::Value
     0
 }
 
+#[cfg(feature = "classic")]
 pub fn box_as_typed_value(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
@@ -1020,6 +1047,7 @@ pub fn box_as_typed_value(
 }
 
 /// Keep the old name as an alias — used by method_call / property_call for IReference<T> params.
+#[cfg(feature = "classic")]
 #[inline]
 pub fn box_as_ireference(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1059,6 +1087,7 @@ pub(crate) fn parse_guid_str(s: &str) -> Option<windows::core::GUID> {
     })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_pointer_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1122,6 +1151,7 @@ pub fn ffi_parse_pointer_arg(
     Ok(NativeValue { pointer })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_query_interface_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1176,6 +1206,7 @@ pub fn ffi_parse_query_interface_arg(
     Ok((ffi_parse_pointer_arg(scope, arg)?, None))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_buffer_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1185,6 +1216,7 @@ pub fn ffi_parse_buffer_arg(
     Ok(value)
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_buffer_arg_with_length(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1226,6 +1258,7 @@ pub fn ffi_parse_buffer_arg_with_length(
     Ok((NativeValue { pointer }, byte_length))
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_struct_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1268,6 +1301,7 @@ pub fn ffi_parse_struct_arg(
 
 /// Write a single struct field value (from a V8 value) into a byte buffer in little-endian order.
 /// Used when converting a plain JS object like `{A:255, R:0, G:0, B:0}` to WinRT struct bytes.
+#[cfg(feature = "classic")]
 pub(crate) fn append_struct_field_bytes(
     buf: &mut Vec<u8>,
     scope: &mut v8::PinScope<'_, '_>,
@@ -1292,6 +1326,7 @@ pub(crate) fn append_struct_field_bytes(
     }
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_function_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1317,6 +1352,7 @@ pub fn ffi_parse_function_arg(
     Ok(NativeValue { pointer })
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 fn external_or_null<'a>(
     scope: &mut v8::PinScope<'a, '_>,
@@ -1329,6 +1365,7 @@ fn external_or_null<'a>(
     }
 }
 
+#[cfg(feature = "classic")]
 #[inline]
 pub unsafe fn set_ret_val(
     value: *mut c_void,
@@ -1456,6 +1493,7 @@ pub unsafe fn set_ret_val(
 
 /// Read a native value from a raw pointer and convert it to a V8 value.
 /// `ptr` must point to storage containing the native representation (e.g. u32, HSTRING, pointer, struct bytes).
+#[cfg(feature = "classic")]
 pub unsafe fn read_value_from_ptr<'a>(
     ptr: *const c_void,
     scope: &mut v8::PinScope<'a, '_>,
@@ -1586,6 +1624,7 @@ pub unsafe fn read_value_from_ptr<'a>(
 /// Returns Ok(Some(parse_type)) when the slot should be treated as having that parse type
 /// for later string-cloning logic (e.g. NativeType::String), Ok(None) when no parse-type
 /// should be set, or Err(...) on parse errors.
+#[cfg(feature = "classic")]
 pub fn write_v8_value_to_ptr(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
@@ -1742,6 +1781,7 @@ pub(crate) const OUT_PARAM_MARKER: &str = "__nswinrt_out_param__";
 
 /// Detects an `NSWinRT.interop.out(...)` wrapper and returns its object plus
 /// the wrapped `value` that should initialize the native byref slot.
+#[cfg(feature = "classic")]
 pub fn try_unwrap_out_param<'scope, 'value>(
     scope: &mut v8::PinScope<'scope, '_>,
     arg: v8::Local<'value, v8::Value>,
@@ -1764,6 +1804,7 @@ pub fn try_unwrap_out_param<'scope, 'value>(
     Some((object, value))
 }
 
+#[cfg(feature = "classic")]
 pub fn set_out_param_value<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     wrapper: v8::Local<'a, v8::Object>,

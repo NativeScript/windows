@@ -29,7 +29,7 @@ host_dll = []
 icu = []
 
 [dependencies]
-runtime = { path = "../../runtime", features = ["napi_engine", "module_runner"] }
+runtime = { path = "../../runtime", default-features = false, features = ["napi_engine", "module_runner"] }
 napi = { version = "2", default-features = false, features = ["napi8"] }
 # Shared JS prelude + URL polyfill: used by both the cdylib (abi.rs) and the demo bin (main.rs).
 ns-windows-common = { path = "../common" }

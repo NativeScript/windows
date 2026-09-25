@@ -10,7 +10,8 @@ byteorder = "1.5"
 regex = "1.10"
 anyhow = "1.0"
 libffi = "5.1.0"
-v8 = "147"
+# The classic engine (`classic` feature). The napi engines build without it and never link V8.
+v8 = { version = "147", optional = true }
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -68,8 +69,11 @@ features = [
 ]
 
 [features]
-default = []
-devtools = ["runtime-devtools"]
+default = ["classic"]
+# The classic engine: WinRT interop written against rusty_v8, which `nativescript.dll` is built on.
+# The napi engine packages turn default features off, so they don't compile or link V8.
+classic = ["dep:v8"]
+devtools = ["classic", "runtime-devtools"]
 napi_engine = ["dep:napi"]
 # ES modules for napi engines without a native module loader (QuickJS, Hermes, JSC): modules are
 # transformed to async functions and run by a JS module runner (napi_engine::module_runner).

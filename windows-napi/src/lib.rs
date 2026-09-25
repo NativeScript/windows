@@ -6,9 +6,6 @@
 
 use napi::Env;
 use napi_derive::napi;
-use std::cell::RefCell;
-use std::mem::ManuallyDrop;
-use runtime::Runtime;
 
 mod console_test;
 mod delegate_test;
@@ -16,70 +13,8 @@ mod invoke_test;
 mod proxy_test;
 mod value_test;
 
-thread_local! {
-    /// One runtime per JS thread. Node addon calls arrive on the main thread; the runtime's
-    /// V8 isolate and WinRT apartment are thread-affine, so a thread-local keeps them together.
-    ///
-    /// `ManuallyDrop` so TLS destruction never runs `Runtime::drop`: it touches other
-    /// thread-locals, which aborts the process once those are destroyed (observed when a
-    /// consumer calls `process.exit()` without `deinit()` — Node skips env teardown on a hard
-    /// exit). Explicit `deinit()`/env-cleanup drop it properly; otherwise it leaks at process
-    /// death, which is harmless.
-    static RT: RefCell<Option<ManuallyDrop<Box<Runtime>>>> = const { RefCell::new(None) };
-}
-
-fn drop_runtime() {
-    RT.with(|cell| {
-        if let Some(rt) = cell.borrow_mut().take() {
-            drop(ManuallyDrop::into_inner(rt));
-        }
-    });
-}
-
-/// Create the runtime rooted at `appRoot` (defaults to the empty string). Idempotent: a second
-/// call while a runtime already exists is a no-op and returns `true`.
-#[napi]
-pub fn init(mut env: Env, app_root: Option<String>) -> bool {
-    runtime::napi_engine::crash_reporter::install();
-    RT.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_some() {
-            return true;
-        }
-        let mut rt = Box::new(Runtime::new(app_root.as_deref().unwrap_or("")));
-        rt.register_delegate_isolate_ptr();
-        *slot = Some(ManuallyDrop::new(rt));
-        // On a graceful env teardown (worker exit, embedder shutdown) drop the runtime
-        // properly; a hard process.exit() never reaches this and leaks instead — by design.
-        let _ = env.add_env_cleanup_hook((), |_| drop_runtime());
-        true
-    })
-}
-
-/// Evaluate `script` under `filename` (defaults to `main.js`) in the runtime's context.
-#[napi]
-pub fn run_script(script: String, filename: Option<String>) {
-    RT.with(|cell| {
-        if let Some(rt) = cell.borrow_mut().as_mut() {
-            rt.run_script(&script, filename.as_deref().unwrap_or("main.js"));
-        }
-    });
-}
-
-/// Drain JS timers and pump the appropriate message/dispatcher loop for one tick. Wire this to
-/// a libuv `check`/`prepare` handle (or an `setImmediate` loop) so `setTimeout`, WinRT async
-/// `Completed` callbacks, and their promise continuations fire.
-#[napi]
-pub fn pump_timers() {
-    runtime::timers::pump();
-    if runtime::ui_dispatcher::needs_win32_pump() {
-        runtime::pump_messages();
-    } else {
-        runtime::pump_dispatcher();
-    }
-}
-
-/// Pump Win32 messages and flush microtasks. Returns `true` if a message was dispatched.
+/// Pump the calling thread's Win32 messages (WinRT async completions, cross-apartment
+/// delegate invokes, `createWindow` input). Returns `true` if a message was dispatched.
 #[napi]
 pub fn pump_messages() -> bool {
     runtime::pump_messages()
@@ -199,10 +134,4 @@ pub fn install_interop(env: Env) -> napi::Result<()> {
 #[napi]
 pub fn install_dotnet(env: Env) -> napi::Result<()> {
     runtime::napi_engine::dotnet::install_dotnet(&env)
-}
-
-/// Tear the runtime down on this thread.
-#[napi]
-pub fn deinit() {
-    drop_runtime();
 }

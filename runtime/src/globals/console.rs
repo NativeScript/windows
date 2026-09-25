@@ -1,10 +1,16 @@
+#[cfg(feature = "classic")]
 use crate::class_helpers::{collect_class_methods, collect_class_properties};
+#[cfg(feature = "classic")]
 use crate::DeclarationFFI;
+#[cfg(feature = "classic")]
 use metadata::declarations::class_declaration::ClassDeclaration;
+#[cfg(feature = "classic")]
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
+#[cfg(feature = "classic")]
 use metadata::meta_data_reader::MetadataReader;
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "classic")]
 use std::ffi::c_int;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -18,6 +24,7 @@ use windows::Win32::System::EventLog::{
     EVENTLOG_WARNING_TYPE, REPORT_EVENT_TYPE,
 };
 
+#[cfg(feature = "classic")]
 pub fn init_console(
     scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>,
     context: v8::Local<v8::Context>,
@@ -54,6 +61,7 @@ pub fn init_console(
     );
 }
 
+#[cfg(feature = "classic")]
 fn handle_item_log(
     scope: &mut v8::PinScope<'_, '_>,
     item: v8::Local<v8::Value>,
@@ -353,6 +361,7 @@ fn handle_item_log(
 /// All casts use TryFrom rather than unchecked cast so V8 built-in objects
 /// whose slot 0 holds a non-External value (SMI, backing-store pointer, …)
 /// never cause a BadType panic.
+#[cfg(feature = "classic")]
 fn winrt_type_name_from_object(
     scope: &mut v8::PinScope<'_, '_>,
     obj: v8::Local<v8::Object>,
@@ -378,6 +387,7 @@ fn winrt_type_name_from_object(
     winrt_name_from_slot(scope, proto_obj)
 }
 
+#[cfg(feature = "classic")]
 fn winrt_name_from_slot(
     scope: &mut v8::PinScope<'_, '_>,
     obj: v8::Local<v8::Object>,
@@ -460,6 +470,7 @@ pub(crate) fn report_event(message: &str, event_type: REPORT_EVENT_TYPE) {
     }
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_log(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -480,6 +491,7 @@ pub(crate) fn handle_console_log(
     write_console(&value);
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_warn(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -500,6 +512,7 @@ pub(crate) fn handle_console_warn(
     write_console(&value);
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_error(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -592,6 +605,7 @@ pub(crate) fn handle_console_error(
     write_console(&value);
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_dir(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -612,6 +626,7 @@ pub(crate) fn handle_console_dir(
     write_console(&value);
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_trace(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -658,6 +673,7 @@ pub(crate) fn handle_console_trace(
     write_console(&value);
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_assert(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -694,6 +710,7 @@ thread_local! {
     pub(crate) static CONSOLE_TIMERS: RefCell<HashMap<String, Instant>> = RefCell::new(HashMap::new());
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_time(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -714,6 +731,7 @@ pub(crate) fn handle_console_time(
     });
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_time_end(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -742,6 +760,7 @@ pub(crate) fn handle_console_time_end(
     });
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_time_log(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -770,6 +789,7 @@ pub(crate) fn handle_console_time_log(
 }
 
 /// Format args[start..] into a space-separated string for timeEnd/timeLog extras.
+#[cfg(feature = "classic")]
 fn format_extra_args(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments,
@@ -786,6 +806,7 @@ fn format_extra_args(
     out
 }
 
+#[cfg(feature = "classic")]
 pub(crate) fn handle_console_table(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -835,6 +856,7 @@ pub(crate) fn handle_console_table(
 }
 
 /// Format an array of rows (objects or primitives) as a table.
+#[cfg(feature = "classic")]
 fn table_from_array(
     scope: &mut v8::PinScope<'_, '_>,
     arr: v8::Local<v8::Array>,
@@ -926,6 +948,7 @@ fn table_from_array(
 }
 
 /// Format a plain JS object as a key→value table.
+#[cfg(feature = "classic")]
 fn table_from_object(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<v8::Object>) -> String {
     let cols = vec!["(index)".to_string(), "Values".to_string()];
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -1013,6 +1036,7 @@ pub(crate) fn render_table(cols: &[String], rows: &[Vec<String>]) -> String {
     out
 }
 
+#[cfg(feature = "classic")]
 fn transform_js_object(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::Object>) -> String {
     v8::tc_scope!(tc, scope);
     if let Some(val) = object.to_string(tc) {
@@ -1036,6 +1060,7 @@ fn transform_js_object(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::O
 
 /// Return a short description for a JS value when it's a native WinRT proxy
 /// or an External pointer. Examples: `StackPanel@0x12345`, `External@0xabc`.
+#[cfg(feature = "classic")]
 fn short_js_value_description(
     scope: &mut v8::PinScope<'_, '_>,
     val: v8::Local<v8::Value>,

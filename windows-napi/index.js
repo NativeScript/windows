@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, init, runScript, pumpTimers, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet, deinit } = nativeBinding
+const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet } = nativeBinding
 
 module.exports.formatValue = formatValue
 module.exports.tableFor = tableFor
@@ -330,9 +330,6 @@ module.exports.outParamValue = outParamValue
 module.exports.setOutParam = setOutParam
 module.exports.structFieldBytes = structFieldBytes
 module.exports.boxTyped = boxTyped
-module.exports.init = init
-module.exports.runScript = runScript
-module.exports.pumpTimers = pumpTimers
 module.exports.pumpMessages = pumpMessages
 module.exports.lastError = lastError
 module.exports.installGlobals = installGlobals
@@ -349,4 +346,3 @@ module.exports.scanWinmdDir = scanWinmdDir
 module.exports.arrayBufferFromBuffer = arrayBufferFromBuffer
 module.exports.installInterop = installInterop
 module.exports.installDotnet = installDotnet
-module.exports.deinit = deinit

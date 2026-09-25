@@ -127,7 +127,7 @@ fn napi_bin_write_arg(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
         ValueType::String => {
             let s = js_to_rust_string(env, arg);
             buf.push(0x05);
-            crate::global_fns::bin_write_str16(buf, s.as_bytes());
+            crate::dotnet::bin_write_str16(buf, s.as_bytes());
         }
         ValueType::Object | ValueType::Function => {
             let obj: JsObject = unsafe { arg.cast() };
@@ -154,7 +154,7 @@ fn napi_bin_write_arg(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
             }
             let s = js_to_rust_string(env, arg);
             buf.push(0x05);
-            crate::global_fns::bin_write_str16(buf, s.as_bytes());
+            crate::dotnet::bin_write_str16(buf, s.as_bytes());
         }
         _ => buf.push(0x00),
     }
@@ -184,7 +184,7 @@ fn napi_bin_write_value(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
         ValueType::String => {
             let s = js_to_rust_string(env, arg);
             buf.push(0x05);
-            crate::global_fns::bin_write_str32(buf, s.as_bytes());
+            crate::dotnet::bin_write_str32(buf, s.as_bytes());
         }
         ValueType::Object | ValueType::Function => {
             if let Some(len) = napi_array_length(env, arg) {
@@ -221,7 +221,7 @@ fn napi_bin_write_value(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
             }
             let s = js_to_rust_string(env, arg);
             buf.push(0x05);
-            crate::global_fns::bin_write_str32(buf, s.as_bytes());
+            crate::dotnet::bin_write_str32(buf, s.as_bytes());
         }
         _ => buf.push(0x00),
     }
@@ -431,13 +431,13 @@ fn native_invoke_bin(ctx: &CallContext) -> napi::Result<JsUnknown> {
     match op {
         0x01 | 0x04 | 0x05 => req.extend_from_slice(&handle.to_le_bytes()),
         _ => {
-            crate::global_fns::bin_write_str16(&mut req, type_name.as_bytes());
-            crate::global_fns::bin_write_str16(&mut req, assembly.as_bytes());
+            crate::dotnet::bin_write_str16(&mut req, type_name.as_bytes());
+            crate::dotnet::bin_write_str16(&mut req, assembly.as_bytes());
         }
     }
 
     if op == 0x01 || op == 0x02 {
-        crate::global_fns::bin_write_str16(&mut req, method.as_bytes());
+        crate::dotnet::bin_write_str16(&mut req, method.as_bytes());
     }
 
     if matches!(op, 0x01 | 0x02 | 0x03) {
@@ -484,7 +484,7 @@ fn native_create_delegate(ctx: &CallContext) -> napi::Result<JsUnknown> {
 
     let mut req: Vec<u8> = Vec::with_capacity(32);
     req.push(0x09);
-    crate::global_fns::bin_write_str16(&mut req, type_name.as_bytes());
+    crate::dotnet::bin_write_str16(&mut req, type_name.as_bytes());
     req.extend_from_slice(&cb_id.to_le_bytes());
 
     match crate::dotnet::call_dotnet_binary(&req) {
@@ -541,15 +541,15 @@ fn native_create_js_subclass(ctx: &CallContext) -> napi::Result<JsUnknown> {
 
     let mut req: Vec<u8> = Vec::with_capacity(64);
     req.push(0x0A);
-    crate::global_fns::bin_write_str16(&mut req, assembly.as_bytes());
-    crate::global_fns::bin_write_str16(&mut req, type_name.as_bytes());
+    crate::dotnet::bin_write_str16(&mut req, assembly.as_bytes());
+    crate::dotnet::bin_write_str16(&mut req, type_name.as_bytes());
     req.extend_from_slice(&(interface_names.len() as i32).to_le_bytes());
     for name in &interface_names {
-        crate::global_fns::bin_write_str16(&mut req, name.as_bytes());
+        crate::dotnet::bin_write_str16(&mut req, name.as_bytes());
     }
     req.extend_from_slice(&(member_names.len() as i32).to_le_bytes());
     for name in &member_names {
-        crate::global_fns::bin_write_str16(&mut req, name.as_bytes());
+        crate::dotnet::bin_write_str16(&mut req, name.as_bytes());
     }
     req.extend_from_slice(&cb_id.to_le_bytes());
 
@@ -611,7 +611,7 @@ fn native_await_task(ctx: &CallContext) -> napi::Result<()> {
     let mut req: Vec<u8> = Vec::with_capacity(32);
     req.push(0x01u8);
     req.extend_from_slice(&handle_id.to_le_bytes());
-    crate::global_fns::bin_write_str16(&mut req, b"__dotnet_await__");
+    crate::dotnet::bin_write_str16(&mut req, b"__dotnet_await__");
     req.push(2u8);
     req.push(0x03u8);
     req.extend_from_slice(&resolve_id.to_le_bytes());

@@ -1,6 +1,7 @@
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
 use crate::method_call::PointerPlan;
+#[cfg(feature = "classic")]
 use crate::value::{
     append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length,
     ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg,
@@ -8,14 +9,17 @@ use crate::value::{
     ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg,
     ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg,
     ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr, set_out_param_value,
-    try_unwrap_out_param, write_v8_value_to_ptr, NativeType, NativeValue,
+    try_unwrap_out_param, write_v8_value_to_ptr,
 };
+use crate::value::{NativeType, NativeValue};
 use crate::ReturnKind;
 use libffi::middle::*;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+#[cfg(feature = "classic")]
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
 use metadata::declarations::declaration::DeclarationKind;
+#[cfg(feature = "classic")]
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
@@ -97,6 +101,7 @@ fn struct_size_align(sd: &StructDeclaration) -> (usize, usize) {
 /// padding, nested structs (recursed), and enum fields (Int32). The naive field-concatenation path zeroed
 /// nested-struct/enum fields and dropped padding — which silently broke e.g. `Duration { TimeSpan; Type }`
 /// (a 0-tick / instant animation) and `GridLength { Value; GridUnitType }`.
+#[cfg(feature = "classic")]
 pub(crate) fn append_struct_object_bytes(
     buf: &mut Vec<u8>,
     scope: &mut v8::PinScope<'_, '_>,
@@ -330,14 +335,17 @@ impl PropertyCall {
         self.si.return_type.as_str()
     }
 
+    #[cfg(feature = "classic")]
     pub(crate) fn return_kind(&self) -> &ReturnKind {
         &self.si.return_kind
     }
 
+    #[cfg(feature = "classic")]
     pub fn parse_types_debug(&self) -> &[NativeType] {
         &self.si.parse_parameter_types
     }
 
+    #[cfg(feature = "classic")]
     pub fn abi_types_debug(&self) -> &[NativeType] {
         &self.si.parameter_types
     }
@@ -969,6 +977,7 @@ impl PropertyCall {
         })
     }
 
+    #[cfg(feature = "classic")]
     pub fn call<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
@@ -990,6 +999,7 @@ impl PropertyCall {
         }
     }
 
+    #[cfg(feature = "classic")]
     pub fn call_with_values<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
