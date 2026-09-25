@@ -1,6 +1,6 @@
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
-use crate::method_call::PointerPlan;
+use crate::method_call::{is_scalar_return_type, PointerPlan, QiCache};
 #[cfg(feature = "classic")]
 use crate::value::{
     append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length,
@@ -30,8 +30,10 @@ use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -266,6 +268,10 @@ struct PropertyStaticInfo {
     /// Per-parameter marshaling plan, aligned with `parse_parameter_types` (see
     /// `method_call::PointerPlan`). Only consulted for in-params parsed as `Pointer`.
     param_plans: Vec<crate::method_call::PointerPlan>,
+    /// Return-slot classification, resolved once: scalar and string returns are written into
+    /// the call's stable return buffer instead of the pointer slot.
+    is_scalar_return: bool,
+    is_string_return: bool,
 }
 
 /// Resolve the Pointer-parameter marshaling plans for a property/interface call's static info.
@@ -307,18 +313,159 @@ pub struct PropertyCall {
     si: Rc<PropertyStaticInfo>,
     is_initializer: bool,
     is_setter: bool,
-    /// Original (pre-QI) interface, kept alive for the duration of the call object.
+    /// Original (pre-QI) interface, kept alive for the duration of the call object when this
+    /// call did its own QueryInterface; `None` when the interface is borrowed.
     #[allow(dead_code)]
-    parent_interface: IUnknown,
-    interface: IUnknown,
+    parent_interface: Option<IUnknown>,
+    /// The interface the call goes through, already QI'd to `si.iid`. Owned (released on drop)
+    /// when this call object did the QueryInterface itself; borrowed from a `QiCache` or a
+    /// [`PreparedProperty`] otherwise, whose owner outlives the call.
+    interface: ManuallyDrop<IUnknown>,
+    owns_interface: bool,
     func: *mut c_void,
-    /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
-    argument_buf: Vec<NativeValue>,
-    /// Per-call parse-type tracker reused to avoid per-call heap allocation.
-    argument_parse_types: Vec<Option<NativeType>>,
+    /// Argument slots for the call; inline storage covers the common arities, so building a
+    /// call does not allocate.
+    argument_buf: SmallVec<[NativeValue; 8]>,
+    /// Parse type per argument slot, aligned with `argument_buf`.
+    argument_parse_types: SmallVec<[Option<NativeType>; 8]>,
     /// Scratch buffer used when a WinRT property/method returns a value type
     /// or scalar that must be written into caller-owned storage.
     return_value_buf: [u8; 128],
+}
+
+impl PropertyCall {
+    /// Drop the previous call's argument state, releasing the HSTRINGs built for `String`
+    /// in-parameters first (the union slots would otherwise leak them).
+    fn reset_args(&mut self) {
+        unsafe { crate::ffi::release_string_args(&mut self.argument_buf, &self.argument_parse_types) };
+        self.argument_buf.clear();
+        self.argument_parse_types.clear();
+    }
+}
+
+impl Drop for PropertyCall {
+    fn drop(&mut self) {
+        self.reset_args();
+        if self.owns_interface {
+            unsafe { ManuallyDrop::drop(&mut self.interface) };
+        }
+    }
+}
+
+/// A property accessor resolved once on a fixed target (see `method_call::PreparedCall`): the
+/// target's interface pointer already QI'd to the accessor's interface plus its vtable slot.
+/// Static property call sites keep one per accessor on the class activation factory.
+#[derive(Clone)]
+pub(crate) struct PreparedProperty {
+    si: Rc<PropertyStaticInfo>,
+    interface: IUnknown,
+    func: *mut c_void,
+    is_setter: bool,
+    is_initializer: bool,
+}
+
+impl PropertyCall {
+    /// Static info for an accessor already seen on this thread, if any.
+    fn cached_static_info(
+        property: &PropertyDeclaration,
+        is_setter: bool,
+        is_initializer: bool,
+    ) -> Option<Rc<PropertyStaticInfo>> {
+        let method = if is_setter {
+            property.setter()?
+        } else {
+            property.getter()
+        };
+        let scope_key = method
+            .metadata()
+            .map(|m| windows::core::Interface::as_raw(m) as usize)
+            .unwrap_or(0);
+        let cache_key = (
+            scope_key,
+            ((method.token().0 as u64) << 1) | (is_initializer as u64),
+        );
+        PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+    }
+
+    /// A call over an interface pointer that some longer-lived owner holds: no QueryInterface
+    /// and no refcount traffic. The vtable slot is still read per call object (interface-declared
+    /// accessors share a metadata token across implementing classes).
+    fn from_borrowed(
+        si: Rc<PropertyStaticInfo>,
+        is_setter: bool,
+        is_initializer: bool,
+        interface_ptr: *mut c_void,
+    ) -> Self {
+        let vtable = unsafe { *(interface_ptr as *const *const *mut c_void) };
+        let func = unsafe { *vtable.add(si.index) };
+        Self {
+            si,
+            is_initializer,
+            is_setter,
+            parent_interface: None,
+            interface: ManuallyDrop::new(unsafe { IUnknown::from_raw(interface_ptr) }),
+            owns_interface: false,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
+        }
+    }
+
+    /// Build an accessor call on `instance` through the wrapper's `qi` cache, so repeated
+    /// property reads and writes on one wrapper skip the per-call QueryInterface. The first
+    /// access of an accessor on the thread still goes through [`PropertyCall::new`] to build
+    /// its static info. `None` when the instance does not implement the accessor's interface.
+    pub(crate) fn new_cached(
+        property: &PropertyDeclaration,
+        is_setter: bool,
+        instance: &IUnknown,
+        qi: &QiCache,
+    ) -> Option<Self> {
+        let Some(si) = Self::cached_static_info(property, is_setter, false) else {
+            return Self::new(property, is_setter, instance.clone(), false);
+        };
+        let ptr = qi.interface(instance, &si.iid)?;
+        Some(Self::from_borrowed(si, is_setter, false, ptr))
+    }
+
+    /// Resolve `property`'s getter or setter on `target` once for reuse through
+    /// [`PropertyCall::from_prepared`]. `None` when the target does not implement it.
+    pub(crate) fn prepare(
+        property: &PropertyDeclaration,
+        is_setter: bool,
+        target: IUnknown,
+    ) -> Option<PreparedProperty> {
+        let mut call = Self::new(property, is_setter, target, false)?;
+        // Move the interface out; the call object must not release it on drop.
+        call.owns_interface = false;
+        let interface = unsafe { ManuallyDrop::take(&mut call.interface) };
+        Some(PreparedProperty {
+            si: Rc::clone(&call.si),
+            interface,
+            func: call.func,
+            is_setter: call.is_setter,
+            is_initializer: call.is_initializer,
+        })
+    }
+
+    /// A call built from a [`PreparedProperty`]: borrows its interface pointer and vtable slot.
+    pub(crate) fn from_prepared(prepared: &PreparedProperty) -> Self {
+        Self {
+            si: Rc::clone(&prepared.si),
+            is_initializer: prepared.is_initializer,
+            is_setter: prepared.is_setter,
+            parent_interface: None,
+            interface: ManuallyDrop::new(unsafe {
+                IUnknown::from_raw(prepared.interface.as_raw())
+            }),
+            owns_interface: false,
+            func: prepared.func,
+            return_value_buf: [0u8; 128],
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
+        }
+    }
 }
 
 #[inline]
@@ -335,7 +482,6 @@ impl PropertyCall {
         self.si.return_type.as_str()
     }
 
-    #[cfg(feature = "classic")]
     pub(crate) fn return_kind(&self) -> &ReturnKind {
         &self.si.return_kind
     }
@@ -372,17 +518,17 @@ impl PropertyCall {
         let vtable_ptr: *mut *mut c_void =
             unsafe { std::mem::transmute(queried_interface.vtable()) };
         let func = unsafe { *vtable_ptr.add(si.index) };
-        let cap = si.number_of_abi_parameters + 3;
         Some(Self {
             si,
             is_initializer,
             is_setter,
-            parent_interface: interface,
-            interface: queried_interface,
+            parent_interface: Some(interface),
+            interface: ManuallyDrop::new(queried_interface),
+            owns_interface: true,
             func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(cap),
-            argument_parse_types: Vec::with_capacity(cap),
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
         })
     }
 
@@ -601,6 +747,8 @@ impl PropertyCall {
         let param_plans =
             pointer_plans_for(&parse_parameter_types, &parameters, &param_sigs, &[]);
 
+        let is_scalar_return = is_scalar_return_type(&return_type);
+        let is_string_return = return_type == "String";
         let static_info = Rc::new(PropertyStaticInfo {
             cif,
             iid,
@@ -618,21 +766,23 @@ impl PropertyCall {
             param_sigs,
             type_args: Vec::new(),
             param_plans,
+            is_scalar_return,
+            is_string_return,
         });
         PROPERTY_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
 
-        let cap = number_of_abi_parameters + 3;
         Some(Self {
             si: static_info,
             is_initializer,
             is_setter,
-            parent_interface,
-            interface,
+            parent_interface: Some(parent_interface),
+            interface: ManuallyDrop::new(interface),
+            owns_interface: true,
             func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(cap),
-            argument_parse_types: Vec::with_capacity(cap),
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
         })
     }
 
@@ -778,6 +928,8 @@ impl PropertyCall {
         let parameters = method.parameters().to_vec();
         let param_plans =
             pointer_plans_for(&parse_parameter_types, &parameters, &param_sigs, &type_args);
+        let is_scalar_return = is_scalar_return_type(&return_type);
+        let is_string_return = return_type == "String";
         let static_info = Rc::new(PropertyStaticInfo {
             cif,
             iid: declaring_iid,
@@ -795,21 +947,23 @@ impl PropertyCall {
             param_sigs,
             type_args,
             param_plans,
+            is_scalar_return,
+            is_string_return,
         });
         INTERFACE_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
 
-        let cap = number_of_abi_parameters + 3;
         Some(Self {
             si: static_info,
             is_initializer,
             is_setter,
-            parent_interface,
-            interface,
+            parent_interface: Some(parent_interface),
+            interface: ManuallyDrop::new(interface),
+            owns_interface: true,
             func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(cap),
-            argument_parse_types: Vec::with_capacity(cap),
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
         })
     }
 
@@ -942,6 +1096,8 @@ impl PropertyCall {
         let parameters = method.parameters().to_vec();
         let param_plans =
             pointer_plans_for(&parse_parameter_types, &parameters, &param_sigs, &type_args);
+        let is_scalar_return = is_scalar_return_type(&return_type);
+        let is_string_return = return_type == "String";
         let static_info = Rc::new(PropertyStaticInfo {
             cif,
             iid: declaring_iid,
@@ -959,21 +1115,23 @@ impl PropertyCall {
             param_sigs,
             type_args,
             param_plans,
+            is_scalar_return,
+            is_string_return,
         });
         INTERFACE_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
 
-        let cap = number_of_abi_parameters + 3;
         Some(Self {
             si: static_info,
             is_initializer: false,
             is_setter: false,
-            parent_interface,
-            interface,
+            parent_interface: Some(parent_interface),
+            interface: ManuallyDrop::new(interface),
+            owns_interface: true,
             func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(cap),
-            argument_parse_types: Vec::with_capacity(cap),
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
         })
     }
 
@@ -1012,31 +1170,13 @@ impl PropertyCall {
             ReturnKind::Struct(_) | ReturnKind::Guid
         );
 
-        let is_scalar_return = matches!(
-            self.si.return_type.as_str(),
-            "UInt8"
-                | "Int8"
-                | "UInt16"
-                | "Int16"
-                | "UInt32"
-                | "Int32"
-                | "UInt64"
-                | "Int64"
-                | "USize"
-                | "ISize"
-                | "Single"
-                | "Double"
-                | "Boolean"
-                | "Char16"
-        );
-
+        let is_scalar_return = self.si.is_scalar_return;
         // HSTRING out-params must also land in a stable buffer; the local
         // `result` variable goes out of scope before the caller can read it.
-        let is_string_return = self.si.return_type.as_str() == "String";
+        let is_string_return = self.si.is_string_return;
 
-        self.argument_buf.clear();
-        self.argument_parse_types.clear();
-        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
+        self.reset_args();
+        let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // param_index (usize) replaces Option<String> — references self.param_sigs[i] directly,
         // saving one String clone per out-param per call.
@@ -1278,29 +1418,16 @@ impl PropertyCall {
             }
         }
 
-        let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
-
-        for (i, v) in self.argument_buf.iter().enumerate() {
-            let Some(abi_native) = self.si.parameter_types.get(i) else {
-                return (call_failure(), std::ptr::null_mut(), Vec::new());
-            };
-
-            let effective_native = if matches!(abi_native, NativeType::Pointer) {
-                if let Some(Some(parse_pt)) = self.argument_parse_types.get(i) {
-                    if matches!(parse_pt, NativeType::String) {
-                        NativeType::String
-                    } else {
-                        abi_native.clone()
-                    }
-                } else {
-                    abi_native.clone()
-                }
-            } else {
-                abi_native.clone()
-            };
-
-            call_args.push(unsafe { v.as_arg(&effective_native) });
-        }
+        let prep = match crate::ffi::prepare_string_storage(
+            &self.argument_buf,
+            &self.si.parameter_types,
+            &self.argument_parse_types,
+        ) {
+            Ok(prep) => prep,
+            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+        };
+        let call_args =
+            crate::ffi::build_call_args(&prep, &self.argument_buf, &self.si.parameter_types);
 
         let ret = match catch_unwind(AssertUnwindSafe(|| unsafe {
             self.si.cif.call(CodePtr::from_ptr(self.func), &call_args)
@@ -1440,28 +1567,11 @@ impl PropertyCall {
             self.si.return_kind,
             ReturnKind::Struct(_) | ReturnKind::Guid
         );
-        let is_scalar_return = matches!(
-            self.si.return_type.as_str(),
-            "UInt8"
-                | "Int8"
-                | "UInt16"
-                | "Int16"
-                | "UInt32"
-                | "Int32"
-                | "UInt64"
-                | "Int64"
-                | "USize"
-                | "ISize"
-                | "Single"
-                | "Double"
-                | "Boolean"
-                | "Char16"
-        );
-        let is_string_return = self.si.return_type.as_str() == "String";
+        let is_scalar_return = self.si.is_scalar_return;
+        let is_string_return = self.si.is_string_return;
 
-        self.argument_buf.clear();
-        self.argument_parse_types.clear();
-        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
+        self.reset_args();
+        let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         let mut out_slots: Vec<(usize, NativeType, usize, Option<napi::JsObject>)> = Vec::new();
 
@@ -1694,26 +1804,16 @@ impl PropertyCall {
             }
         }
 
-        let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
-        for (i, v) in self.argument_buf.iter().enumerate() {
-            let Some(abi_native) = self.si.parameter_types.get(i) else {
-                return fail3();
-            };
-            let effective_native = if matches!(abi_native, NativeType::Pointer) {
-                if let Some(Some(parse_pt)) = self.argument_parse_types.get(i) {
-                    if matches!(parse_pt, NativeType::String) {
-                        NativeType::String
-                    } else {
-                        abi_native.clone()
-                    }
-                } else {
-                    abi_native.clone()
-                }
-            } else {
-                abi_native.clone()
-            };
-            call_args.push(unsafe { v.as_arg(&effective_native) });
-        }
+        let prep = match crate::ffi::prepare_string_storage(
+            &self.argument_buf,
+            &self.si.parameter_types,
+            &self.argument_parse_types,
+        ) {
+            Ok(prep) => prep,
+            Err(_) => return fail3(),
+        };
+        let call_args =
+            crate::ffi::build_call_args(&prep, &self.argument_buf, &self.si.parameter_types);
 
         let ret = match catch_unwind(AssertUnwindSafe(|| unsafe {
             self.si.cif.call(CodePtr::from_ptr(self.func), &call_args)
@@ -1782,7 +1882,12 @@ impl PropertyCall {
                             match crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(
                                 env, inner,
                             ) {
-                                Some(p) => crate::napi_engine::value::as_unknown(env, p),
+                                Some(p) => {
+                                    // The wrapper holds its own reference; drop the +1 the
+                                    // callee wrote into the out slot.
+                                    IUnknown::from_raw(inner);
+                                    crate::napi_engine::value::as_unknown(env, p)
+                                }
                                 None => match nv::read_return_value(
                                     env,
                                     inner,

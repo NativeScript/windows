@@ -20,6 +20,7 @@ const DEFAULT_ATTRIBUTE: &str = "Windows.Foundation.Metadata.DefaultAttribute";
 pub struct ClassDeclaration {
     initializers: OnceLock<Vec<MethodDeclaration>>,
     default_interface: OnceLock<Option<Box<dyn BaseClassDeclarationImpl>>>,
+    sealed: OnceLock<bool>,
     base: BaseClassDeclaration,
     base_full_name: String,
 }
@@ -140,6 +141,7 @@ impl ClassDeclaration {
         Self {
             initializers: OnceLock::new(),
             default_interface: OnceLock::new(),
+            sealed: OnceLock::new(),
             base: BaseClassDeclaration::new(DeclarationKind::Class, metadata.clone(), token),
             base_full_name,
         }
@@ -185,21 +187,25 @@ impl ClassDeclaration {
         !self.initializers().is_empty()
     }
 
+    /// Whether the class is sealed. The type-def flags are immutable, so the metadata call
+    /// runs once per declaration; the runtime asks on every construct and wrap.
     pub fn is_sealed(&self) -> bool {
-        let mut flags = 0_u32;
-        if let Some(metadata) = self.base.base().metadata() {
-            let result = unsafe {
-                metadata.GetTypeDefProps(
-                    self.base.base().token().0 as u32,
-                    None,
-                    0 as _,
-                    &mut flags,
-                    0 as _,
-                )
-            };
-            debug_assert!(result.is_ok());
-        }
-        is_td_sealed(flags as i32)
+        *self.sealed.get_or_init(|| {
+            let mut flags = 0_u32;
+            if let Some(metadata) = self.base.base().metadata() {
+                let result = unsafe {
+                    metadata.GetTypeDefProps(
+                        self.base.base().token().0 as u32,
+                        None,
+                        0 as _,
+                        &mut flags,
+                        0 as _,
+                    )
+                };
+                debug_assert!(result.is_ok());
+            }
+            is_td_sealed(flags as i32)
+        })
     }
 
     pub fn initializers(&self) -> &[MethodDeclaration] {

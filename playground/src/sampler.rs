@@ -191,6 +191,32 @@ impl Sampler {
             for (chain, n) in rows.into_iter().take(12) {
                 eprintln!("{n:5}  {chain}");
             }
+
+            // "What does X spend its time in": the frame directly below the outermost X,
+            // counted once per sample ("(self)" when X itself was on top).
+            let mut callees: HashMap<String, usize> = HashMap::new();
+            for stack in &samples {
+                let names: Vec<String> = stack
+                    .iter()
+                    .take_while(|&&ip| ip != 0)
+                    .enumerate()
+                    .map(|(d, &ip)| symbol_name(if d == 0 { ip } else { ip - 1 }, &mut cache))
+                    .collect();
+                if let Some(pos) = names.iter().rposition(|n| n.contains(&focus)) {
+                    let callee = if pos == 0 {
+                        "(self)".to_string()
+                    } else {
+                        names[pos - 1].chars().take(110).collect()
+                    };
+                    *callees.entry(callee).or_default() += 1;
+                }
+            }
+            let mut rows: Vec<_> = callees.into_iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("\n[sampler] callees of '{focus}' ({hits} samples)");
+            for (callee, n) in rows.into_iter().take(25) {
+                eprintln!("{:6.2}%  {callee}", n as f64 * 100.0 / hits.max(1) as f64);
+            }
         }
     }
 }

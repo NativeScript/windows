@@ -2,6 +2,7 @@
 /target
 target/
 /target-prof
+/target-napi
 /**/*.rs.bk
 /Cargo.lock
 

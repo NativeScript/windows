@@ -12,11 +12,18 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
-use napi::{sys, CallContext, Env, JsFunction, JsObject, JsUnknown, NapiRaw, NapiValue, ValueType};
+use napi::{sys, CallContext, Env, JsFunction, JsUnknown, NapiRaw, NapiValue, ValueType};
 use windows::core::{IUnknown, Interface, GUID, HRESULT};
 
+use crate::napi_engine::ns_proxy::Decl;
 use crate::value::NativeType;
+
+/// A delegate parameter's declared class when that class is sealed: the argument's runtime
+/// class is then exactly this one, so the wrapper is built from the declaration without asking
+/// the object (see [`crate::sealed_class_for_type_name`]).
+pub(crate) type SealedParam = Option<(Arc<str>, Decl)>;
 
 #[repr(C)]
 pub(crate) struct NapiDelegateVtbl {
@@ -40,6 +47,9 @@ pub(crate) struct NapiDelegateData {
     env: sys::napi_env,
     func_ref: sys::napi_ref,
     param_types: Vec<NativeType>,
+    /// Aligned with `param_types`; `Some` for pointer parameters declared as a sealed class.
+    /// Shorter than `param_types` (or empty) means "resolve at invoke time" for the rest.
+    param_classes: Vec<SealedParam>,
 }
 
 impl Drop for NapiDelegateData {
@@ -64,12 +74,45 @@ unsafe impl Send for NapiDelegate {}
 unsafe impl Sync for NapiDelegate {}
 
 /// Allocate a NapiDelegate COM object over `func`; returns the IUnknown-compatible pointer
-/// (refcount 1, owned by the caller/WinRT callee).
+/// (refcount 1, owned by the caller/WinRT callee). Pointer parameters are typed at invoke time
+/// through GetRuntimeClassName; see [`make_napi_delegate_typed`] for the declared-type variant.
 pub fn make_napi_delegate(
     env: &Env,
     func: &JsFunction,
     guid: GUID,
     param_types: Vec<NativeType>,
+) -> Option<*mut c_void> {
+    make_napi_delegate_typed(env, func, guid, param_types, Vec::new())
+}
+
+/// The sealed-class declarations of a delegate's Invoke parameters, aligned with the
+/// `param_types` that [`crate::delegate_info_from_type_sig`] reports for `iid_name`. Only
+/// pointer parameters whose declared type is a sealed runtime class get an entry; every other
+/// parameter (unsealed classes, interfaces, `Object`, scalars) is `None` and keeps the
+/// runtime-class resolution at invoke time. Empty when `iid_name` is not a delegate.
+pub(crate) fn delegate_param_classes(iid_name: &str, param_types: &[NativeType]) -> Vec<SealedParam> {
+    let Some(sigs) = crate::delegate_param_sigs(iid_name) else {
+        return Vec::new();
+    };
+    param_types
+        .iter()
+        .zip(sigs.iter())
+        .map(|(ty, sig)| match ty {
+            NativeType::Pointer => crate::sealed_class_for_type_name(sig),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`make_napi_delegate`] with the parameters' sealed-class declarations resolved up front
+/// (`param_classes` from [`delegate_param_classes`]), so an event handler receives its typed
+/// arguments without a per-invoke IInspectable QI, GetRuntimeClassName and metadata lookup.
+pub(crate) fn make_napi_delegate_typed(
+    env: &Env,
+    func: &JsFunction,
+    guid: GUID,
+    param_types: Vec<NativeType>,
+    param_classes: Vec<SealedParam>,
 ) -> Option<*mut c_void> {
     let mut func_ref: sys::napi_ref = std::ptr::null_mut();
     let status =
@@ -81,6 +124,7 @@ pub fn make_napi_delegate(
         env: env.raw(),
         func_ref,
         param_types,
+        param_classes,
     });
     let delegate = Box::new(NapiDelegate {
         vtable: &NAPI_DELEGATE_VTBL as *const _,
@@ -192,14 +236,15 @@ fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2:
 
             let params_raw = [p0, p1, p2];
             let n = data.param_types.len().min(3);
-            let mut js_args: Vec<sys::napi_value> = Vec::with_capacity(n);
+            let mut js_args: [sys::napi_value; 4] = [std::ptr::null_mut(); 4];
             for i in 0..n {
                 let raw = params_raw[i];
-                let val = match delegate_param_to_napi(env, raw, &data.param_types[i]) {
+                let class = data.param_classes.get(i).and_then(|c| c.as_ref());
+                let val = match delegate_param_to_napi(env, raw, &data.param_types[i], class) {
                     Some(v) => v,
                     None => return E_FAIL,
                 };
-                js_args.push(val);
+                js_args[i] = val;
             }
 
             let mut recv: sys::napi_value = std::ptr::null_mut();
@@ -209,7 +254,7 @@ fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2:
                 env,
                 recv,
                 func,
-                js_args.len(),
+                n,
                 js_args.as_ptr(),
                 &mut call_result,
             );
@@ -235,13 +280,16 @@ fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2:
 /// Convert one raw delegate Invoke parameter to a napi value per its NativeType — builds the
 /// JS-visible arguments the delegate callback is invoked with.
 ///
-/// Pointer params: resolves the concrete WinRT type via `ns_proxy::try_wrap_inspectable_pointer`
-/// (INSTANCE_CACHE / GetRuntimeClassName) so the JS callback receives a fully typed proxy
-/// (property/method access); falls back to a raw external only when that resolution fails.
+/// Pointer params declared as a sealed class (`class` is `Some`) wrap straight from that
+/// declaration. Otherwise the concrete WinRT type is resolved via
+/// `ns_proxy::try_wrap_inspectable_pointer` (INSTANCE_CACHE / GetRuntimeClassName) so the JS
+/// callback receives a fully typed proxy (property/method access); a raw external is the
+/// fallback when that resolution fails.
 unsafe fn delegate_param_to_napi(
     env: sys::napi_env,
     raw: usize,
     ty: &NativeType,
+    class: Option<&(Arc<str>, Decl)>,
 ) -> Option<sys::napi_value> {
     let mut out: sys::napi_value = std::ptr::null_mut();
     let ok = match ty {
@@ -249,13 +297,32 @@ unsafe fn delegate_param_to_napi(
             if raw == 0 {
                 sys::napi_get_null(env, &mut out)
             } else {
-                // Resolve the concrete WinRT type so the JS callback receives a fully typed
-                // proxy (property/method access); raw external as the fallback.
                 let env_obj = Env::from_raw(env);
-                if let Some(proxy) = crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(
-                    &env_obj,
-                    raw as *mut c_void,
-                ) {
+                // The parameter is borrowed from the event source for the duration of Invoke;
+                // the wrapper needs its own reference (AddRef via clone of a ManuallyDrop view).
+                let sealed = class.and_then(|(name, decl)| {
+                    let owned: IUnknown = {
+                        let borrowed =
+                            std::mem::ManuallyDrop::new(IUnknown::from_raw(raw as *mut c_void));
+                        (*borrowed).clone()
+                    };
+                    crate::napi_engine::ns_proxy::create_instance_proxy(
+                        &env_obj,
+                        name,
+                        decl.clone(),
+                        owned,
+                    )
+                    .ok()
+                });
+                if let Some(proxy) = sealed {
+                    out = proxy.raw();
+                    sys::Status::napi_ok
+                } else if let Some(proxy) =
+                    crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(
+                        &env_obj,
+                        raw as *mut c_void,
+                    )
+                {
                     out = proxy.raw();
                     sys::Status::napi_ok
                 } else {
@@ -340,7 +407,9 @@ fn native_as_delegate(ctx: &CallContext) -> napi::Result<JsUnknown> {
         )));
     };
 
-    let Some(ptr) = make_napi_delegate(&ctx.env, &func, guid, param_types) else {
+    let param_classes = delegate_param_classes(&type_name, &param_types);
+    let Some(ptr) = make_napi_delegate_typed(&ctx.env, &func, guid, param_types, param_classes)
+    else {
         return Err(napi::Error::from_reason(
             "__nsAsDelegate: failed to create native delegate".to_string(),
         ));

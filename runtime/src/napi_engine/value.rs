@@ -14,7 +14,7 @@ use std::mem::ManuallyDrop;
 // `Result<_, AnyError>` return types. Import concrete items instead.
 use napi::sys;
 use napi::{
-    Env, JsBigInt, JsBoolean, JsExternal, JsFunction, JsNumber, JsObject, JsString, JsUnknown,
+    Env, JsBigInt, JsBoolean, JsFunction, JsNumber, JsObject, JsString, JsUnknown,
     NapiRaw, NapiValue, ValueType,
 };
 use windows::core::{IUnknown, Interface, GUID, HSTRING};
@@ -471,21 +471,113 @@ pub fn external_from_ptr(env: &Env, ptr: *mut c_void) -> Result<JsUnknown, AnyEr
     Ok(as_unknown(env, ext))
 }
 
+/// Layout of the payload napi-rs boxes behind every `env.create_external` value. It mirrors
+/// napi 2.16.17 `src/js_values/tagged_object.rs` (`TaggedObject<T>`), whose fields are private
+/// to napi-rs, so the same shape is declared here to read the payload back through one raw
+/// `napi_get_value_external` plus a `TypeId` compare instead of `env.get_value_external`
+/// (which allocates an Error String on every type mismatch).
+#[repr(C)]
+pub(crate) struct Tagged<T> {
+    type_id: std::any::TypeId,
+    object: Option<T>,
+}
+
+/// The `T` payload of a napi-rs external whose raw data pointer is `raw`, if the external was
+/// created for exactly that type.
+///
+/// # Safety
+/// `raw` must be the data pointer of a live external created by napi-rs `create_external`.
+#[inline]
+pub(crate) unsafe fn tagged_payload<'a, T: 'static>(raw: *mut c_void) -> Option<&'a T> {
+    if raw.is_null() {
+        return None;
+    }
+    if *(raw as *const std::any::TypeId) != std::any::TypeId::of::<T>() {
+        return None;
+    }
+    (*(raw as *const Tagged<T>)).object.as_ref()
+}
+
+/// NUL-terminated property key for the `handle` slot every wrapper carries; passing a static
+/// key to `napi_get_named_property` avoids the per-call `CString` that napi-rs's
+/// `get_named_property` allocates.
+pub(crate) const HANDLE_KEY: &[u8] = b"handle\0";
+
+/// `obj[key]` through `napi_get_named_property` with a static NUL-terminated key. `None` when
+/// the read fails (a pending exception from a throwing getter is left for the caller's usual
+/// error handling, exactly as with napi-rs's `get_named_property`).
+#[inline]
+pub(crate) fn get_named_property_raw(
+    env: &Env,
+    obj: sys::napi_value,
+    key: &'static [u8],
+) -> Option<sys::napi_value> {
+    debug_assert_eq!(key.last(), Some(&0u8));
+    let mut out: sys::napi_value = std::ptr::null_mut();
+    let st = unsafe {
+        sys::napi_get_named_property(
+            env.raw(),
+            obj,
+            key.as_ptr() as *const std::ffi::c_char,
+            &mut out,
+        )
+    };
+    if st != sys::Status::napi_ok || out.is_null() {
+        return None;
+    }
+    Some(out)
+}
+
+/// `napi_typeof` on a raw value; `None` when the call fails.
+#[inline]
+pub(crate) fn raw_typeof(env: &Env, v: sys::napi_value) -> Option<sys::napi_valuetype> {
+    let mut vt: sys::napi_valuetype = 0;
+    let st = unsafe { sys::napi_typeof(env.raw(), v, &mut vt) };
+    (st == sys::Status::napi_ok).then_some(vt)
+}
+
+/// Raw data pointer of an external; the caller guarantees `typeof v === External`.
+#[inline]
+pub(crate) fn external_data_raw(env: &Env, v: sys::napi_value) -> Option<*mut c_void> {
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let st = unsafe { sys::napi_get_value_external(env.raw(), v, &mut out) };
+    if st != sys::Status::napi_ok || out.is_null() {
+        return None;
+    }
+    Some(out)
+}
+
+/// The COM/handle pointer carried by an external the caller has already identified as such
+/// (`typeof === External`). One `napi_get_value_external`, then a `TypeId` dispatch: host
+/// instances carry a `HostHandle` (checked first, the hot case), everything else boxes a
+/// `usize`. Never constructs a napi-rs Error.
+#[inline]
+pub(crate) fn external_ptr_raw(env: &Env, v: sys::napi_value) -> Option<*mut c_void> {
+    let data = external_data_raw(env, v)?;
+    unsafe {
+        if let Some(hh) = tagged_payload::<crate::napi_engine::ns_hostobject::HostHandle>(data) {
+            return Some(hh.ptr());
+        }
+        tagged_payload::<usize>(data).map(|p| *p as *mut c_void)
+    }
+}
+
+/// The `HostHandle` carried by an external the caller has already identified as such.
+#[inline]
+pub(crate) fn host_handle_from_external<'a>(
+    env: &Env,
+    v: sys::napi_value,
+) -> Option<&'a crate::napi_engine::ns_hostobject::HostHandle> {
+    let data = external_data_raw(env, v)?;
+    unsafe { tagged_payload::<crate::napi_engine::ns_hostobject::HostHandle>(data) }
+}
+
 #[inline]
 pub fn ptr_from_external(env: &Env, v: &JsUnknown) -> Option<*mut c_void> {
     if v.get_type().ok()? != ValueType::External {
         return None;
     }
-    let ext: JsExternal = unsafe { v.cast() };
-    // Most externals box a `usize` pointer. Host-object instances instead use a `HostHandle`
-    // external (one object that both carries the pointer and owns the COM ref); read it too.
-    if let Ok(raw) = env.get_value_external::<usize>(&ext) {
-        return Some(*raw as *mut c_void);
-    }
-    if let Ok(hh) = env.get_value_external::<crate::napi_engine::ns_hostobject::HostHandle>(&ext) {
-        return Some(hh.ptr());
-    }
-    None
+    external_ptr_raw(env, unsafe { v.raw() })
 }
 
 /// null → JS null, else a pointer external.
@@ -508,7 +600,7 @@ fn external_or_null(env: &Env, ptr: *mut c_void) -> Result<JsUnknown, AnyError> 
 /// (undefined and anything else → None, NOT a null pointer).
 fn js_value_as_ptr(env: &Env, v: &JsUnknown) -> Option<*mut c_void> {
     match v.get_type().ok()? {
-        ValueType::External => ptr_from_external(env, v),
+        ValueType::External => external_ptr_raw(env, unsafe { v.raw() }),
         ValueType::Null => Some(std::ptr::null_mut()),
         ValueType::BigInt => {
             let b: JsBigInt = unsafe { v.cast() };
@@ -531,7 +623,16 @@ fn js_value_as_ptr(env: &Env, v: &JsUnknown) -> Option<*mut c_void> {
 /// 3. `__native_ptr` property — hex/decimal string, BigInt, Number, or External.
 /// 4. `__handle` managed-bridge id — resolved via `Bridge.GetNativePtrForHandle`.
 pub(crate) fn try_get_external_handle(env: &Env, obj: &JsObject) -> Option<*mut c_void> {
-    if let Ok(handle) = obj.get_named_property::<JsUnknown>("handle") {
+    if let Some(handle_raw) = get_named_property_raw(env, unsafe { obj.raw() }, HANDLE_KEY) {
+        // Host instances and pointer externals: the hot case. One typeof, one raw external
+        // read, no napi-rs Error construction (the JSC shim's napi_get_value_external assumes
+        // an object, so the typeof guard must stay in front of it).
+        if raw_typeof(env, handle_raw) == Some(sys::ValueType::napi_external) {
+            if let Some(p) = external_ptr_raw(env, handle_raw) {
+                return Some(p);
+            }
+        }
+        let handle = unsafe { JsUnknown::from_raw_unchecked(env.raw(), handle_raw) };
         if let Ok(ValueType::Function) = handle.get_type() {
             // Managed wrappers commonly expose the handle behind a small accessor; calling it
             // is the explicit bridge contract. `this` = the object so typical getters work.
@@ -1131,9 +1232,11 @@ pub unsafe fn read_value_from_ptr(
                 // release the WinRT string buffer (same ownership contract as the original).
                 let raw_usize = read_unaligned(ptr as *const usize);
                 let hstring: HSTRING = std::mem::transmute(raw_usize);
-                let s = hstring.to_string_lossy();
+                // HSTRING and JS strings are both UTF-16: hand the code units straight to the
+                // engine instead of transcoding through a Rust String.
+                let js = env.create_string_utf16(&hstring).map_err(map)?;
                 drop(hstring);
-                as_unknown(env, env.create_string(&s).map_err(map)?)
+                as_unknown(env, js)
             }
         }
     })
@@ -1313,7 +1416,7 @@ pub fn try_unbox_property_value(env: &Env, raw: *mut c_void) -> Option<JsUnknown
         }
         PropertyType::String => {
             let s = unsafe { pv.GetString() }.ok()?;
-            env.create_string(&s.to_string()).ok().map(|v| as_unknown(env, v))
+            env.create_string_utf16(&s).ok().map(|v| as_unknown(env, v))
         }
         PropertyType::Guid => {
             let g = unsafe { pv.GetGuid() }.ok()?;

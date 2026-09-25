@@ -14,8 +14,11 @@ use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_SINGLETHREADED};
 
 use crate::class_helpers::find_class_method;
 use crate::error::{generic_error, type_error, AnyError};
-use crate::method_call::MethodCall;
+use crate::method_call::{MethodCall, PreparedCall};
+use crate::napi_engine::ns_hostobject::HostHandle;
 use crate::napi_engine::value as nv;
+use crate::property_call::{PreparedProperty, PropertyCall};
+use crate::ReturnKind;
 use crate::value::NativeType;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
@@ -58,6 +61,7 @@ fn class_declaration(
 /// and unresolvable types). Shared by method and property invocation.
 pub(crate) fn convert_call_result(
     env: &Env,
+    kind: &ReturnKind,
     is_void: bool,
     return_type: &str,
     hr: HRESULT,
@@ -72,6 +76,45 @@ pub(crate) fn convert_call_result(
             .get_undefined()
             .map_err(|e| type_error(e.to_string()))?;
         return Ok(nv::as_unknown(env, u));
+    }
+    // Fast paths off the precomputed ReturnKind. Everything else (unsealed classes, which may
+    // come back as a derived runtime class; interfaces; enums; structs; Guid; Object; pointer
+    // primitives) takes the string-driven resolution below.
+    match kind {
+        ReturnKind::Object {
+            decl,
+            type_name,
+            sealed: true,
+        } => {
+            if result.is_null() {
+                let n = env.get_null().map_err(|e| type_error(e.to_string()))?;
+                return Ok(nv::as_unknown(env, n));
+            }
+            // The callee handed back a +1 reference; the wrapper takes ownership of it. A
+            // sealed class has no derived runtime classes, so the declaration is exact and no
+            // IInspectable QI / GetRuntimeClassName / metadata lookup is needed.
+            let instance = unsafe { IUnknown::from_raw(result) };
+            let proxy = crate::napi_engine::ns_proxy::create_instance_proxy(
+                env,
+                type_name,
+                decl.clone(),
+                instance,
+            )
+            .map_err(|e| generic_error(e.to_string()))?;
+            return Ok(nv::as_unknown(env, proxy));
+        }
+        ReturnKind::Primitive(nt) => match nt {
+            NativeType::Pointer
+            | NativeType::Buffer
+            | NativeType::Function
+            | NativeType::Void
+            | NativeType::Struct(_) => {}
+            _ => {
+                // Scalar or String: `result` points at the stable return buffer.
+                return unsafe { nv::read_value_from_ptr(env, result as *const c_void, nt) };
+            }
+        },
+        _ => {}
     }
     if let Ok(nt) = NativeType::try_from(return_type) {
         match nt {
@@ -146,6 +189,9 @@ pub(crate) fn convert_call_result(
     if !result.is_null() {
         if let Some(proxy) = crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(env, result)
         {
+            // The wrapper took its own reference (clone); release the +1 the call handed us,
+            // exactly like the unbox branch below.
+            unsafe { IUnknown::from_raw(result) };
             return Ok(nv::as_unknown(env, proxy));
         }
         // Boxed primitive (IReference<T> from e.g. PropertySet.Lookup) → JS primitive.
@@ -165,7 +211,7 @@ fn convert_result(
     hr: HRESULT,
     result: *mut c_void,
 ) -> Result<JsUnknown, AnyError> {
-    convert_call_result(env, mc.is_void(), mc.return_type(), hr, result)
+    convert_call_result(env, mc.return_kind(), mc.is_void(), mc.return_type(), hr, result)
 }
 
 /// Invoke a method declared on a (possibly generic) interface, via QI to `iid`. Used by
@@ -188,7 +234,7 @@ pub fn invoke_interface_method(
         )));
     };
     let (hr, result, _outs) = pc.call_napi(env, args);
-    convert_call_result(env, pc.is_void(), pc.return_type(), hr, result)
+    convert_call_result(env, pc.return_kind(), pc.is_void(), pc.return_type(), hr, result)
 }
 
 /// Get/set a property declared on a (possibly generic) interface, via QI to `iid`.
@@ -226,7 +272,7 @@ pub fn invoke_interface_property(
         let u = env.get_undefined().map_err(|e| type_error(e.to_string()))?;
         return Ok(nv::as_unknown(env, u));
     }
-    convert_call_result(env, pc.is_void(), pc.return_type(), hr, result)
+    convert_call_result(env, pc.return_kind(), pc.is_void(), pc.return_type(), hr, result)
 }
 
 /// Get or set a WinRT property on an owned COM reference via `PropertyCall::call_napi`.
@@ -264,7 +310,107 @@ pub fn invoke_property(
             .map_err(|e| type_error(e.to_string()))?;
         return Ok(nv::as_unknown(env, u));
     }
-    convert_call_result(env, pc.is_void(), pc.return_type(), hr, result)
+    convert_call_result(env, pc.return_kind(), pc.is_void(), pc.return_type(), hr, result)
+}
+
+/// Invoke an instance method on a host object's own COM reference: the call borrows the
+/// interface pointer from the handle's QI cache (no AddRef, no QueryInterface, no Release on
+/// the repeat path) and the return value is converted straight from the call's ReturnKind.
+pub(crate) fn invoke_host_method(
+    env: &Env,
+    handle: &HostHandle,
+    method: &metadata::declarations::method_declaration::MethodDeclaration,
+    is_sealed: bool,
+    args: &[JsUnknown],
+) -> Result<JsUnknown, AnyError> {
+    ensure_winrt_initialized();
+    let mut mc = MethodCall::new_cached(method, is_sealed, handle.instance(), handle.qi());
+    if let Some(msg) = mc.init_error_message() {
+        return Err(generic_error(msg.to_string()));
+    }
+    let (hr, result, _out) = mc.call_napi(env, args);
+    convert_call_result(env, mc.return_kind(), mc.is_void(), mc.return_type(), hr, result)
+}
+
+/// Get (`value = None`) or set (`value = Some`) a property on a host object's own COM
+/// reference through the handle's QI cache; see [`invoke_host_method`].
+pub(crate) fn invoke_host_property(
+    env: &Env,
+    handle: &HostHandle,
+    property: &metadata::declarations::property_declaration::PropertyDeclaration,
+    value: Option<&JsUnknown>,
+) -> Result<JsUnknown, AnyError> {
+    ensure_winrt_initialized();
+    let is_setter = value.is_some();
+    let Some(mut pc) =
+        PropertyCall::new_cached(property, is_setter, handle.instance(), handle.qi())
+    else {
+        return Err(generic_error(format!(
+            "PropertyCall construction failed for '{}'",
+            property.name()
+        )));
+    };
+    let (hr, result, _outs) = match value {
+        Some(v) => {
+            let args = [nv::dup(env, v)];
+            pc.call_napi(env, &args)
+        }
+        None => pc.call_napi(env, &[]),
+    };
+    if is_setter {
+        if hr.is_err() {
+            let detail = crate::error::format_hresult_message(hr);
+            return Err(generic_error(format!(
+                "Property set '{}' failed: {detail}",
+                property.name()
+            )));
+        }
+        let u = env.get_undefined().map_err(|e| type_error(e.to_string()))?;
+        return Ok(nv::as_unknown(env, u));
+    }
+    convert_call_result(env, pc.return_kind(), pc.is_void(), pc.return_type(), hr, result)
+}
+
+/// Invoke a method through a [`PreparedCall`] (a static method or constructor resolved once on
+/// its activation factory): the call borrows the prepared interface pointer and vtable slot.
+pub(crate) fn invoke_prepared_method(
+    env: &Env,
+    prepared: &PreparedCall,
+    args: &[JsUnknown],
+) -> Result<JsUnknown, AnyError> {
+    let mut mc = MethodCall::from_prepared(prepared);
+    let (hr, result, _out) = mc.call_napi(env, args);
+    convert_call_result(env, mc.return_kind(), mc.is_void(), mc.return_type(), hr, result)
+}
+
+/// Get (`value = None`) or set (`value = Some`) a property through a [`PreparedProperty`]
+/// (a static accessor resolved once on its activation factory).
+pub(crate) fn invoke_prepared_property(
+    env: &Env,
+    prepared: &PreparedProperty,
+    property: &metadata::declarations::property_declaration::PropertyDeclaration,
+    value: Option<&JsUnknown>,
+) -> Result<JsUnknown, AnyError> {
+    let mut pc = PropertyCall::from_prepared(prepared);
+    let (hr, result, _outs) = match value {
+        Some(v) => {
+            let args = [nv::dup(env, v)];
+            pc.call_napi(env, &args)
+        }
+        None => pc.call_napi(env, &[]),
+    };
+    if value.is_some() {
+        if hr.is_err() {
+            let detail = crate::error::format_hresult_message(hr);
+            return Err(generic_error(format!(
+                "Property set '{}' failed: {detail}",
+                property.name()
+            )));
+        }
+        let u = env.get_undefined().map_err(|e| type_error(e.to_string()))?;
+        return Ok(nv::as_unknown(env, u));
+    }
+    convert_call_result(env, pc.return_kind(), pc.is_void(), pc.return_type(), hr, result)
 }
 
 /// Invoke a static WinRT method: activation factory → MethodCall → call_napi.

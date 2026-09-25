@@ -1105,6 +1105,7 @@ dependencies = [
  "runtime-binding-gen",
  "serde",
  "serde_json",
+ "smallvec",
  "url",
  "windows",
  "windows-collections",

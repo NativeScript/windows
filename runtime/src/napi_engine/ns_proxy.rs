@@ -334,7 +334,27 @@ pub(crate) fn wire_winrt_event_napi(
         }
         let func: JsFunction = unsafe { value.cast() };
         let (guid, param_types) = crate::delegate_info_from_add_method(add_method)?;
-        crate::napi_engine::delegate::make_napi_delegate(env, &func, guid, param_types)
+        // The delegate's IID-form name, derived exactly as `delegate_info_from_add_method`
+        // derives it, keys the parameters' sealed-class declarations so the handler receives
+        // typed arguments without a per-event runtime-class lookup.
+        let param_classes = add_method
+            .parameters()
+            .first()
+            .and_then(|p| {
+                let iid_name =
+                    metadata::signature::Signature::to_iid_string(p.metadata()?, &p.type_());
+                (!iid_name.is_empty()).then(|| {
+                    crate::napi_engine::delegate::delegate_param_classes(&iid_name, &param_types)
+                })
+            })
+            .unwrap_or_default();
+        crate::napi_engine::delegate::make_napi_delegate_typed(
+            env,
+            &func,
+            guid,
+            param_types,
+            param_classes,
+        )
     });
 
     if let Some(delegate_ptr) = effective_ptr {

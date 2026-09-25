@@ -439,13 +439,28 @@ pub fn create_hstring_backed_js_value<'s>(
     let key = v8::String::new(scope, "__hstring_ptr").unwrap();
     let _ = obj.set(scope, key.into(), ext.into());
     // Also expose the string content under `value` for convenience.
-    let s = unsafe { (&*(ptr as *mut HSTRING)).to_string_lossy() };
+    let content = two_byte_string(scope, unsafe { &*(ptr as *const HSTRING) });
     let _ = obj.set(
         scope,
         v8::String::new(scope, "value").unwrap().into(),
-        v8::String::new(scope, &s).unwrap().into(),
+        content.into(),
     );
     obj
+}
+
+/// A JS string holding the HSTRING's UTF-16 code units: one copy into the V8 heap, no
+/// intermediate UTF-8 transcode. Lone surrogates round-trip unchanged.
+#[cfg(feature = "classic")]
+#[inline]
+pub(crate) fn two_byte_string<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    hstring: &HSTRING,
+) -> v8::Local<'a, v8::String> {
+    if hstring.is_empty() {
+        return v8::String::empty(scope);
+    }
+    v8::String::new_from_two_byte(scope, hstring, v8::NewStringType::Normal)
+        .unwrap_or_else(|| v8::String::empty(scope))
 }
 
 #[cfg(feature = "classic")]
@@ -676,6 +691,23 @@ fn try_get_external_handle(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Object>,
 ) -> Option<*mut c_void> {
+    // Runtime wrappers carry their DeclarationFFI in internal field 0, so the COM pointer is
+    // one field read away; the `handle` property protocol below is the bridge contract for
+    // foreign (managed / delegate-result) objects. ArrayBuffers also report two internal
+    // fields, holding Smis, which the checked External conversion rejects.
+    if arg.internal_field_count() == 2 {
+        if let Some(field) = arg.get_internal_field(scope, 0) {
+            if let Ok(ext) = v8::Local::<v8::External>::try_from(field) {
+                let dec = ext.value() as *const DeclarationFFI;
+                if !dec.is_null() {
+                    if let Some(instance) = unsafe { (*dec).instance.as_ref() } {
+                        return Some(instance.as_raw() as *mut c_void);
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(handle_key) = v8::String::new(scope, "handle") {
         if let Some(handle) = arg.get(scope, handle_key.into()) {
             // If `handle` is a function (common for managed wrappers exposing
@@ -735,9 +767,15 @@ fn try_get_external_handle(
         }
     }
 
-    if let Some(dec) = arg.get_internal_field(scope, 0) {
-        let dec = unsafe { dec.cast::<v8::External>() };
-        let dec = dec.value() as *mut DeclarationFFI;
+    if let Some(field) = arg.get_internal_field(scope, 0) {
+        // Checked: a typed array's embedder slots hold Smis, not Externals.
+        let Ok(ext) = v8::Local::<v8::External>::try_from(field) else {
+            return None;
+        };
+        let dec = ext.value() as *mut DeclarationFFI;
+        if dec.is_null() {
+            return None;
+        }
         let dec = unsafe { &*dec };
 
         if let Some(ref instance) = dec.instance {
@@ -1482,9 +1520,8 @@ pub unsafe fn set_ret_val(
                 // string buffer.
                 let raw_usize = unsafe { std::ptr::read_unaligned(value as *const usize) };
                 let hstring: HSTRING = unsafe { std::mem::transmute(raw_usize) };
-                let s = hstring.to_string_lossy();
+                let v = two_byte_string(scope, &hstring);
                 drop(hstring);
-                let v = v8::String::new(scope, &s).unwrap_or_else(|| v8::String::empty(scope));
                 rv.set(v.into());
             }
         }
@@ -1609,11 +1646,9 @@ pub unsafe fn read_value_from_ptr<'a>(
             } else {
                 let raw_usize = std::ptr::read_unaligned(ptr as *const usize);
                 let hstring: HSTRING = std::mem::transmute(raw_usize);
-                let s = hstring.to_string_lossy();
+                let v = two_byte_string(scope, &hstring);
                 drop(hstring);
-                v8::String::new(scope, &s)
-                    .unwrap_or_else(|| v8::String::empty(scope))
-                    .into()
+                v.into()
             }
         }
     }

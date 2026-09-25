@@ -286,9 +286,8 @@ pub fn attach_compositor_to_window(
         .map_err(|e| napi::Error::from_reason(format!("compositor is not desktop-capable: {e}")))?;
     let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, false) }
         .map_err(|e| napi::Error::from_reason(format!("CreateDesktopWindowTarget failed: {e}")))?;
-    let raw = target.as_raw();
-    std::mem::forget(target); // ownership moves into the wrapped proxy below
-
-    crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(env, raw)
-        .ok_or_else(|| napi::Error::from_reason("failed to wrap DesktopWindowTarget"))
+    // The wrapper takes its own reference to the target; ours is released when `target` drops.
+    let wrapped = crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(env, target.as_raw());
+    drop(target);
+    wrapped.ok_or_else(|| napi::Error::from_reason("failed to wrap DesktopWindowTarget"))
 }

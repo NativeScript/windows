@@ -317,7 +317,9 @@ pub(crate) fn find_class_method_by_arity(
 thread_local! {
     // Bound method (metadata scope, token) → every overload sharing its public name, for methods
     // whose overloads differ in arity. See `register_overload_siblings`.
-    static OVERLOAD_SIBLINGS: std::cell::RefCell<ahash::AHashMap<(usize, i32), std::rc::Rc<[MethodDeclaration]>>> =
+    // `None` records a method with no arity siblings, so the class scan runs once per method
+    // either way.
+    static OVERLOAD_SIBLINGS: std::cell::RefCell<ahash::AHashMap<(usize, i32), Option<std::rc::Rc<[MethodDeclaration]>>>> =
         std::cell::RefCell::new(ahash::AHashMap::new());
 }
 
@@ -345,8 +347,9 @@ pub(crate) fn register_overload_siblings(
     if OVERLOAD_SIBLINGS.with(|m| m.borrow().contains_key(&key)) {
         return;
     }
-    let mut siblings: Vec<MethodDeclaration> = vec![bound.clone()];
-    for m in find_class_methods(class_declaration, js_name) {
+    let candidates = find_class_methods(class_declaration, js_name);
+    let mut siblings: Vec<&MethodDeclaration> = vec![bound];
+    for m in &candidates {
         if m.name() == js_name
             && m.is_static() == bound.is_static()
             && !siblings
@@ -356,9 +359,12 @@ pub(crate) fn register_overload_siblings(
             siblings.push(m);
         }
     }
-    if siblings.len() > 1 {
-        OVERLOAD_SIBLINGS.with(|m| m.borrow_mut().insert(key, siblings.into()));
-    }
+    let entry = if siblings.len() > 1 {
+        Some(siblings.into_iter().cloned().collect::<Vec<_>>().into())
+    } else {
+        None
+    };
+    OVERLOAD_SIBLINGS.with(|m| m.borrow_mut().insert(key, entry));
 }
 
 /// The overload of `bound` matching `argc`, when `bound` itself doesn't (see
@@ -372,6 +378,7 @@ pub(crate) fn overload_for_argc(bound: &MethodDeclaration, argc: usize) -> Optio
     OVERLOAD_SIBLINGS.with(|m| {
         m.borrow()
             .get(&method_identity(bound))
+            .and_then(|s| s.as_ref())
             .and_then(|s| s.iter().find(|c| c.number_of_parameters() == argc).cloned())
     })
 }

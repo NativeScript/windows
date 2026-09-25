@@ -56,16 +56,162 @@ thread_local!(static CREATING_CTORS: RefCell<Vec<String>> = RefCell::new(Vec::ne
 
 thread_local!(static SHARED_METHOD_FNS: RefCell<ahash::AHashMap<String, v8::Global<v8::Function>>> = RefCell::new(ahash::AHashMap::new()));
 
-/// Per-isolate cache of instance wrapper templates, keyed by resolved runtime
-/// class name. Stored in an isolate slot so the `v8::Global`s die with their
-/// isolate instead of dangling in a thread_local.
-pub(crate) struct InstanceTemplateCache(
-    pub RefCell<ahash::AHashMap<String, v8::Global<v8::FunctionTemplate>>>,
-);
+/// Identity of a cached wrapper template: which builder made it (the lib.rs and ns_proxy
+/// builders install different interceptor sets) plus the declaration and parent it was built
+/// for, by address. Declarations are per-name singletons in the metadata cache, so the address
+/// identifies them without hashing their names.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TemplateKey {
+    builder: u8,
+    decl: usize,
+    parent: usize,
+}
+
+impl TemplateKey {
+    pub(crate) fn new(
+        builder: u8,
+        decl: &Arc<RwLock<dyn Declaration>>,
+        parent: Option<&Arc<RwLock<dyn Declaration>>>,
+    ) -> Self {
+        Self {
+            builder,
+            decl: Arc::as_ptr(decl) as *const () as usize,
+            parent: parent.map_or(0, |p| Arc::as_ptr(p) as *const () as usize),
+        }
+    }
+}
+
+struct TemplateEntry {
+    tmpl: v8::Global<v8::FunctionTemplate>,
+    // Pin the keyed declarations so their addresses can never be recycled for another type
+    // while the entry lives.
+    _decl: Arc<RwLock<dyn Declaration>>,
+    _parent: Option<Arc<RwLock<dyn Declaration>>>,
+}
+
+/// Per-isolate cache of instance wrapper templates. Stored in an isolate slot so the
+/// `v8::Global`s die with their isolate instead of dangling in a thread_local.
+pub(crate) struct InstanceTemplateCache {
+    templates: RefCell<ahash::AHashMap<TemplateKey, TemplateEntry>>,
+}
 
 impl InstanceTemplateCache {
     pub(crate) fn new() -> Self {
-        Self(RefCell::new(ahash::AHashMap::new()))
+        Self {
+            templates: RefCell::new(ahash::AHashMap::new()),
+        }
+    }
+
+    pub(crate) fn get<'a>(
+        &self,
+        scope: &mut v8::PinScope<'a, '_>,
+        key: TemplateKey,
+    ) -> Option<Local<'a, FunctionTemplate>> {
+        self.templates
+            .borrow()
+            .get(&key)
+            .map(|entry| v8::Local::new(scope, &entry.tmpl))
+    }
+
+    pub(crate) fn insert(
+        &self,
+        key: TemplateKey,
+        tmpl: v8::Global<v8::FunctionTemplate>,
+        decl: Arc<RwLock<dyn Declaration>>,
+        parent: Option<Arc<RwLock<dyn Declaration>>>,
+    ) {
+        self.templates.borrow_mut().insert(
+            key,
+            TemplateEntry {
+                tmpl,
+                _decl: decl,
+                _parent: parent,
+            },
+        );
+    }
+}
+
+/// `handle` on instance wrappers: the wrapped COM pointer as an External, or null without one.
+/// A template accessor serves it from internal field 0, so a wrap neither defines a property
+/// (a map transition through the interceptor-aware define path) nor allocates the External.
+pub(crate) fn install_handle_accessor(
+    scope: &mut v8::PinScope<'_, '_>,
+    object_tmpl: Local<v8::ObjectTemplate>,
+) {
+    if let Some(key) =
+        v8::String::new_from_one_byte(scope, b"handle", v8::NewStringType::Internalized)
+    {
+        object_tmpl.set_accessor(key.into(), instance_handle_getter);
+    }
+}
+
+fn instance_handle_getter(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let raw = this_declaration_ffi(scope, args.holder())
+        .and_then(|ffi| unsafe { &*ffi }.instance.as_ref().map(|i| i.as_raw()));
+    match raw {
+        Some(raw) => rv.set(v8::External::new(scope, raw).into()),
+        None => rv.set_null(),
+    }
+}
+
+/// The isolate's template cache. Returned by pointer because the slot borrow would otherwise
+/// pin `scope` for the whole wrap; the slot lives as long as the isolate and is only used on
+/// its thread.
+pub(crate) fn template_cache(scope: &mut v8::PinScope<'_, '_>) -> Option<&'static InstanceTemplateCache> {
+    scope
+        .get_slot::<InstanceTemplateCache>()
+        .map(|c| unsafe { &*(c as *const InstanceTemplateCache) })
+}
+
+/// The per-object side store in internal field 1: a `v8::Map` of JS-assigned values and cached
+/// member functions. Instance wrappers create it on the first write, so wrappers that never
+/// store anything do not allocate a map.
+pub(crate) struct SideStore<'s> {
+    object: Local<'s, v8::Object>,
+    map: std::cell::Cell<Option<Local<'s, v8::Map>>>,
+}
+
+impl<'s> SideStore<'s> {
+    /// `None` when `object` has no side-store field.
+    #[inline]
+    pub(crate) fn of(scope: &v8::PinScope<'s, '_>, object: Local<'s, v8::Object>) -> Option<Self> {
+        let field = object.get_internal_field(scope, 1)?;
+        let map = Local::<v8::Value>::try_from(field)
+            .ok()
+            .and_then(|v| Local::<v8::Map>::try_from(v).ok());
+        Some(Self { object, map: std::cell::Cell::new(map) })
+    }
+
+    #[inline]
+    pub(crate) fn get(
+        &self,
+        scope: &v8::PinScope<'s, '_>,
+        key: Local<v8::Value>,
+    ) -> Option<Local<'s, v8::Value>> {
+        self.map.get()?.get(scope, key)
+    }
+
+    pub(crate) fn set(
+        &self,
+        scope: &v8::PinScope<'s, '_>,
+        key: Local<v8::Value>,
+        value: Local<v8::Value>,
+    ) -> Option<Local<'s, v8::Map>> {
+        let map = match self.map.get() {
+            Some(map) => map,
+            None => {
+                let map = v8::Map::new(scope);
+                self.object.set_internal_field(1, map.into());
+                self.map.set(Some(map));
+                map
+            }
+        };
+        map.set(scope, key, value)
     }
 }
 
@@ -102,7 +248,7 @@ pub(crate) fn this_instance(
 }
 
 /// The per-instance `DeclarationFFI` stored on a wrapper object. The pointee
-/// is leaked at instance creation, so it outlives the wrapper.
+/// lives at least as long as the wrapper.
 #[inline]
 pub(crate) fn this_declaration_ffi(
     scope: &mut v8::PinScope<'_, '_>,
@@ -118,6 +264,58 @@ pub(crate) fn this_declaration_ffi(
         return None;
     }
     Some(ptr)
+}
+
+/// The wrapper state of a member callback's receiver, when `this` is a WinRT
+/// wrapper that carries a COM instance. The pointee lives at least as long as
+/// the wrapper, so it outlives the callback that received `this`.
+#[inline]
+fn this_wrapper<'a>(
+    scope: &mut v8::PinScope<'_, '_>,
+    this: v8::Local<v8::Object>,
+) -> Option<&'a DeclarationFFI> {
+    let ptr = this_declaration_ffi(scope, this)?;
+    let ffi = unsafe { &*ptr };
+    ffi.instance.as_ref().map(|_| ffi)
+}
+
+/// Build the call for `method` on a member callback's receiver. A wrapper
+/// receiver borrows the interface pointer through the wrapper's QI cache, so
+/// repeated calls on one wrapper pay no QueryInterface and no refcount traffic;
+/// any other receiver falls back to the declaration's own instance with an
+/// owned query. `None` when there is no instance to call on at all.
+#[inline]
+pub(crate) fn receiver_method_call(
+    scope: &mut v8::PinScope<'_, '_>,
+    this: v8::Local<v8::Object>,
+    dec: &DeclarationFFI,
+    method: &MethodDeclaration,
+    is_sealed: bool,
+) -> Option<MethodCall> {
+    if let Some(ffi) = this_wrapper(scope, this) {
+        let instance = ffi.instance.as_ref()?;
+        return Some(MethodCall::new_cached(method, is_sealed, instance, &ffi.qi));
+    }
+    let instance = dec.instance.clone()?;
+    Some(MethodCall::new(method, is_sealed, instance, false))
+}
+
+/// Property twin of [`receiver_method_call`]. `None` when there is no instance
+/// or the instance does not implement the accessor's interface.
+#[inline]
+pub(crate) fn receiver_property_call(
+    scope: &mut v8::PinScope<'_, '_>,
+    this: v8::Local<v8::Object>,
+    dec: &DeclarationFFI,
+    property: &PropertyDeclaration,
+    is_setter: bool,
+) -> Option<PropertyCall> {
+    if let Some(ffi) = this_wrapper(scope, this) {
+        let instance = ffi.instance.as_ref()?;
+        return PropertyCall::new_cached(property, is_setter, instance, &ffi.qi);
+    }
+    let instance = dec.instance.clone()?;
+    PropertyCall::new(property, is_setter, instance, false)
 }
 
 pub(crate) fn handle_ns_func(
@@ -364,11 +562,9 @@ pub(crate) fn handle_named_property_getter(
     let dec = unsafe { &*dec };
     let lock = dec.read();
 
-    let store_field = match this.get_internal_field(scope, 1) {
-        Some(f) => f,
-        None => return v8::Intercepted::kNo,
+    let Some(store) = SideStore::of(scope, this) else {
+        return v8::Intercepted::kNo;
     };
-    let store = unsafe { store_field.cast::<v8::Map>() };
     let kind = lock.kind();
     if key.is_string() {
         if let Some(cache) = store.get(scope, key.into()) {
@@ -527,7 +723,7 @@ pub(crate) fn handle_named_property_getter(
                                             )
                                             .into(),
                                         ),
-                                        ReturnKind::Object { decl, type_name }
+                                        ReturnKind::Object { decl, type_name, .. }
                                         | ReturnKind::InterfaceObject { decl, type_name } => {
                                             if result.is_null() {
                                                 Some(v8::null(scope).into())
@@ -718,10 +914,9 @@ pub(crate) fn handle_named_property_setter(
     let lock = dec.read();
     let kind = lock.kind();
 
-    let Some(store_field) = this.get_internal_field(scope, 1) else {
+    let Some(store) = SideStore::of(scope, this) else {
         return v8::Intercepted::kNo;
     };
-    let store = unsafe { store_field.cast::<v8::Map>() };
 
     let name = key.to_rust_string_lossy(scope);
 
@@ -846,7 +1041,7 @@ fn instance_method_dispatch(
         ReturnKind::Struct(declaration) => {
             Some(crate::create_struct_object_from_raw(declaration.clone(), result, scope).into())
         }
-        ReturnKind::Object { decl, type_name }
+        ReturnKind::Object { decl, type_name, .. }
         | ReturnKind::InterfaceObject { decl, type_name } => {
             if result.is_null() {
                 Some(v8::null(scope).into())
@@ -1131,7 +1326,7 @@ pub(crate) fn handle_instance_property_getter(
             ReturnKind::Struct(declaration) => Some(
                 crate::create_struct_object_from_raw(declaration.clone(), result, scope).into(),
             ),
-            ReturnKind::Object { decl, type_name } => {
+            ReturnKind::Object { decl, type_name, .. } => {
                 if result.is_null() {
                     Some(v8::null(scope).into())
                 } else {
@@ -1416,11 +1611,9 @@ pub(crate) fn handle_instance_property_setter(
     // Default fallback: store the value on the instance backing map so
     // consumers can still attach arbitrary JS properties to WinRT objects.
     let this = args.holder();
-    let store_field = match this.get_internal_field(scope, 1) {
-        Some(f) => f,
-        None => return v8::Intercepted::kNo,
+    let Some(store) = SideStore::of(scope, this) else {
+        return v8::Intercepted::kNo;
     };
-    let store = unsafe { store_field.cast::<v8::Map>() };
     store.set(scope, key.into(), value);
     return v8::Intercepted::kYes;
 
@@ -1800,13 +1993,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
         .as_ref()
         .and_then(|unk| unk.cast::<IUnknown>().ok().map(|id| id.as_raw() as usize));
     if let Some(key) = identity_key {
-        let hit = crate::INSTANCE_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .get(&key)
-                .and_then(|weak| weak.to_local(scope))
-        });
-        if let Some(local) = hit {
+        if let Some(local) = crate::wrapper_cache::get(scope, key) {
             return local.into();
         }
     }
@@ -1831,17 +2018,12 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
     // Interface wrappers derive their members from `parent`, so its identity
     // must be part of the key. The "N|" prefix keeps these templates separate
     // from the parallel lib.rs builder's — the two interceptor sets differ.
-    let template_key: String = match &parent {
-        Some(p) => format!("N|{}|{}", name, p.read().full_name()),
-        None => format!("N|{}", name),
-    };
-    let cached_tmpl: Option<v8::Global<v8::FunctionTemplate>> = scope
-        .get_slot::<InstanceTemplateCache>()
-        .and_then(|c| c.0.borrow().get(template_key.as_str()).cloned());
-    if let Some(tmpl_global) = cached_tmpl {
-        let tmpl = v8::Local::new(scope, &tmpl_global);
+    let template_key = TemplateKey::new(1, &declaration, parent.as_ref());
+    let template_cache = template_cache(scope);
+    if let Some(tmpl) = template_cache.and_then(|c| c.get(scope, template_key)) {
         return finish_instance_object(tmpl, declaration, instance, identity_key, scope);
     }
+    let key_parent = parent.clone();
 
     let class_name = v8::String::new(scope, name).unwrap();
 
@@ -1849,6 +2031,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
     let object_tmpl = tmpl.instance_template(scope);
 
     object_tmpl.set_internal_field_count(2);
+    install_handle_accessor(scope, object_tmpl);
 
     let declaration_ffi = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(
         declaration.clone(),
@@ -1934,13 +2117,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                        let Some(__ns_inst) =
-                            this_instance(scope, args.this()).or_else(|| dec.instance.clone())
-                        else {
+                        let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
                             return;
                         };
-                        let mut method =
-                            MethodCall::new(method, method.is_sealed(), __ns_inst, false);
                         let (ret, result, _outs) = method.call(scope, &args);
 
                         if ret.is_err() {
@@ -1964,7 +2143,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     )
                                     .into(),
                                 ),
-                                ReturnKind::Object { decl, type_name }
+                                ReturnKind::Object { decl, type_name, .. }
                                 | ReturnKind::InterfaceObject { decl, type_name } => {
                                     if result.is_null() {
                                         Some(v8::null(scope).into())
@@ -2112,7 +2291,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                         )
                                         .into(),
                                     ),
-                                    ReturnKind::Object { decl, type_name }
+                                    ReturnKind::Object { decl, type_name, .. }
                                     | ReturnKind::InterfaceObject { decl, type_name } => {
                                         if result.is_null() {
                                             Some(v8::null(scope).into())
@@ -2277,8 +2456,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                                    let mut method = MethodCall::new(method, method.is_sealed(), __ns_inst, false);
+                                    let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
+                                        return;
+                                    };
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = crate::error::format_hresult_message(ret);
@@ -2328,8 +2508,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                                    let mut method = MethodCall::new(method.getter(), false, __ns_inst, false);
+                                    let Some(mut method) = receiver_method_call(scope, args.this(), dec, method.getter(), false) else {
+                                        return;
+                                    };
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = crate::error::format_hresult_message(ret);
@@ -2422,8 +2603,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                                    let mut method = MethodCall::new(method, method.is_sealed(), __ns_inst, false);
+                                    let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
+                                        return;
+                                    };
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = crate::error::format_hresult_message(ret);
@@ -2473,8 +2655,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                                    let Some(mut method) = PropertyCall::new(method, false, __ns_inst, false) else {
+                                    let Some(mut method) = receiver_property_call(scope, args.this(), dec, method, false) else {
                                         return;
                                     };
                                     let (ret, result, _outs) = method.call(scope, &args);
@@ -2563,8 +2744,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                                    let mut method = MethodCall::new(method, method.is_sealed(), __ns_inst, false);
+                                    let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
+                                        return;
+                                    };
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = crate::error::format_hresult_message(ret);
@@ -2615,13 +2797,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let dec = unsafe { &*dec };
                             let lock = dec.read();
                             let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                            let Some(__ns_inst) =
-                                this_instance(scope, args.this()).or_else(|| dec.instance.clone())
-                            else {
+                            let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
                                 return;
                             };
-                            let mut method =
-                                MethodCall::new(method, method.is_sealed(), __ns_inst, false);
                             let (ret, result, _outs) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = crate::error::format_hresult_message(ret);
@@ -2677,14 +2855,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let lock = dec.read();
                             let method =
                                 lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                            let Some(__ns_inst) =
-                                this_instance(scope, args.this()).or_else(|| dec.instance.clone())
-                            else {
-                                return;
-                            };
-                            let Some(mut method) =
-                                PropertyCall::new(method, false, __ns_inst, false)
-                            else {
+                            let Some(mut method) = receiver_property_call(scope, args.this(), dec, method, false) else {
                                 return;
                             };
                             let (ret, result, _outs) = method.call(scope, &args);
@@ -2729,13 +2900,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                         .downcast_ref::<PropertyDeclaration>()
                                         .unwrap();
                                     let setter = prop.setter().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this())
-                                        .or_else(|| dec.instance.clone())
-                                    else {
+                                    let Some(mut method) = receiver_method_call(scope, args.this(), dec, setter, false) else {
                                         return;
                                     };
-                                    let mut method =
-                                        MethodCall::new(setter, false, __ns_inst, false);
                                     let (ret, _, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = crate::error::format_hresult_message(ret);
@@ -2928,11 +3095,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
         }
     }
 
-    {
+    if let Some(cache) = template_cache {
         let g = v8::Global::new(scope, tmpl);
-        if let Some(cache) = scope.get_slot::<InstanceTemplateCache>() {
-            cache.0.borrow_mut().insert(template_key, g);
-        }
+        cache.insert(template_key, g, Arc::clone(&declaration), key_parent);
     }
 
     finish_instance_object(tmpl, declaration, instance, identity_key, scope)
@@ -2959,50 +3124,17 @@ pub(crate) fn finish_instance_object<'a>(
         }
     };
 
-    let declaration_ffi = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(
-        declaration,
-        instance.clone(),
-    )));
+    let declaration_ffi = DeclarationFFI::new_with_instance(declaration, instance);
+    // Internal field 0 owns the `DeclarationFFI` (and through it an AddRef'd IUnknown). Cached
+    // wrappers keep it in their cache slot, which is freed once V8 collects the wrapper.
+    let declaration_ffi = match identity_key {
+        Some(key) => crate::wrapper_cache::insert(scope, object, declaration_ffi, key),
+        None => Box::into_raw(Box::new(declaration_ffi)),
+    };
     let ext = v8::External::new(scope, declaration_ffi as _);
     object.set_internal_field(0, ext.into());
-    let object_store = v8::Map::new(scope);
-    object.set_internal_field(1, object_store.into());
-
-    if let Some(handle_key) = v8::String::new(scope, "handle") {
-        let handle_value: Local<v8::Value> = if let Some(instance) = instance.as_ref() {
-            v8::External::new(scope, instance.as_raw() as *mut c_void).into()
-        } else {
-            v8::null(scope).into()
-        };
-        // Define, don't Set: a Set on an object with named interceptors runs the WinRT setter
-        // interceptor (a metadata lookup for a property called `handle`) and the prototype-chain
-        // setter walk: a measurable share of every instance wrap.
-        object.create_data_property(scope, handle_key.into(), handle_value);
-    }
-
-    if let Some(key) = identity_key {
-        // Internal field 0 owns `declaration_ffi` (and through it an AddRef'd IUnknown); only
-        // callbacks on this object read it, so it dies with the wrapper. Without this every
-        // wrapped WinRT object was leaked (never Released) for the life of the process.
-        let ffi_addr = declaration_ffi as usize;
-        let weak = v8::Weak::with_guaranteed_finalizer(
-            scope.as_mut(),
-            object,
-            Box::new(move || {
-                crate::INSTANCE_CACHE.with(|cache| {
-                    cache.borrow_mut().remove(&key);
-                });
-                let ffi = unsafe { Box::from_raw(ffi_addr as *mut DeclarationFFI) };
-                crate::global_fns::drop_unless_com_teardown(ffi);
-            }),
-        );
-        let new_size = crate::INSTANCE_CACHE.with(|cache| {
-            let mut c = cache.borrow_mut();
-            c.insert(key, weak);
-            c.len()
-        });
-        crate::maybe_request_gc_nudge(new_size, scope.as_mut());
-    }
+    // Internal field 1 (the side store) stays undefined until `SideStore::set` needs it, and
+    // `handle` comes from the template accessor (`install_handle_accessor`).
 
     object.into()
 }

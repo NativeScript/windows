@@ -28,8 +28,10 @@ use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -162,6 +164,10 @@ struct MethodStaticInfo {
     /// Per-parameter marshaling plan, aligned with `parse_parameter_types`. Only consulted
     /// for in-params whose parse type is `Pointer`; every other slot is `Plain`.
     param_plans: Vec<PointerPlan>,
+    /// Return-slot classification, resolved once: scalar and string returns are written into
+    /// the call's stable return buffer instead of the pointer slot.
+    is_scalar_return: bool,
+    is_string_return: bool,
 }
 
 impl MethodStaticInfo {
@@ -182,8 +188,31 @@ impl MethodStaticInfo {
             return_kind: ReturnKind::Void,
             param_sigs: Vec::new(),
             param_plans: Vec::new(),
+            is_scalar_return: false,
+            is_string_return: false,
         })
     }
+}
+
+/// Return types marshaled through the call's stable scalar buffer rather than the pointer slot.
+pub(crate) fn is_scalar_return_type(return_type: &str) -> bool {
+    matches!(
+        return_type,
+        "UInt8"
+            | "Int8"
+            | "UInt16"
+            | "Int16"
+            | "UInt32"
+            | "Int32"
+            | "UInt64"
+            | "Int64"
+            | "USize"
+            | "ISize"
+            | "Single"
+            | "Double"
+            | "Boolean"
+            | "Char16"
+    )
 }
 
 thread_local! {
@@ -198,18 +227,223 @@ pub struct MethodCall {
     si: Rc<MethodStaticInfo>,
     is_initializer: bool,
     is_sealed: bool,
-    interface: IUnknown,
+    /// The interface the call goes through, already QI'd to `si.iid`. Owned (released on drop)
+    /// when this call object did the QueryInterface itself; borrowed from a [`QiCache`] or a
+    /// [`PreparedCall`] otherwise, whose owner outlives the call.
+    interface: ManuallyDrop<IUnknown>,
+    owns_interface: bool,
     func: *mut c_void,
     /// Scratch buffer used when a WinRT method returns a value type (e.g. GUID, Rect)
     /// that is larger than, or cannot be safely aliased through, a single pointer slot.
     return_value_buf: [u8; 128],
-    /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
-    argument_buf: Vec<NativeValue>,
-    /// Per-call parse-type tracker reused to avoid per-call heap allocation.
-    argument_parse_types: Vec<Option<NativeType>>,
+    /// Argument slots for the call; inline storage covers the common arities, so building a
+    /// call does not allocate.
+    argument_buf: SmallVec<[NativeValue; 8]>,
+    /// Parse type per argument slot, aligned with `argument_buf`.
+    argument_parse_types: SmallVec<[Option<NativeType>; 8]>,
     /// Set when construction failed (e.g. QueryInterface returned E_NOINTERFACE for the IID).
     /// call() returns E_FAIL immediately instead of panicking.
     init_error: Option<String>,
+}
+
+impl MethodCall {
+    /// Drop the previous call's argument state, releasing the HSTRINGs built for `String`
+    /// in-parameters first (the union slots would otherwise leak them).
+    fn reset_args(&mut self) {
+        unsafe { crate::ffi::release_string_args(&mut self.argument_buf, &self.argument_parse_types) };
+        self.argument_buf.clear();
+        self.argument_parse_types.clear();
+    }
+}
+
+impl Drop for MethodCall {
+    fn drop(&mut self) {
+        self.reset_args();
+        if self.owns_interface {
+            unsafe { ManuallyDrop::drop(&mut self.interface) };
+        }
+    }
+}
+
+/// Per-wrapper cache of QueryInterface results: the interface pointers that calls through one
+/// JS wrapper have already resolved on its instance, keyed by IID. Repeated calls on the wrapper
+/// reuse the pointer instead of paying a cross-DLL QueryInterface plus refcount churn per call.
+/// The cache lives next to the wrapper's own instance reference (`DeclarationFFI` on classic,
+/// `HostHandle` on napi), so a pointer borrowed from it stays valid as long as the wrapper does.
+pub(crate) struct QiCache(RefCell<SmallVec<[QiEntry; 4]>>);
+
+/// One cached QueryInterface result. `owned` holds the reference the query returned, except
+/// when the result is the very pointer the wrapper already holds (the common default-interface
+/// case): that reference is released at once, since the wrapper's own keeps the pointer alive.
+struct QiEntry {
+    iid: GUID,
+    ptr: *mut c_void,
+    #[allow(dead_code)]
+    owned: Option<IUnknown>,
+}
+
+impl QiCache {
+    pub(crate) fn new() -> Self {
+        Self(RefCell::new(SmallVec::new()))
+    }
+
+    /// Interface pointer for `iid` on `instance`, borrowed from the cache; queried and cached on
+    /// a miss. `None` when the object does not implement `iid`.
+    pub(crate) fn interface(&self, instance: &IUnknown, iid: &GUID) -> Option<*mut c_void> {
+        if let Some(e) = self.0.borrow().iter().find(|e| e.iid == *iid) {
+            return Some(e.ptr);
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            (instance.vtable().QueryInterface)(
+                instance.as_raw(),
+                iid,
+                &mut ptr as *mut _ as *mut *mut c_void,
+            )
+        };
+        if hr.is_err() || ptr.is_null() {
+            return None;
+        }
+        let queried = unsafe { IUnknown::from_raw(ptr) };
+        let owned = if ptr == instance.as_raw() {
+            drop(queried);
+            None
+        } else {
+            Some(queried)
+        };
+        self.0.borrow_mut().push(QiEntry {
+            iid: *iid,
+            ptr,
+            owned,
+        });
+        Some(ptr)
+    }
+}
+
+impl Clone for QiCache {
+    /// A cloned wrapper state starts with an empty cache; entries are re-resolved on demand.
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+/// A method resolved once on a fixed target: the target's interface pointer already QI'd to the
+/// method's interface plus its vtable slot. Activation factories are process-lifetime singletons
+/// with a fixed vtable, so a static-method or constructor call site can keep one of these and
+/// build every call from it without re-resolving the factory or querying it again.
+#[derive(Clone)]
+pub(crate) struct PreparedCall {
+    si: Rc<MethodStaticInfo>,
+    interface: IUnknown,
+    func: *mut c_void,
+    is_sealed: bool,
+    is_initializer: bool,
+}
+
+impl MethodCall {
+    /// Static info for a method already seen on this thread, if any.
+    fn cached_static_info(
+        method: &MethodDeclaration,
+        is_sealed: bool,
+    ) -> Option<Rc<MethodStaticInfo>> {
+        let scope_key = windows::core::Interface::as_raw(method.metadata()?) as usize;
+        let cache_key = (scope_key, ((method.token().0 as u64) << 1) | (is_sealed as u64));
+        METHOD_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+    }
+
+    /// A call over an interface pointer that some longer-lived owner holds: no QueryInterface
+    /// and no refcount traffic. The vtable slot is still read per call object, because methods
+    /// declared on interfaces share a metadata token across implementing classes.
+    fn from_borrowed(
+        si: Rc<MethodStaticInfo>,
+        is_sealed: bool,
+        is_initializer: bool,
+        interface_ptr: *mut c_void,
+    ) -> Self {
+        let vtable = unsafe { *(interface_ptr as *const *const *mut c_void) };
+        let func = unsafe { *vtable.add(si.index) };
+        Self {
+            si,
+            is_initializer,
+            is_sealed,
+            interface: ManuallyDrop::new(unsafe { IUnknown::from_raw(interface_ptr) }),
+            owns_interface: false,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
+            init_error: None,
+        }
+    }
+
+    /// Build a call on `instance` through the wrapper's `qi` cache, so repeated calls on one
+    /// wrapper skip the per-call QueryInterface. The first call of a method on the thread still
+    /// goes through [`MethodCall::new`] to build its static info.
+    pub(crate) fn new_cached(
+        method: &MethodDeclaration,
+        is_sealed: bool,
+        instance: &IUnknown,
+        qi: &QiCache,
+    ) -> Self {
+        let Some(si) = Self::cached_static_info(method, is_sealed) else {
+            return Self::new(method, is_sealed, instance.clone(), false);
+        };
+        match qi.interface(instance, &si.iid) {
+            Some(ptr) => Self::from_borrowed(si, is_sealed, false, ptr),
+            None => {
+                let iid = si.iid;
+                Self::new_init_error(
+                    instance.clone(),
+                    false,
+                    is_sealed,
+                    iid,
+                    format!("QueryInterface failed (cached) for IID {:?}", iid),
+                )
+            }
+        }
+    }
+
+    /// Resolve `method` on `target` once for reuse through [`MethodCall::from_prepared`].
+    /// `None` when the target does not implement the method's interface.
+    pub(crate) fn prepare(
+        method: &MethodDeclaration,
+        is_sealed: bool,
+        target: IUnknown,
+        is_initializer: bool,
+    ) -> Option<PreparedCall> {
+        let mut call = Self::new(method, is_sealed, target, is_initializer);
+        if call.init_error.is_some() {
+            return None;
+        }
+        // Move the interface out; the call object must not release it on drop.
+        call.owns_interface = false;
+        let interface = unsafe { ManuallyDrop::take(&mut call.interface) };
+        Some(PreparedCall {
+            si: Rc::clone(&call.si),
+            interface,
+            func: call.func,
+            is_sealed: call.is_sealed,
+            is_initializer: call.is_initializer,
+        })
+    }
+
+    /// A call built from a [`PreparedCall`]: borrows its interface pointer and vtable slot.
+    pub(crate) fn from_prepared(prepared: &PreparedCall) -> Self {
+        Self {
+            si: Rc::clone(&prepared.si),
+            is_initializer: prepared.is_initializer,
+            is_sealed: prepared.is_sealed,
+            interface: ManuallyDrop::new(unsafe {
+                IUnknown::from_raw(prepared.interface.as_raw())
+            }),
+            owns_interface: false,
+            func: prepared.func,
+            return_value_buf: [0u8; 128],
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
+            init_error: None,
+        }
+    }
 }
 
 #[inline]
@@ -229,11 +463,12 @@ impl MethodCall {
             si: MethodStaticInfo::error_stub(),
             is_initializer,
             is_sealed,
-            interface,
+            interface: ManuallyDrop::new(interface),
+            owns_interface: true,
             func: std::ptr::null_mut(),
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::new(),
-            argument_parse_types: Vec::new(),
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
             init_error: Some(error_msg),
         }
     }
@@ -246,7 +481,6 @@ impl MethodCall {
         self.si.return_type.as_str()
     }
 
-    #[cfg(feature = "classic")]
     pub(crate) fn return_kind(&self) -> &ReturnKind {
         &self.si.return_kind
     }
@@ -311,16 +545,16 @@ impl MethodCall {
             let vtable_ptr: *mut *mut c_void =
                 unsafe { std::mem::transmute(queried_interface.vtable()) };
             let func = unsafe { *vtable_ptr.add(si.index) };
-            let number_of_abi_parameters = si.parameter_types.len();
             return Self {
                 si,
                 is_initializer,
                 is_sealed,
-                interface: queried_interface,
+                interface: ManuallyDrop::new(queried_interface),
+                owns_interface: true,
                 func,
                 return_value_buf: [0u8; 128],
-                argument_buf: Vec::with_capacity(number_of_abi_parameters + 3),
-                argument_parse_types: Vec::with_capacity(number_of_abi_parameters + 3),
+                argument_buf: SmallVec::new(),
+                argument_parse_types: SmallVec::new(),
                 init_error: None,
             };
         }
@@ -518,8 +752,6 @@ impl MethodCall {
             }
         }
 
-        let number_of_abi_parameters = parameter_types.len();
-
         let params = match parameter_types
             .iter()
             .cloned()
@@ -572,6 +804,8 @@ impl MethodCall {
 
         let parameters = method.parameters().to_vec();
         let return_kind = crate::classify_return(&return_type, is_void);
+        let is_scalar_return = is_scalar_return_type(&return_type);
+        let is_string_return = return_type == "String";
 
         // Resolve each Pointer in-param's marshaling plan once; out/ByRef params and
         // non-pointer types never consult their slot.
@@ -606,6 +840,8 @@ impl MethodCall {
             return_kind,
             param_sigs,
             param_plans,
+            is_scalar_return,
+            is_string_return,
         });
         METHOD_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -614,11 +850,12 @@ impl MethodCall {
             si: static_info,
             is_initializer,
             is_sealed,
-            interface: queried_interface,
+            interface: ManuallyDrop::new(queried_interface),
+            owns_interface: true,
             func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters + 3),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters + 3),
+            argument_buf: SmallVec::new(),
+            argument_parse_types: SmallVec::new(),
             init_error: None,
         }
     }
@@ -646,31 +883,13 @@ impl MethodCall {
             ReturnKind::Struct(_) | ReturnKind::Guid
         );
 
-        let is_scalar_return = matches!(
-            self.si.return_type.as_str(),
-            "UInt8"
-                | "Int8"
-                | "UInt16"
-                | "Int16"
-                | "UInt32"
-                | "Int32"
-                | "UInt64"
-                | "Int64"
-                | "USize"
-                | "ISize"
-                | "Single"
-                | "Double"
-                | "Boolean"
-                | "Char16"
-        );
-
+        let is_scalar_return = self.si.is_scalar_return;
         // HSTRING out-params must also land in a stable buffer so the returned
         // pointer remains valid after this call frame is unwound.
-        let is_string_return = self.si.return_type.as_str() == "String";
+        let is_string_return = self.si.is_string_return;
 
-        self.argument_buf.clear();
-        self.argument_parse_types.clear();
-        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
+        self.reset_args();
+        let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // Track out-parameter slots: (argument_buf index, parse_native_type, param_index, wrapper)
         // param_index references self.param_sigs to avoid a String allocation per out-param per call.
@@ -1162,7 +1381,7 @@ impl MethodCall {
         }
 
         let is_void = self.si.is_void;
-        self.argument_buf.clear();
+        self.reset_args();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1216,7 +1435,7 @@ impl MethodCall {
             return call_failure();
         }
 
-        self.argument_buf.clear();
+        self.reset_args();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1305,28 +1524,11 @@ impl MethodCall {
             self.si.return_kind,
             ReturnKind::Struct(_) | ReturnKind::Guid
         );
-        let is_scalar_return = matches!(
-            self.si.return_type.as_str(),
-            "UInt8"
-                | "Int8"
-                | "UInt16"
-                | "Int16"
-                | "UInt32"
-                | "Int32"
-                | "UInt64"
-                | "Int64"
-                | "USize"
-                | "ISize"
-                | "Single"
-                | "Double"
-                | "Boolean"
-                | "Char16"
-        );
-        let is_string_return = self.si.return_type.as_str() == "String";
+        let is_scalar_return = self.si.is_scalar_return;
+        let is_string_return = self.si.is_string_return;
 
-        self.argument_buf.clear();
-        self.argument_parse_types.clear();
-        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
+        self.reset_args();
+        let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // (argument_buf index, parse_native_type, param_index, out-wrapper object)
         let mut out_slots: Vec<(usize, NativeType, usize, Option<napi::JsObject>)> = Vec::new();
@@ -1714,7 +1916,12 @@ impl MethodCall {
                             match crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(
                                 env, inner,
                             ) {
-                                Some(p) => crate::napi_engine::value::as_unknown(env, p),
+                                Some(p) => {
+                                    // The wrapper holds its own reference; drop the +1 the
+                                    // callee wrote into the out slot.
+                                    IUnknown::from_raw(inner);
+                                    crate::napi_engine::value::as_unknown(env, p)
+                                }
                                 None => match nv::read_return_value(
                                     env,
                                     inner,

@@ -436,7 +436,10 @@ impl GenericMethodCall {
             &argument_parse_types,
         ) {
             Ok(value) => value,
-            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+            Err(_) => {
+                unsafe { crate::ffi::release_string_args(&mut arguments, &argument_parse_types) };
+                return (call_failure(), std::ptr::null_mut(), Vec::new());
+            }
         };
 
         let call_args = crate::ffi::build_call_args(&prep, &arguments, &self.parameter_types);
@@ -444,6 +447,12 @@ impl GenericMethodCall {
         let ret_i32_res = catch_unwind(AssertUnwindSafe(|| unsafe {
             self.cif.call(CodePtr::from_ptr(self.func), &call_args)
         }));
+
+        // The libffi borrow of the slots ends here; release the HSTRINGs built for String
+        // parameters (the union would otherwise leak them). Out-slots are untouched.
+        drop(call_args);
+        drop(prep);
+        unsafe { crate::ffi::release_string_args(&mut arguments, &argument_parse_types) };
 
         let ret = match ret_i32_res {
             Ok(code) => code,
