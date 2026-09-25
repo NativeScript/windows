@@ -204,11 +204,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $buildArgs = @()
+          # A hashtable splat binds by parameter name. (An array splat would pass its elements
+          # positionally, so '-Engine' itself would land in build.ps1's -Engine parameter.)
+          $buildArgs = @{}
           if ($env:ENGINE -ne 'classic') {
-            $buildArgs += @('-Engine', $env:ENGINE)
+            $buildArgs.Engine = $env:ENGINE
           } elseif ($env:SKIP_ARM64 -eq 'true') {
-            $buildArgs += '-SkipArm64'
+            $buildArgs.SkipArm64 = $true
           }
           # build.ps1 reports through Write-Host, so the log has to be teed off the information
           # stream (`*>&1`) rather than stdout for the log checks below to see anything.
