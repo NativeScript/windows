@@ -1,30 +1,36 @@
 name: npm release
 
-# Publishes the four engine variants — @nativescript/windows-{hermes,jsc,quickjs,v8} — to npm via
-# OIDC trusted publishing. npm matches a trusted publisher on repository + workflow FILENAME +
-# environment, so `npm_release.yml` and the `npm-publish` environment below are part of the
-# credential: renaming either breaks publishing for all four packages.
+# Publishes the classic runtime — @nativescript/windows — and the four engine variants —
+# @nativescript/windows-{hermes,jsc,quickjs,v8} — to npm via OIDC trusted publishing. npm matches
+# a trusted publisher on repository + workflow FILENAME + environment, so `npm_release.yml` and the
+# `npm-publish` environment below are part of the credential: renaming either breaks publishing for
+# all five packages, and every package needs its own trusted-publisher entry on npmjs.com.
 #
 # NOTE: `paths` filters deliberately do NOT accompany the tag trigger — a tag push can have an
 # empty changed-file set, and paths+tags together silently skip the run.
 on:
   push:
     tags:
-      - "v*" # -> all four variants at the tag's version
+      - "v*" # -> all five packages at the tag's version
   workflow_dispatch:
     inputs:
       engine:
-        description: "Which variant to release"
+        description: "Which package to release"
         type: choice
         required: true
         default: all
-        options: [all, hermes, jsc, quickjs, v8]
+        options: [all, classic, hermes, jsc, quickjs, v8]
       version:
         description: "Release version to cut, e.g. 0.1.0-alpha.2 (dist-tag follows the prerelease id; a plain version publishes 'latest'). Leave empty for a rolling 'next' build."
         required: false
         default: ""
       rebuild_framework:
-        description: "Rebuild the shared framework (tools + dotnet-bridge) from source instead of shipping the copies committed under template/framework."
+        description: "Engine variants: rebuild the shared framework (tools + dotnet-bridge) from source instead of shipping the copies committed under template/framework. (The classic build always rebuilds it.)"
+        type: boolean
+        required: false
+        default: false
+      skip_arm64:
+        description: "Classic only: build x64-only, skipping the arm64 cross-compiles (the engine variants are x64-only regardless)."
         type: boolean
         required: false
         default: false
@@ -33,16 +39,21 @@ on:
 permissions:
   contents: read
 
-# A variant is the same framework as @nativescript/windows — the WinUI 3 app template,
-# dotnet-bridge and tools — with the engine's runtime DLL staged as framework/libs/x64/
-# nativescript.dll. `template/build.ps1 -Engine <engine>` copies that shared scaffolding out of
-# template/framework and builds the engine cdylib into it, so a release is:
+# Every package is the same framework — the WinUI 3 app template, dotnet-bridge and tools — with a
+# runtime DLL staged as framework/libs/<arch>/nativescript.dll:
 #
-#   setup (resolve version + engine matrix) -> build (one Windows job per engine, npm pack)
-#   -> publish (npm, OIDC)
+#   classic  `template/build.ps1` builds the workspace `nativescript` cdylib (rusty_v8) for x64 and
+#            arm64, release and devtools, rebuilds the tools (dotnet-tool, nsbundle_pack, sbg,
+#            typings-generator, ManifestMerger, dotnet-typings-gen) and stages it all under
+#            template/framework. Published from template/ as @nativescript/windows.
+#   variant  `template/build.ps1 -Engine <engine>` copies the shared scaffolding out of
+#            template/framework and builds the engine cdylib into packages/windows-<engine>/framework
+#            as framework/libs/x64/nativescript.dll (x64 only, no devtools).
 #
-# Everything the shared framework needs is committed under template/framework, so the default build
-# only compiles the engine. `rebuild_framework` regenerates that scaffolding from source instead.
+# A release is: setup (resolve version + package matrix) -> build (one Windows job per package,
+# npm pack) -> publish (npm, OIDC). Everything the variants need is committed under
+# template/framework, so a variant build only compiles the engine; `rebuild_framework` regenerates
+# that scaffolding from source instead.
 jobs:
   setup:
     name: Resolve version
@@ -66,13 +77,17 @@ jobs:
           # a cache-poisoning vector, worst in the jobs that publish. Disabled on every setup-node
           # step in this workflow (also keeps pre-v6 behavior).
           package-manager-cache: false
-      - name: Compute version, dist-tag and engine matrix
+      - name: Compute version, dist-tag and package matrix
         id: out
         env:
           # env indirection keeps the dispatch inputs out of shell interpolation
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_ENGINE: ${{ inputs.engine || 'all' }}
-        run: node ./scripts/resolve-release.mjs --version "$INPUT_VERSION" --engine "$INPUT_ENGINE"
+          INPUT_SKIP_ARM64: ${{ inputs.skip_arm64 && 'true' || 'false' }}
+        run: |
+          args=(--version "$INPUT_VERSION" --engine "$INPUT_ENGINE")
+          if [ "$INPUT_SKIP_ARM64" = "true" ]; then args+=(--skip-arm64); fi
+          node ./scripts/resolve-release.mjs "${args[@]}"
 
   build:
     name: Build ${{ matrix.engine }}
@@ -80,11 +95,14 @@ jobs:
     needs: setup
     strategy:
       fail-fast: false
-      # { include: [{ engine: hermes }, ...] } — the engines selected in `setup`.
+      # { include: [{ engine, dir, npm_name, tarball, rust_targets, rust_workspaces }, ...] } — the
+      # packages selected in `setup` (see scripts/resolve-release.mjs).
       matrix: ${{ fromJSON(needs.setup.outputs.build_matrix) }}
     env:
       NPM_VERSION: ${{ needs.setup.outputs.npm_version }}
       ENGINE: ${{ matrix.engine }}
+      PACKAGE_DIR: ${{ matrix.dir }}
+      SKIP_ARM64: ${{ inputs.skip_arm64 && 'true' || 'false' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -100,29 +118,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
+          # classic cross-compiles the arm64 runtime and tools; the variants build for the host.
+          targets: ${{ matrix.rust_targets }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # The engine packages are excluded from the root workspace (their C builds / prebuilt
           # engine links must not run on a plain `cargo build`), so each has its own target dir.
-          workspaces: |
-            . -> target
-            packages/windows-${{ matrix.engine }} -> target
+          workspaces: ${{ matrix.rust_workspaces }}
           key: ${{ matrix.engine }}
-      # rusty_v8's build script downloads its prebuilt static lib to <target>/release/gn_out, which
+      # rusty_v8's build script downloads its prebuilt static lib to <profile dir>/gn_out, which
       # rust-cache prunes (it keeps only build/, deps/ and .fingerprint/) while keeping the build
       # script's recorded output. When a lockfile change then recompiles the v8 crate, the script
       # counts as fresh, nothing downloads the lib again, and the link fails with "could not find
-      # native static library `rusty_v8`". Drop the v8 build state so the script runs again.
+      # native static library `rusty_v8`". Drop the v8 build state so the script runs again. The
+      # profile dir is target/release for a host build and target/<triple>/<profile> for the
+      # classic cross builds, so every v8 build dir under the target roots is checked.
       - name: Re-fetch rusty_v8's static lib when the cache pruned it
         shell: pwsh
         run: |
-          foreach ($target in @('target', "packages/windows-$env:ENGINE/target")) {
-            $release = Join-Path $target 'release'
-            if ((Test-Path $release) -and -not (Test-Path (Join-Path $release 'gn_out/obj/rusty_v8.lib'))) {
-              Write-Host "rusty_v8.lib missing under $release; resetting the v8 build script."
-              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
-                (Join-Path $release 'build/v8-*'), (Join-Path $release '.fingerprint/v8-*')
-            }
+          foreach ($root in @('target', (Join-Path $env:PACKAGE_DIR 'target'))) {
+            if (-not (Test-Path $root)) { continue }
+            Get-ChildItem -Path $root -Recurse -Directory -Filter 'v8-*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Parent.Name -eq 'build' } |
+              ForEach-Object {
+                $profileDir = $_.Parent.Parent.FullName
+                if (-not (Test-Path (Join-Path $profileDir 'gn_out/obj/rusty_v8.lib'))) {
+                  Write-Host "rusty_v8.lib missing under $profileDir; resetting the v8 build script."
+                  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+                    (Join-Path $profileDir 'build/v8-*'), (Join-Path $profileDir '.fingerprint/v8-*')
+                }
+              }
           }
       # quickjs' napi shim uses clang/GCC C extensions that MSVC `cl` rejects; build.rs compiles it
       # with clang-cl from this exact path and silently falls back to `cl` (which then fails deep in
@@ -141,14 +166,16 @@ jobs:
             throw "clang-cl is required to compile the quickjs napi shim and is not at $clangCl."
           }
           & $clangCl --version
-      - name: Setup .NET (framework rebuild)
-        if: ${{ inputs.rebuild_framework }}
+      # The classic build publishes ManifestMerger and dotnet-typings-gen with `dotnet publish`
+      # every time; a variant only needs the SDK when it regenerates the shared framework.
+      - name: Setup .NET
+        if: ${{ matrix.engine == 'classic' || inputs.rebuild_framework }}
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           # dotnet-typings-gen targets net10.0; ManifestMerger is netstandard2.0 and builds on it.
           dotnet-version: "10.x"
       - name: Rebuild shared framework
-        if: ${{ inputs.rebuild_framework }}
+        if: ${{ matrix.engine != 'classic' && inputs.rebuild_framework }}
         shell: pwsh
         # -SkipRelease -SkipDevtools: the classic V8 nativescript.dll is not staged into a variant
         # (the engine cdylib takes its place), so building it here would be thrown away.
@@ -156,38 +183,81 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           ./template/build.ps1 -SkipArm64 -SkipRelease -SkipDevtools
+      # The runtime DLLs and tool binaries are committed under template/framework so the variants
+      # can stage them without a classic build. A classic release must ship what THIS run built,
+      # so clear them first: with the committed copies gone, the checks after the build can only
+      # pass on fresh output, never on a stale binary a failed step left in place.
+      - name: Clear committed runtime DLLs and tools (classic)
+        if: ${{ matrix.engine == 'classic' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($dir in @('template/framework/libs/x64', 'template/framework/libs/arm64',
+                             'template/framework/libs/devtools', 'template/framework/tools')) {
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          }
       - name: Set package version
         shell: pwsh
-        working-directory: packages/windows-${{ matrix.engine }}
+        working-directory: ${{ matrix.dir }}
         run: npm version $env:NPM_VERSION --no-git-tag-version --allow-same-version
       - name: Build ${{ matrix.engine }} framework
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # build.ps1 reports through Write-Host, so the log has to be teed off the information
-          # stream (`*>&1`) rather than stdout for the WARN check below to see anything.
-          $logPath = Join-Path $env:RUNNER_TEMP "build-$env:ENGINE.log"
-          ./template/build.ps1 -Engine $env:ENGINE *>&1 | Tee-Object -FilePath $logPath
-          # A missing engine runtime DLL (hermes.dll, JavaScriptCore.dll, …) beside the cdylib is
-          # only a warning there, but it ships a framework that fails to load at app start.
-          if (Select-String -Path $logPath -Pattern 'expected engine DLL not found' -Quiet) {
-            throw "An engine runtime DLL was not staged — see the WARN above."
+          $buildArgs = @()
+          if ($env:ENGINE -ne 'classic') {
+            $buildArgs += @('-Engine', $env:ENGINE)
+          } elseif ($env:SKIP_ARM64 -eq 'true') {
+            $buildArgs += '-SkipArm64'
           }
-          $dll = "packages/windows-$env:ENGINE/framework/libs/x64/nativescript.dll"
-          if (-not (Test-Path $dll)) { throw "Runtime DLL missing: $dll" }
+          # build.ps1 reports through Write-Host, so the log has to be teed off the information
+          # stream (`*>&1`) rather than stdout for the log checks below to see anything.
+          $logPath = Join-Path $env:RUNNER_TEMP "build-$env:ENGINE.log"
+          ./template/build.ps1 @buildArgs *>&1 | Tee-Object -FilePath $logPath
+
+          $libs = Join-Path $env:PACKAGE_DIR 'framework/libs'
+          $tools = Join-Path $env:PACKAGE_DIR 'framework/tools'
+          if ($env:ENGINE -eq 'classic') {
+            # The tool builds only warn on failure and skip the copy; treat that as fatal here.
+            $failure = 'failed for target|Expected build output not found|Skipping copy|dotnet publish for .* failed'
+            if (Select-String -Path $logPath -Pattern $failure -Quiet) {
+              throw "A tool build failed — see the log above."
+            }
+            $archs = @('x64')
+            if ($env:SKIP_ARM64 -ne 'true') { $archs += 'arm64' }
+            $expected = @('ManifestMerger/ManifestMerger.dll', 'dotnet-typings-gen/dotnet-typings-gen.dll') |
+              ForEach-Object { Join-Path $tools $_ }
+            foreach ($arch in $archs) {
+              $expected += (Join-Path $libs "$arch/nativescript.dll")
+              $expected += (Join-Path $libs "devtools/$arch/nativescript.dll")
+              foreach ($tool in @('dotnet-tool', 'nsbundle_pack', 'sbg', 'typings-generator')) {
+                $expected += (Join-Path $tools "$tool-$arch.exe")
+              }
+            }
+          } else {
+            # A missing engine runtime DLL (hermes.dll, JavaScriptCore.dll, …) beside the cdylib is
+            # only a warning there, but it ships a framework that fails to load at app start.
+            if (Select-String -Path $logPath -Pattern 'expected engine DLL not found' -Quiet) {
+              throw "An engine runtime DLL was not staged — see the WARN above."
+            }
+            $expected = @(Join-Path $libs 'x64/nativescript.dll')
+          }
+          $missing = $expected | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "Build output missing: $($missing -join ', ')" }
       - name: Pack
         shell: pwsh
-        working-directory: packages/windows-${{ matrix.engine }}
+        working-directory: ${{ matrix.dir }}
         run: |
           $ErrorActionPreference = 'Stop'
           # --pack-destination does not create the directory.
-          New-Item -ItemType Directory -Force -Path ../../dist | Out-Null
-          npm pack --pack-destination ../../dist
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          npm pack --pack-destination $dist
       - name: Upload npm package artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: npm-package-${{ matrix.engine }}
-          path: dist/nativescript-windows-${{ matrix.engine }}-${{ needs.setup.outputs.npm_version }}.tgz
+          path: dist/${{ matrix.tarball }}
           if-no-files-found: error
 
   publish:
@@ -207,7 +277,8 @@ jobs:
     env:
       NPM_VERSION: ${{ needs.setup.outputs.npm_version }}
       NPM_TAG: ${{ needs.setup.outputs.npm_tag }}
-      ENGINE: ${{ matrix.engine }}
+      NPM_NAME: ${{ matrix.npm_name }}
+      TARBALL: ${{ matrix.tarball }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -231,18 +302,18 @@ jobs:
       - name: Publish package (OIDC trusted publishing)
         if: ${{ vars.USE_NPM_TOKEN != 'true' }}
         run: |
-          echo "Publishing @nativescript/windows-$ENGINE@$NPM_VERSION to NPM with tag $NPM_TAG via OIDC trusted publishing..."
+          echo "Publishing $NPM_NAME@$NPM_VERSION to NPM with tag $NPM_TAG via OIDC trusted publishing..."
           unset NODE_AUTH_TOKEN
           if [ -n "${NPM_CONFIG_USERCONFIG:-}" ]; then
             rm -f "$NPM_CONFIG_USERCONFIG"
           fi
-          npm publish "./dist/nativescript-windows-${ENGINE}-${NPM_VERSION}.tgz" --tag "$NPM_TAG" --access public --provenance
+          npm publish "./dist/$TARBALL" --tag "$NPM_TAG" --access public --provenance
         env:
           NODE_AUTH_TOKEN: ""
       - name: Publish package (granular token)
         if: ${{ vars.USE_NPM_TOKEN == 'true' }}
         run: |
-          echo "Publishing @nativescript/windows-$ENGINE@$NPM_VERSION to NPM with tag $NPM_TAG via granular token..."
-          npm publish "./dist/nativescript-windows-${ENGINE}-${NPM_VERSION}.tgz" --tag "$NPM_TAG" --access public --provenance
+          echo "Publishing $NPM_NAME@$NPM_VERSION to NPM with tag $NPM_TAG via granular token..."
+          npm publish "./dist/$TARBALL" --tag "$NPM_TAG" --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}

@@ -5,12 +5,13 @@
 // Trigger shapes:
 //   * workflow_dispatch with a version -> that version (leading "v" allowed)
 //   * push of a v* tag                 -> version from the tag, which is authoritative: every
-//     selected package is stamped to it (the four variants carry their own package.json versions,
-//     so there is no single manifest to cross-check the tag against)
+//     selected package is stamped to it (the packages carry their own package.json versions, so
+//     there is no single manifest to cross-check the tag against)
 //   * workflow_dispatch without a version -> rolling "next" prerelease
 //
-// One version covers every engine in a run: the variants are the same framework built from the same
-// commit and differ only in the runtime DLL, so they release in lockstep.
+// One version covers every package in a run: the classic runtime and the four engine variants are
+// the same framework built from the same commit and differ only in the runtime DLL, so they
+// release in lockstep.
 //
 // The repo has no root package.json, so this stays dependency-free — no semver/dayjs, and no
 // `npm install` step in front of it.
@@ -22,14 +23,25 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 
-const ENGINES = ["hermes", "jsc", "quickjs", "v8"];
+// Every publishable package, keyed by the `engine` the workflow matrix runs on. `classic` is the
+// workspace `nativescript` cdylib (rusty_v8) published from template/; the rest are the napi engine
+// packages, each staged from the same template scaffolding by `template/build.ps1 -Engine`.
+const PACKAGES = {
+  classic: { dir: "template", name: "@nativescript/windows" },
+  hermes: { dir: "packages/windows-hermes", name: "@nativescript/windows-hermes" },
+  jsc: { dir: "packages/windows-jsc", name: "@nativescript/windows-jsc" },
+  quickjs: { dir: "packages/windows-quickjs", name: "@nativescript/windows-quickjs" },
+  v8: { dir: "packages/windows-v8", name: "@nativescript/windows-v8" },
+};
+const ENGINES = Object.keys(PACKAGES);
 
-const USAGE = `Usage: node scripts/resolve-release.mjs [--version <version>] [--engine <engine>]
+const USAGE = `Usage: node scripts/resolve-release.mjs [--version <version>] [--engine <engine>] [--skip-arm64]
 
-  --version   release version to cut (leading "v" allowed); empty or omitted resolves from
-              GITHUB_REF (v* tag) or falls back to a rolling "next" prerelease
-  --engine    all (default) | ${ENGINES.join(" | ")}
-  -h, --help  show this help`;
+  --version     release version to cut (leading "v" allowed); empty or omitted resolves from
+                GITHUB_REF (v* tag) or falls back to a rolling "next" prerelease
+  --engine      all (default) | ${ENGINES.join(" | ")}
+  --skip-arm64  build the classic package x64-only (the engine variants are x64-only regardless)
+  -h, --help    show this help`;
 
 let values;
 try {
@@ -37,6 +49,7 @@ try {
     options: {
       version: { type: "string", default: "" },
       engine: { type: "string", default: "all" },
+      "skip-arm64": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   }));
@@ -110,10 +123,10 @@ if (inputVersion) {
   // that is already released takes a patch bump, so the "next" channel never trails "latest".
   let base;
   for (const e of engines) {
-    const manifest = path.join(repoRoot, "packages", `windows-${e}`, "package.json");
+    const manifest = path.join(repoRoot, PACKAGES[e].dir, "package.json");
     const declared = parseVersion(
       JSON.parse(fs.readFileSync(manifest, "utf8")).version,
-      `packages/windows-${e}/package.json version`
+      `${PACKAGES[e].dir}/package.json version`
     );
     if (!base || isNewer(declared, base)) base = declared;
   }
@@ -123,16 +136,39 @@ if (inputVersion) {
 }
 
 const tag = npmTag(parseVersion(version, "Release version"), version);
-const matrix = JSON.stringify({ include: engines.map((e) => ({ engine: e })) });
+
+// One matrix entry per package. Besides the engine key the workflow needs, for each package:
+//   dir              where package.json lives (npm version / npm pack run there)
+//   npm_name         the published name
+//   tarball          what `npm pack` emits ("@scope/name" -> "scope-name-<version>.tgz")
+//   rust_targets     extra Rust targets the toolchain must install (classic cross-compiles arm64)
+//   rust_workspaces  the Swatinem/rust-cache `workspaces` mapping; the engine packages are excluded
+//                    from the root workspace and build into their own target/ dir
+const matrix = {
+  include: engines.map((e) => {
+    const pkg = PACKAGES[e];
+    const classic = e === "classic";
+    return {
+      engine: e,
+      dir: pkg.dir,
+      npm_name: pkg.name,
+      tarball: `${pkg.name.replace(/^@/, "").replace("/", "-")}-${version}.tgz`,
+      rust_targets: classic
+        ? values["skip-arm64"]
+          ? "x86_64-pc-windows-msvc"
+          : "x86_64-pc-windows-msvc,aarch64-pc-windows-msvc"
+        : "",
+      rust_workspaces: classic ? ". -> target" : `. -> target\n${pkg.dir} -> target`,
+    };
+  }),
+};
 
 if (process.env.GITHUB_OUTPUT) {
   fs.appendFileSync(
     process.env.GITHUB_OUTPUT,
-    `NPM_VERSION=${version}\nNPM_TAG=${tag}\nBUILD_MATRIX=${matrix}\n`
+    `NPM_VERSION=${version}\nNPM_TAG=${tag}\nBUILD_MATRIX=${JSON.stringify(matrix)}\n`
   );
 }
 console.log(
-  `Resolved ${version} (dist-tag: ${tag}) for ${engines
-    .map((e) => `@nativescript/windows-${e}`)
-    .join(", ")}`
+  `Resolved ${version} (dist-tag: ${tag}) for ${engines.map((e) => PACKAGES[e].name).join(", ")}`
 );
