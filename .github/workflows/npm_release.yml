@@ -108,6 +108,22 @@ jobs:
             . -> target
             packages/windows-${{ matrix.engine }} -> target
           key: ${{ matrix.engine }}
+      # rusty_v8's build script downloads its prebuilt static lib to <target>/release/gn_out, which
+      # rust-cache prunes (it keeps only build/, deps/ and .fingerprint/) while keeping the build
+      # script's recorded output. When a lockfile change then recompiles the v8 crate, the script
+      # counts as fresh, nothing downloads the lib again, and the link fails with "could not find
+      # native static library `rusty_v8`". Drop the v8 build state so the script runs again.
+      - name: Re-fetch rusty_v8's static lib when the cache pruned it
+        shell: pwsh
+        run: |
+          foreach ($target in @('target', "packages/windows-$env:ENGINE/target")) {
+            $release = Join-Path $target 'release'
+            if ((Test-Path $release) -and -not (Test-Path (Join-Path $release 'gn_out/obj/rusty_v8.lib'))) {
+              Write-Host "rusty_v8.lib missing under $release; resetting the v8 build script."
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+                (Join-Path $release 'build/v8-*'), (Join-Path $release '.fingerprint/v8-*')
+            }
+          }
       # quickjs' napi shim uses clang/GCC C extensions that MSVC `cl` rejects; build.rs compiles it
       # with clang-cl from this exact path and silently falls back to `cl` (which then fails deep in
       # the C build) when it is absent. Fail early with the real reason instead.
