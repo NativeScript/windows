@@ -240,6 +240,8 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
 pub extern "C" fn runtime_deinit(runtime: i64) {
     if runtime != 0 {
         let _ = std::panic::catch_unwind(|| {
+            // Native addons' cleanup hooks and envs go first, while the isolate is still alive.
+            runtime::node_api::teardown();
             let runtime: *mut Runtime = runtime as _;
             let _ = unsafe { Box::from_raw(runtime) };
         });
@@ -420,6 +422,8 @@ pub extern "C" fn runtime_devtools_pump(_runtime: i64) {
 pub extern "C" fn runtime_pump_timers() {
     let _ = std::panic::catch_unwind(|| {
         runtime::timers::pump();
+        // Native addons: threadsafe-function calls, async-work completions, deferred finalizers.
+        runtime::node_api::drain();
         if runtime::ui_dispatcher::needs_win32_pump() {
             runtime::pump_messages();
         } else {
@@ -440,7 +444,11 @@ pub extern "C" fn runtime_pump_timers() {
 /// Returns `true` if at least one Win32 message was dispatched.
 #[no_mangle]
 pub extern "C" fn runtime_pump_messages() -> bool {
-    std::panic::catch_unwind(|| runtime::pump_messages()).unwrap_or(false)
+    std::panic::catch_unwind(|| {
+        runtime::node_api::drain();
+        runtime::pump_messages()
+    })
+    .unwrap_or(false)
 }
 
 /// Free a string previously returned by `runtime_devtools_start`.

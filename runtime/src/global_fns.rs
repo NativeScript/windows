@@ -3696,6 +3696,12 @@ const HELPER_SOURCE: &str = r#"
             function makeRequire(callerFile) {
                 return function require(specifier) {
                     if (specifier === 'ns:module' && globalThis.__nsModuleBuiltin) return globalThis.__nsModuleBuiltin;
+                    // Node-API addons: `system_lib://name.node` (next to the app executable) or a
+                    // path to a `.node` file.
+                    if (typeof specifier === 'string' && typeof globalThis.__nsLoadNativeAddon === 'function' &&
+                        (specifier.indexOf('system_lib://') === 0 || /\.node$/i.test(specifier))) {
+                        return globalThis.__nsLoadNativeAddon(specifier, callerFile || '', globalThis.__nsAppRoot || '');
+                    }
                     var resolved = resolveSpecifier(specifier, callerFile);
                     if (!resolved) throw new Error('Cannot find module: ' + specifier);
 
@@ -5032,6 +5038,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsHostWaitForAsync", handle_host_wait_for_async);
     register!("__nsEnqueueMicrotask", handle_enqueue_microtask);
     register!("__nsPointerKey", handle_pointer_key);
+    register!("__nsLoadNativeAddon", crate::native_addons::handle_load_native_addon);
     register!("__nsBufferToPointer", handle_buffer_to_pointer);
     register!("__nsArrayBufferFromBuffer", handle_array_buffer_from_buffer);
     register!("__nsProxyWriteTextFile", handle_proxy_write_text_file);

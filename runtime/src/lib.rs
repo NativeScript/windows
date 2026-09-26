@@ -31,6 +31,10 @@ mod name_space;
 #[cfg(feature = "napi_engine")]
 pub mod napi_engine;
 #[cfg(feature = "classic")]
+mod native_addons;
+#[cfg(feature = "classic")]
+pub mod node_api;
+#[cfg(feature = "classic")]
 mod ns_proxy;
 #[cfg(feature = "classic")]
 mod wrapper_cache;

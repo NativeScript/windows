@@ -1,0 +1,13 @@
+[package]
+name = "napi-v8-shim"
+version = "0.1.0"
+edition = "2021"
+description = "Node-API over the classic engine's V8: napi-android's v8-api.cpp (vendored in packages/windows-v8) compiled against rusty_v8, plus the env/registration glue the native-addon loader needs."
+
+[dependencies]
+# The shim's C++ calls V8; this keeps rusty_v8's static library (and its headers, which build.rs
+# finds in the registry source) in the link.
+v8 = "147"
+
+[build-dependencies]
+cc = "1"
