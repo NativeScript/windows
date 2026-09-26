@@ -2922,46 +2922,34 @@ const HELPER_SOURCE: &str = r#"
             }
         })();
 
-        // Uses __nsDwmFlush() — the Windows equivalent of Choreographer /
-        // CADisplayLink.  DwmFlush() blocks the calling thread until the next
-        // monitor VSync, giving frame-perfect timing at any refresh rate
-        // (60 / 120 / 144 / 240 Hz) with no timer overhead.
-        //
-        // On headless systems DwmFlush() returns immediately (composition
-        // disabled), so rAF callbacks fire as fast as microtasks drain —
-        // ideal for tests and headless rendering scenarios.
+        // Callbacks run once per frame from the host's pump (runtime_pump_timers, driven by
+        // CompositionTarget.Rendering), never by blocking the UI thread on vsync: see
+        // runtime/src/animation_frames.rs. Callbacks requested during a frame run in the next.
         (function () {
             var _nextId  = 0;
             var _pending = new Map();
-            var _running = false;
-
-            function _flush() {
-                if (_pending.size === 0) { _running = false; return; }
-                // Block until next VSync; returns ms timestamp.
-                var ts = (typeof __nsDwmFlush === 'function')
-                    ? __nsDwmFlush()
-                    : performance.now();
-                var cbs = Array.from(_pending);
-                _pending.clear();
-                for (var i = 0; i < cbs.length; i++) {
-                    try { cbs[i][1](ts); } catch (e) {
-                        console.log('rAF error:', e && e.message || e);
-                    }
-                }
-                if (_pending.size > 0) queueMicrotask(_flush);
-                else _running = false;
-            }
 
             globalThis.requestAnimationFrame = function requestAnimationFrame(callback) {
                 if (typeof callback !== 'function') return 0;
                 var id = ++_nextId;
                 _pending.set(id, callback);
-                if (!_running) { _running = true; queueMicrotask(_flush); }
+                if (_pending.size === 1) __nsRequestFrame();
                 return id;
             };
 
             globalThis.cancelAnimationFrame = function cancelAnimationFrame(id) {
                 _pending.delete(id);
+            };
+
+            globalThis.__nsRunAnimationFrames = function (ts) {
+                if (_pending.size === 0) return;
+                var cbs = Array.from(_pending.values());
+                _pending.clear();
+                for (var i = 0; i < cbs.length; i++) {
+                    try { cbs[i](ts); } catch (e) {
+                        console.log('rAF error:', e && e.message || e);
+                    }
+                }
             };
         })();
 
@@ -3696,6 +3684,12 @@ const HELPER_SOURCE: &str = r#"
             function makeRequire(callerFile) {
                 return function require(specifier) {
                     if (specifier === 'ns:module' && globalThis.__nsModuleBuiltin) return globalThis.__nsModuleBuiltin;
+                    // Node-API addons: `system_lib://name.node` (next to the app executable) or a
+                    // path to a `.node` file.
+                    if (typeof specifier === 'string' && typeof globalThis.__nsLoadNativeAddon === 'function' &&
+                        (specifier.indexOf('system_lib://') === 0 || /\.node$/i.test(specifier))) {
+                        return globalThis.__nsLoadNativeAddon(specifier, callerFile || '', globalThis.__nsAppRoot || '');
+                    }
                     var resolved = resolveSpecifier(specifier, callerFile);
                     if (!resolved) throw new Error('Cannot find module: ' + specifier);
 
@@ -5032,6 +5026,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsHostWaitForAsync", handle_host_wait_for_async);
     register!("__nsEnqueueMicrotask", handle_enqueue_microtask);
     register!("__nsPointerKey", handle_pointer_key);
+    register!("__nsLoadNativeAddon", crate::native_addons::handle_load_native_addon);
     register!("__nsBufferToPointer", handle_buffer_to_pointer);
     register!("__nsArrayBufferFromBuffer", handle_array_buffer_from_buffer);
     register!("__nsProxyWriteTextFile", handle_proxy_write_text_file);
@@ -5080,6 +5075,7 @@ pub(crate) fn init_async_helpers(
         crate::timers::handle_ns_clear_interval
     );
     register!("__nsDwmFlush", handle_dwm_flush);
+    register!("__nsRequestFrame", crate::animation_frames::handle_request_frame);
     register!("__tns_uptime", handle_tns_uptime);
     register!("__nsUUID", handle_ns_uuid);
     register!("__nsIsUiThread", handle_is_ui_thread);

@@ -90,6 +90,12 @@ impl StaticBindingGenerator {
             extensions_metadata.len()
         );
 
+        let extensions_metadata = retain_extendable(extensions_metadata);
+
+        // Proxies from an earlier run whose extension is gone (or now skipped) must not stay in
+        // the build: the app compiles whatever is in the directory.
+        remove_generated_proxies(&self.config.output_dir.join("NSWinRTProxies"));
+
         if extensions_metadata.is_empty() {
             println!("[SBG] No extensions to generate, skipping C# compilation");
             return Ok(ProxyManifest::default());
@@ -348,4 +354,77 @@ fn main() -> Result<()> {
     let _manifest = sbg.generate()?;
 
     Ok(())
+}
+
+/// Deletes the `*.g.cs` files an earlier run generated (hand-written app sources are not `.g.cs`).
+fn remove_generated_proxies(project_dir: &Path) {
+    let Ok(entries) = fs::read_dir(project_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".g.cs")) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Root namespaces of types a JS extension can derive from without WinRT metadata sbg can read
+/// (the Windows App SDK's `Microsoft.UI.*` lives in a framework package, not system metadata).
+const EXTENDABLE_ROOTS: &[&str] = &["Windows", "Microsoft", "System", "NativeScript"];
+
+fn is_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether an auto-captured extension's base can be a real WinRT/.NET type.
+fn is_extendable_base(base: &str) -> bool {
+    let generic_root = base.split('`').next().unwrap_or(base);
+    let segments: Vec<&str> = generic_root.split('.').collect();
+    if segments.len() < 2 || !segments.iter().all(|s| is_identifier(s)) {
+        return false;
+    }
+    EXTENDABLE_ROOTS.contains(&segments[0]) || signature_resolver::is_known_type(base)
+}
+
+/// The bundle scan (dotnet-tool) is syntactic: any class extending a dotted name looks like an
+/// extension, including ordinary classes of bundled libraries (minified `e.Foo`, `Ua.$`). A proxy
+/// for such a "base" cannot compile, so auto-captured ones are dropped; explicitly named ones
+/// (`@CSharpProxy`) are kept as asked.
+fn retain_extendable(extensions: Vec<metadata_reader::ExtensionMetadata>) -> Vec<metadata_reader::ExtensionMetadata> {
+    let (kept, dropped): (Vec<_>, Vec<_>) = extensions.into_iter().partition(|ext| {
+        let base = ext.base_class.as_deref().map(str::trim).unwrap_or("");
+        !ext.is_auto_generated_name || base.is_empty() || base == "object" || base == "Object" || is_extendable_base(base)
+    });
+    if !dropped.is_empty() {
+        let names: Vec<&str> = dropped.iter().filter_map(|e| e.base_class.as_deref()).take(8).collect();
+        println!(
+            "[SBG] Skipped {} captured extension(s) whose base is not a WinRT type ({}{})",
+            dropped.len(),
+            names.join(", "),
+            if dropped.len() > names.len() { ", ..." } else { "" }
+        );
+    }
+    kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_extendable_base;
+
+    #[test]
+    fn winrt_bases_are_extendable() {
+        assert!(is_extendable_base("Microsoft.UI.Xaml.Controls.Button"));
+        assert!(is_extendable_base("Windows.UI.Xaml.Controls.Panel"));
+        assert!(is_extendable_base("NativeScript.Mason.View"));
+    }
+
+    #[test]
+    fn bundled_library_classes_are_not() {
+        for base in ["Ua.$", "i.X", "Sa.ThinEngine", "Phaser.Utils", "u.MaterialDefines", "Button"] {
+            assert!(!is_extendable_base(base), "{base}");
+        }
+    }
 }

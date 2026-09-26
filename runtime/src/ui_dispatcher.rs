@@ -102,6 +102,22 @@ pub fn defer_on_ui_thread(f: impl FnOnce() + Send + 'static) -> bool {
     dq.TryEnqueue(&handler).unwrap_or(false)
 }
 
+/// Queues `f` on the UI thread's dispatcher -- always as a separate work item, never inline, even
+/// from the UI thread (so it can't run inside a XAML callout). `false` if there is no dispatcher.
+pub fn enqueue_on_ui_thread(f: impl FnOnce() + Send + 'static) -> bool {
+    let Some(dq) = UI_QUEUE.get() else {
+        return false;
+    };
+    let cell = std::sync::Mutex::new(Some(f));
+    let handler = DispatcherQueueHandler::new(move || {
+        if let Some(f) = cell.lock().unwrap().take() {
+            f();
+        }
+        Ok(())
+    });
+    dq.TryEnqueue(&handler).unwrap_or(false)
+}
+
 pub fn is_initialized() -> bool {
     UI_QUEUE.get().is_some()
 }

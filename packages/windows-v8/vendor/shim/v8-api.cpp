@@ -2592,7 +2592,7 @@ napi_status NAPI_CDECL napi_type_tag_object(napi_env env,
     CHECK_TO_OBJECT_WITH_PREAMBLE(env, context, obj, object);
     CHECK_ARG_WITH_PREAMBLE(env, type_tag);
 
-    auto key = NAPI_PRIVATE_KEY(context);
+    auto key = env->TypeTagKey();
     auto maybe_has = obj->HasPrivate(context, key);
     CHECK_MAYBE_NOTHING_WITH_PREAMBLE(env, maybe_has, napi_generic_failure);
     RETURN_STATUS_IF_FALSE_WITH_PREAMBLE(
@@ -2622,7 +2622,7 @@ napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
     CHECK_ARG_WITH_PREAMBLE(env, result);
 
     auto maybe_value =
-            obj->GetPrivate(context, NAPI_PRIVATE_KEY(context));
+            obj->GetPrivate(context, env->TypeTagKey());
     CHECK_MAYBE_EMPTY_WITH_PREAMBLE(env, maybe_value, napi_generic_failure);
     v8::Local<v8::Value> val = maybe_value.ToLocalChecked();
 

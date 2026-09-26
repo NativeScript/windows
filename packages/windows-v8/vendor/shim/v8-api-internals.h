@@ -101,9 +101,7 @@ class PersistentToLocal {
 #define CHECK_LE(a, b) CHECK((a) <= (b))
 #endif
 
-// [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
-// [windows port] V8 14.7 removed Context::GetIsolate(); the host has the isolate entered.
-#define NAPI_PRIVATE_KEY(context)                                      \
-  (v8::Private::New(v8::Isolate::GetCurrent()))
+// [windows port] Type tags use napi_env__::TypeTagKey(): a stable private symbol. (This macro used
+// to create a new, unique private on every call, so a tag could never be read back.)
 
 #endif  // SRC_JS_NATIVE_API_V8_INTERNALS_H_

@@ -199,6 +199,11 @@
         Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p sbg"
         EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory)"
         Condition="'$(SbgExe)' == '' and Exists('$(SBGMetadataSource)') and Exists('$(WindowsRuntimeRepoRoot)\Cargo.toml')" />
+      <!-- The proxies are picked up here, after sbg ran: a glob evaluated with the project would
+           still compile proxies an earlier run generated for extensions that are gone. -->
+      <ItemGroup>
+        <Compile Include="$(NSGenDir)\NSWinRTProxies\**\*.cs" Exclude="$(NSGenDir)\NSWinRTProxies\obj\**\*.cs" Visible="false" />
+      </ItemGroup>
     </Target>
 
   <Target Name="CleanStaticBindingGeneratorOutput" AfterTargets="CoreClean">
@@ -206,8 +211,6 @@
   </Target>
 
   <ItemGroup>
-    <Compile Include="$(NSGenDir)\NSWinRTProxies\**\*.cs" Visible="false" Condition="Exists('$(NSGenDir)\NSWinRTProxies')" />
-    <Compile Remove="$(NSGenDir)\NSWinRTProxies\obj\**\*.cs" Condition="Exists('$(NSGenDir)\NSWinRTProxies\obj')" />
     <Content Include="$(NSGenDir)\sbg-manifest.json" Link="sbg-manifest.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\sbg-manifest.json')" />
     <Content Include="$(NSGenDir)\NSWinRTProxies\bin\Release\**\NSWinRTProxies.dll" Link="NSWinRTProxies.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\NSWinRTProxies\bin\Release')" />
   </ItemGroup>

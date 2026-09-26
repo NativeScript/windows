@@ -173,6 +173,12 @@ fn known_override_signature(base_type: &str, method: &str) -> Option<ResolvedMet
     }
 }
 
+/// Whether `type_name` is a type in the WinRT metadata sbg can see (system and sideloaded
+/// winmds; not necessarily the app's framework packages, e.g. the Windows App SDK).
+pub fn is_known_type(type_name: &str) -> bool {
+    MetadataReader::find_by_name_or_generic(type_name).is_some()
+}
+
 /// Resolves one method's real signature given the type name it's declared/overridden on
 /// (base class or interface) and the method's name. `None` when the type or method can't be
 /// found — callers should skip the member and warn, not guess a signature.
