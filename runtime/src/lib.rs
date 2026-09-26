@@ -31,6 +31,8 @@ mod name_space;
 #[cfg(feature = "napi_engine")]
 pub mod napi_engine;
 #[cfg(feature = "classic")]
+pub mod animation_frames;
+#[cfg(feature = "classic")]
 mod native_addons;
 #[cfg(feature = "classic")]
 pub mod node_api;
@@ -8894,6 +8896,7 @@ impl Drop for Runtime {
         DOTNET_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         DOTNET_ONESHOT_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         crate::timers::clear_thread_tasks();
+        crate::animation_frames::clear_thread();
         crate::websocket::clear_thread_sockets();
         crate::globals::url::clear_thread_url_ctor();
         crate::inspector::clear_thread_dispatchers();

@@ -137,6 +137,8 @@ fn url_relative_resolution() {
 #[test]
 fn raf_fires_callback_with_positive_timestamp() {
     let mut rt = Runtime::new(".");
+    // What an app host does after creating the runtime; the frame pump finds the isolate here.
+    rt.register_delegate_isolate_ptr();
     // Register the callback.
     rt.run_script(
         r#"
@@ -150,9 +152,8 @@ fn raf_fires_callback_with_positive_timestamp() {
         "setup.js",
     );
 
-    // Drain microtasks: __nsDwmFlush returns immediately on headless (no DWM)
-    // or waits one VSync on a live display.  Either way the callback runs.
-    rt.run_script("", "pump.js");
+    // One frame: the host's pump (runtime_pump_timers) runs requested callbacks.
+    assert!(runtime::animation_frames::pump(), "no frame was requested");
 
     assert_js(&mut rt, "_rafFired === true", "rAF callback not fired");
     assert_js(&mut rt, "_rafTs    >= 0", "rAF timestamp negative");
@@ -161,6 +162,8 @@ fn raf_fires_callback_with_positive_timestamp() {
 #[test]
 fn raf_callback_receives_increasing_timestamps() {
     let mut rt = Runtime::new(".");
+    // What an app host does after creating the runtime; the frame pump finds the isolate here.
+    rt.register_delegate_isolate_ptr();
     rt.run_script(
         r#"
         var _ts1 = -1, _ts2 = -1;
@@ -171,15 +174,38 @@ fn raf_callback_receives_increasing_timestamps() {
     "#,
         "setup.js",
     );
-    rt.run_script("", "pump1.js");
-    rt.run_script("", "pump2.js");
+    runtime::animation_frames::pump();
+    // Requested during the first frame: runs in the second, not the first.
+    assert_js(&mut rt, "_ts2 === -1", "nested rAF ran in the same frame");
+    runtime::animation_frames::pump();
     assert_js(&mut rt, "_ts1 >= 0", "first rAF timestamp invalid");
     assert_js(&mut rt, "_ts2 >= _ts1", "second rAF not >= first");
 }
 
 #[test]
+fn raf_does_not_run_without_a_frame() {
+    let mut rt = Runtime::new(".");
+    // What an app host does after creating the runtime; the frame pump finds the isolate here.
+    rt.register_delegate_isolate_ptr();
+    rt.run_script(
+        r#"
+        var _early = false;
+        requestAnimationFrame(function() { _early = true; });
+        Promise.resolve().then(function() {});
+    "#,
+        "setup.js",
+    );
+    // Microtasks drained, no pump yet: the UI thread was never held for a frame.
+    assert_js(&mut rt, "_early === false", "rAF ran before the frame");
+    runtime::animation_frames::pump();
+    assert_js(&mut rt, "_early === true", "rAF did not run on the frame");
+}
+
+#[test]
 fn cancel_raf_prevents_callback() {
     let mut rt = Runtime::new(".");
+    // What an app host does after creating the runtime; the frame pump finds the isolate here.
+    rt.register_delegate_isolate_ptr();
     rt.run_script(
         r#"
         var _called = false;
@@ -188,7 +214,7 @@ fn cancel_raf_prevents_callback() {
     "#,
         "setup.js",
     );
-    rt.run_script("", "pump.js");
+    runtime::animation_frames::pump();
     assert_js(
         &mut rt,
         "_called === false",

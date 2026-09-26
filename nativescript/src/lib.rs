@@ -424,6 +424,8 @@ pub extern "C" fn runtime_pump_timers() {
         runtime::timers::pump();
         // Native addons: threadsafe-function calls, async-work completions, deferred finalizers.
         runtime::node_api::drain();
+        // This frame's requestAnimationFrame callbacks, then their microtasks.
+        runtime::animation_frames::pump();
         if runtime::ui_dispatcher::needs_win32_pump() {
             runtime::pump_messages();
         } else {
