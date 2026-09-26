@@ -195,6 +195,16 @@ struct napi_env__ {
   v8::Isolate* const isolate;  // Shortcut for context()->GetIsolate()
   v8impl::Persistent<v8::Context> context_persistent;
 
+  // The private symbol type tags are stored under. It must be the same symbol for tagging and
+  // checking, so it is created once (Private::ForApi) and kept for the env's lifetime.
+  v8::Global<v8::Private> type_tag_key;
+  inline v8::Local<v8::Private> TypeTagKey() {
+    if (type_tag_key.IsEmpty()) {
+      type_tag_key.Reset(isolate, v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "napi:type_tag")));
+    }
+    return type_tag_key.Get(isolate);
+  }
+
   v8impl::Persistent<v8::Value> last_exception;
   // Cache the template for NapiHostObject
   v8::Persistent<v8::ObjectTemplate> host_object_template;
