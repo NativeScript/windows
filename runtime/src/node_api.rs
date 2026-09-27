@@ -577,18 +577,22 @@ struct AsyncWork {
 }
 
 impl AsyncWork {
-    /// JS thread.
+    /// JS thread. `complete` may free the work (`napi_delete_async_work`), as Node allows and
+    /// napi-rs does, so nothing reads `work` after calling it.
     unsafe fn complete(work: *mut AsyncWork) {
-        let work = &*work;
-        let status = if work.state.swap(WORK_IDLE, Ordering::AcqRel) == WORK_CANCELLED {
-            NAPI_CANCELLED
-        } else {
-            NAPI_OK
+        let (env, complete, data) = {
+            let work = &*work;
+            let status = if work.state.swap(WORK_IDLE, Ordering::AcqRel) == WORK_CANCELLED {
+                NAPI_CANCELLED
+            } else {
+                NAPI_OK
+            };
+            (work.env, work.complete.map(|complete| (complete, status)), work.data)
         };
-        if let Some(complete) = work.complete {
-            let _scope = HandleScope::open(work.env);
-            complete(work.env, status, work.data);
-            report_pending(work.env);
+        if let Some((complete, status)) = complete {
+            let _scope = HandleScope::open(env);
+            complete(env, status, data);
+            report_pending(env);
         }
     }
 }
