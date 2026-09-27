@@ -18,13 +18,13 @@ use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
 use metadata::declarations::declaration::DeclarationKind;
-use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
+use metadata::generic_instance_id_builder::GenericInstanceIdBuilder;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use parking_lot::RwLock;
@@ -59,6 +59,9 @@ pub(crate) enum PointerPlan {
     Delegate(GUID, Vec<NativeType>),
     /// Interface/class parameter — QI the argument to this IID.
     Interface(GUID),
+    /// `IIterable<T>`, `IVectorView<T>` or `IVector<T>` — a JS array becomes a native collection;
+    /// anything else is QI'd to the parameter's IID.
+    Collection(std::sync::Arc<crate::collection_arg::CollectionPlan>),
 }
 
 impl PointerPlan {
@@ -108,6 +111,24 @@ impl PointerPlan {
                     None => PointerPlan::Plain,
                 }
             }
+            // The parameter names a closed generic, and the open one's IID matches nothing.
+            DeclarationKind::GenericInterface => {
+                let Some(iid_name) = parameter.metadata().map(|meta| {
+                    let raw = Signature::to_iid_string(meta, &parameter.type_());
+                    crate::property_call::substitute_type_vars(&raw, type_args)
+                }) else {
+                    return PointerPlan::Plain;
+                };
+                if let Some(plan) = crate::collection_arg::plan_for(&iid_name) {
+                    return PointerPlan::Collection(plan);
+                }
+                let iid = GenericInstanceIdBuilder::generate_id_from_name(&iid_name);
+                if iid == GUID::zeroed() {
+                    PointerPlan::Plain
+                } else {
+                    PointerPlan::Interface(iid)
+                }
+            }
             _ => {
                 let iid = {
                     let lock = declaration.read();
@@ -115,10 +136,6 @@ impl PointerPlan {
                         DeclarationKind::Interface => lock
                             .as_any()
                             .downcast_ref::<InterfaceDeclaration>()
-                            .map(|interface| interface.id()),
-                        DeclarationKind::GenericInterface => lock
-                            .as_any()
-                            .downcast_ref::<GenericInterfaceDeclaration>()
                             .map(|interface| interface.id()),
                         DeclarationKind::GenericInterfaceInstance => lock
                             .as_any()
@@ -1122,6 +1139,17 @@ impl MethodCall {
                                 Err(_) => ffi_parse_pointer_arg(scope, value),
                             }
                         }
+                        PointerPlan::Collection(plan) => {
+                            match crate::collection_arg::classic_arg(scope, value, plan) {
+                                Ok((pointer, Some(guard))) => {
+                                    queried_interfaces.push(guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(_) if !value.is_array() => ffi_parse_pointer_arg(scope, value),
+                                Err(error) => Err(error),
+                            }
+                        }
                     }
                 }
                 NativeType::Buffer => {
@@ -1736,6 +1764,16 @@ impl MethodCall {
                             match nv::napi_parse_query_interface(env, &value, iid) {
                                 Ok((pointer, Some(interface_guard))) => {
                                     queried_interfaces.push(interface_guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(_) => nv::napi_parse_pointer(env, &value),
+                            }
+                        }
+                        PointerPlan::Collection(plan) => {
+                            match crate::collection_arg::napi_arg(env, &value, plan) {
+                                Ok((pointer, Some(guard))) => {
+                                    queried_interfaces.push(guard);
                                     Ok(pointer)
                                 }
                                 Ok((pointer, None)) => Ok(pointer),

@@ -4,6 +4,7 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod class_helpers;
+mod collection_arg;
 pub mod esm_http;
 pub(crate) mod dotnet;
 mod error;

@@ -1334,6 +1334,16 @@ impl PropertyCall {
                                 Err(error) => Err(error),
                             }
                         }
+                        PointerPlan::Collection(plan) => {
+                            match crate::collection_arg::classic_arg(scope, value, plan) {
+                                Ok((pointer, Some(guard))) => {
+                                    queried_interfaces.push(guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(error) => Err(error),
+                            }
+                        }
                     }
                 }
                 NativeType::Buffer => {
@@ -1719,6 +1729,16 @@ impl PropertyCall {
                             match nv::napi_parse_query_interface(env, &value, iid) {
                                 Ok((pointer, Some(interface_guard))) => {
                                     queried_interfaces.push(interface_guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(error) => Err(error),
+                            }
+                        }
+                        PointerPlan::Collection(plan) => {
+                            match crate::collection_arg::napi_arg(env, &value, plan) {
+                                Ok((pointer, Some(guard))) => {
+                                    queried_interfaces.push(guard);
                                     Ok(pointer)
                                 }
                                 Ok((pointer, None)) => Ok(pointer),
