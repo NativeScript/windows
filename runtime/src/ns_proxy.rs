@@ -16,9 +16,8 @@ use crate::value::{
     NativeValue, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER,
 };
 use crate::{
-    class_activation_factory, delegate_info_from_add_method, js_delegate_params_from_declaration,
-    resolve_class_factory_from_parent, throw_js_error, DeclarationFFI, JsDelegate, JsDelegateData,
-    ReturnKind, JS_DELEGATE_VTBL,
+    class_activation_factory, resolve_class_factory_from_parent, throw_js_error, DeclarationFFI,
+    ReturnKind,
 };
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
@@ -390,18 +389,8 @@ pub(crate) fn wire_winrt_event(
     });
     let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
         let func = v8::Local::<v8::Function>::try_from(value).ok()?;
-        let (guid, param_types) = delegate_info_from_add_method(add_method)?;
-        let data = Box::new(JsDelegateData {
-            js_func: v8::Global::new(scope, func),
-            param_types,
-        });
-        let delegate = Box::new(JsDelegate {
-            vtable: &JS_DELEGATE_VTBL as *const _,
-            ref_count: std::sync::atomic::AtomicU32::new(1),
-            guid,
-            data: Box::into_raw(data),
-        });
-        Some(Box::into_raw(delegate) as *mut c_void)
+        let (guid, signature) = crate::delegate_signature_from_add_method(add_method)?;
+        Some(crate::new_js_delegate(v8::Global::new(scope, func), guid, signature))
     });
 
     if let Some(delegate_ptr) = effective_ptr {
@@ -3376,21 +3365,11 @@ pub(crate) fn create_ns_ctor_object<'a>(
                             None
                         };
                         if let Some(func) = maybe_func {
-                            if let Some((guid, param_types)) =
-                                js_delegate_params_from_declaration(&*lock, kind)
+                            if let Some((guid, signature)) =
+                                crate::delegate_signature_from_declaration(&*lock, kind)
                             {
                                 let global_func = v8::Global::new(scope, func);
-                                let data = Box::new(JsDelegateData {
-                                    js_func: global_func,
-                                    param_types,
-                                });
-                                let delegate = Box::new(JsDelegate {
-                                    vtable: &JS_DELEGATE_VTBL as *const _,
-                                    ref_count: std::sync::atomic::AtomicU32::new(1),
-                                    guid,
-                                    data: Box::into_raw(data),
-                                });
-                                let raw = Box::into_raw(delegate) as *mut c_void;
+                                let raw = crate::new_js_delegate(global_func, guid, signature);
                                 let result_obj = v8::Object::new(scope);
                                 if let Some(key) = v8::String::new(scope, "handle") {
                                     result_obj.set(

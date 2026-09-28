@@ -333,7 +333,7 @@ pub(crate) fn wire_winrt_event_napi(
             return None;
         }
         let func: JsFunction = unsafe { value.cast() };
-        let (guid, param_types) = crate::delegate_info_from_add_method(add_method)?;
+        let (guid, signature) = crate::delegate_signature_from_add_method(add_method)?;
         // The delegate's IID-form name, derived exactly as `delegate_info_from_add_method`
         // derives it, keys the parameters' sealed-class declarations so the handler receives
         // typed arguments without a per-event runtime-class lookup.
@@ -344,7 +344,7 @@ pub(crate) fn wire_winrt_event_napi(
                 let iid_name =
                     metadata::signature::Signature::to_iid_string(p.metadata()?, &p.type_());
                 (!iid_name.is_empty()).then(|| {
-                    crate::napi_engine::delegate::delegate_param_classes(&iid_name, &param_types)
+                    crate::napi_engine::delegate::delegate_param_classes(&iid_name, &signature.params)
                 })
             })
             .unwrap_or_default();
@@ -352,7 +352,7 @@ pub(crate) fn wire_winrt_event_napi(
             env,
             &func,
             guid,
-            param_types,
+            signature,
             param_classes,
         )
     });

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use napi::{sys, CallContext, Env, JsFunction, JsUnknown, NapiRaw, NapiValue, ValueType};
 use windows::core::{IUnknown, Interface, GUID, HRESULT};
 
+use crate::delegate_invoke::{self, DelegateArg, DelegateReturn, DelegateSignature};
 use crate::napi_engine::ns_proxy::Decl;
 use crate::value::NativeType;
 
@@ -46,10 +47,13 @@ pub(crate) static NAPI_DELEGATE_VTBL: NapiDelegateVtbl = NapiDelegateVtbl {
 pub(crate) struct NapiDelegateData {
     env: sys::napi_env,
     func_ref: sys::napi_ref,
-    param_types: Vec<NativeType>,
+    signature: DelegateSignature,
     /// Aligned with `param_types`; `Some` for pointer parameters declared as a sealed class.
     /// Shorter than `param_types` (or empty) means "resolve at invoke time" for the rest.
     param_classes: Vec<SealedParam>,
+    /// For a delegate whose Invoke the shared vtable can't implement (see [`delegate_invoke`]):
+    /// the typed Invoke and the delegate's own vtable, which points at it.
+    typed: Option<(delegate_invoke::TypedInvoke, Box<NapiDelegateVtbl>)>,
 }
 
 impl Drop for NapiDelegateData {
@@ -80,9 +84,9 @@ pub fn make_napi_delegate(
     env: &Env,
     func: &JsFunction,
     guid: GUID,
-    param_types: Vec<NativeType>,
+    signature: DelegateSignature,
 ) -> Option<*mut c_void> {
-    make_napi_delegate_typed(env, func, guid, param_types, Vec::new())
+    make_napi_delegate_typed(env, func, guid, signature, Vec::new())
 }
 
 /// The sealed-class declarations of a delegate's Invoke parameters, aligned with the
@@ -111,7 +115,7 @@ pub(crate) fn make_napi_delegate_typed(
     env: &Env,
     func: &JsFunction,
     guid: GUID,
-    param_types: Vec<NativeType>,
+    signature: DelegateSignature,
     param_classes: Vec<SealedParam>,
 ) -> Option<*mut c_void> {
     let mut func_ref: sys::napi_ref = std::ptr::null_mut();
@@ -120,14 +124,35 @@ pub(crate) fn make_napi_delegate_typed(
     if status != sys::Status::napi_ok || func_ref.is_null() {
         return None;
     }
+    let typed = if signature.needs_typed_invoke() {
+        delegate_invoke::TypedInvoke::new(&signature, napi_delegate_typed_invoke).map(|invoke| {
+            let vtable = Box::new(NapiDelegateVtbl {
+                query_interface: napi_delegate_query_interface,
+                add_ref: napi_delegate_add_ref,
+                release: napi_delegate_release,
+                // Called through the delegate's real signature, never through this type.
+                invoke: unsafe {
+                    std::mem::transmute::<*const c_void, unsafe extern "system" fn(*mut NapiDelegate, usize, usize, usize, usize) -> HRESULT>(invoke.code_ptr())
+                },
+            });
+            (invoke, vtable)
+        })
+    } else {
+        None
+    };
+    let vtable: *const NapiDelegateVtbl = match &typed {
+        Some((_, vtable)) => &**vtable,
+        None => &NAPI_DELEGATE_VTBL,
+    };
     let data = Box::new(NapiDelegateData {
         env: env.raw(),
         func_ref,
-        param_types,
+        signature,
         param_classes,
+        typed,
     });
     let delegate = Box::new(NapiDelegate {
-        vtable: &NAPI_DELEGATE_VTBL as *const _,
+        vtable,
         ref_count: AtomicU32::new(1),
         guid,
         data: Box::into_raw(data),
@@ -194,7 +219,17 @@ unsafe extern "system" fn napi_delegate_invoke(
 ) -> HRESULT {
     // catch_unwind so Rust panics cannot cross the WinRT C++ caller stack (UB / CLR FailFast).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        napi_delegate_invoke_inner(this, p0, p1, p2)
+        napi_delegate_invoke_inner(
+            this,
+            |signature| {
+                [p0, p1, p2]
+                    .into_iter()
+                    .take(signature.params.len().min(3))
+                    .map(DelegateArg::Word)
+                    .collect()
+            },
+            std::ptr::null_mut(),
+        )
     }));
     match result {
         Ok(hr) => hr,
@@ -202,7 +237,32 @@ unsafe extern "system" fn napi_delegate_invoke(
     }
 }
 
-fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2: usize) -> HRESULT {
+/// Invoke for delegates with a typed Invoke (see [`delegate_invoke`]): libffi calls this with the
+/// arguments read from wherever the ABI put them.
+unsafe extern "C" fn napi_delegate_typed_invoke(
+    _cif: &delegate_invoke::ffi_cif,
+    result: &mut u64,
+    args: *const *const c_void,
+    _userdata: &(),
+) {
+    const E_FAIL: HRESULT = HRESULT(0x80004005u32 as i32);
+    let hr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let this = *(*args as *const *mut NapiDelegate);
+        if this.is_null() || (*this).data.is_null() {
+            return E_FAIL;
+        }
+        let (_, values, result_slot) = delegate_invoke::read_invoke_args(args, &(*(*this).data).signature);
+        napi_delegate_invoke_inner(this, |_| values, result_slot)
+    }))
+    .unwrap_or(E_FAIL);
+    delegate_invoke::set_hresult(result, hr.0);
+}
+
+fn napi_delegate_invoke_inner(
+    this: *mut NapiDelegate,
+    args: impl FnOnce(&DelegateSignature) -> Vec<DelegateArg>,
+    result_slot: *mut c_void,
+) -> HRESULT {
     const E_FAIL: HRESULT = HRESULT(0x80004005u32 as i32);
     if this.is_null() {
         return E_FAIL;
@@ -234,17 +294,21 @@ fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2:
                 return E_FAIL;
             }
 
-            let params_raw = [p0, p1, p2];
-            let n = data.param_types.len().min(3);
-            let mut js_args: [sys::napi_value; 4] = [std::ptr::null_mut(); 4];
-            for i in 0..n {
-                let raw = params_raw[i];
-                let class = data.param_classes.get(i).and_then(|c| c.as_ref());
-                let val = match delegate_param_to_napi(env, raw, &data.param_types[i], class) {
-                    Some(v) => v,
-                    None => return E_FAIL,
+            let args = args(&data.signature);
+            let mut js_args: Vec<sys::napi_value> = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                let val = match *arg {
+                    DelegateArg::Word(raw) => {
+                        let class = data.param_classes.get(i).and_then(|c| c.as_ref());
+                        delegate_param_to_napi(env, raw, &data.signature.params[i], class)
+                    }
+                    DelegateArg::F32(v) => napi_double(env, v as f64),
+                    DelegateArg::F64(v) => napi_double(env, v),
                 };
-                js_args[i] = val;
+                match val {
+                    Some(v) => js_args.push(v),
+                    None => return E_FAIL,
+                }
             }
 
             let mut recv: sys::napi_value = std::ptr::null_mut();
@@ -254,10 +318,11 @@ fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2:
                 env,
                 recv,
                 func,
-                n,
+                js_args.len(),
                 js_args.as_ptr(),
                 &mut call_result,
             );
+            let threw = status != sys::Status::napi_ok;
             if status != sys::Status::napi_ok {
                 // A JS exception must not escape into WinRT C++ frames: capture it into the
                 // runtime's last-error slot (mirrors the TryCatch in the v8 original).
@@ -270,10 +335,51 @@ fn napi_delegate_invoke_inner(this: *mut NapiDelegate, p0: usize, p1: usize, p2:
                     }
                 }
             }
+            if data.signature.ret != DelegateReturn::Void {
+                let value = if threw { None } else { napi_return_value(env, call_result) };
+                delegate_invoke::write_return(result_slot, &data.signature.ret, value);
+                // A delegate the caller expects a value from reports the exception as a failure.
+                if threw {
+                    return E_FAIL;
+                }
+            }
             HRESULT(0)
         })();
         let _ = sys::napi_close_handle_scope(env, scope);
         hr
+    }
+}
+
+unsafe fn napi_double(env: sys::napi_env, value: f64) -> Option<sys::napi_value> {
+    let mut out: sys::napi_value = std::ptr::null_mut();
+    (sys::napi_create_double(env, value, &mut out) == sys::Status::napi_ok).then_some(out)
+}
+
+/// A JS delegate's result as a scalar: a BigInt keeps all 64 bits (`Int64` results such as a packed
+/// width/height pair), numbers and booleans convert, anything else is no result.
+unsafe fn napi_return_value(env: sys::napi_env, value: sys::napi_value) -> Option<delegate_invoke::ReturnValue> {
+    if value.is_null() {
+        return None;
+    }
+    let mut ty = sys::ValueType::napi_undefined;
+    if sys::napi_typeof(env, value, &mut ty) != sys::Status::napi_ok {
+        return None;
+    }
+    match ty {
+        sys::ValueType::napi_bigint => {
+            let (mut v, mut lossless) = (0i64, false);
+            (sys::napi_get_value_bigint_int64(env, value, &mut v, &mut lossless) == sys::Status::napi_ok)
+                .then_some(delegate_invoke::ReturnValue::Int(v))
+        }
+        sys::ValueType::napi_boolean => {
+            let mut v = false;
+            (sys::napi_get_value_bool(env, value, &mut v) == sys::Status::napi_ok).then_some(delegate_invoke::ReturnValue::Bool(v))
+        }
+        sys::ValueType::napi_number => {
+            let mut v = 0f64;
+            (sys::napi_get_value_double(env, value, &mut v) == sys::Status::napi_ok).then_some(delegate_invoke::ReturnValue::Float(v))
+        }
+        _ => None,
     }
 }
 
@@ -401,14 +507,14 @@ fn native_as_delegate(ctx: &CallContext) -> napi::Result<JsUnknown> {
 
     let func: JsFunction = ctx.get(1)?;
 
-    let Some((guid, param_types)) = crate::delegate_info_from_type_sig(&type_name) else {
+    let Some((guid, signature)) = crate::delegate_signature_from_type_sig(&type_name) else {
         return Err(napi::Error::from_reason(format!(
             "__nsAsDelegate: unknown delegate type '{type_name}'"
         )));
     };
 
-    let param_classes = delegate_param_classes(&type_name, &param_types);
-    let Some(ptr) = make_napi_delegate_typed(&ctx.env, &func, guid, param_types, param_classes)
+    let param_classes = delegate_param_classes(&type_name, &signature.params);
+    let Some(ptr) = make_napi_delegate_typed(&ctx.env, &func, guid, signature, param_classes)
     else {
         return Err(napi::Error::from_reason(
             "__nsAsDelegate: failed to create native delegate".to_string(),
