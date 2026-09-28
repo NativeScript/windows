@@ -2495,3 +2495,85 @@ fn perf_return_kind_dispatch() {
         println!("(perf_return_kind result files not written — skipping assertion)");
     }
 }
+
+/// A JS function behind a delegate whose Invoke takes floats and returns a value
+/// (`Int64 F(Single, Single, Single, Single)`), called the way native code calls it.
+#[test]
+fn js_delegate_with_float_params_and_int64_result() {
+    use crate::delegate_invoke::{DelegateReturn, DelegateSignature};
+    use crate::value::NativeType;
+    use std::ffi::c_void;
+    use windows::core::{GUID, HRESULT};
+
+    let mut runtime = Box::new(Runtime::new("."));
+    runtime.register_delegate_isolate_ptr();
+    runtime.run_script(
+        r#"
+            globalThis.__measure = function (kw, kh, aw, ah) {
+                globalThis.__seen = [kw, kh, aw, ah].join(',');
+                if (aw < 0) throw new Error('negative width');
+                // Two float32s packed as (widthBits << 32) | heightBits.
+                const view = new DataView(new ArrayBuffer(8));
+                view.setFloat32(0, aw);
+                view.setFloat32(4, 40.5);
+                return view.getBigInt64(0);
+            };
+        "#,
+        "typed_delegate.js",
+    );
+
+    let func = {
+        let context = runtime.global_context().clone();
+        v8::scope!(scope, runtime.isolate_mut());
+        let context = v8::Local::new(scope, &context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let key = v8::String::new(scope, "__measure").unwrap();
+        let value = context.global(scope).get(scope, key.into()).unwrap();
+        v8::Global::new(scope, v8::Local::<v8::Function>::try_from(value).unwrap())
+    };
+    let signature = DelegateSignature::new(vec![NativeType::F32; 4], DelegateReturn::Scalar(NativeType::I64));
+    let delegate = crate::new_js_delegate(func, GUID::zeroed(), signature) as *mut crate::JsDelegate;
+
+    type MeasureInvoke = unsafe extern "system" fn(*mut c_void, f32, f32, f32, f32, *mut i64) -> HRESULT;
+    let invoke: MeasureInvoke = unsafe { std::mem::transmute((*(*delegate).vtable).invoke) };
+
+    let mut out: i64 = 0;
+    let hr = unsafe { invoke(delegate as *mut c_void, f32::NAN, 12.25, 300.0, -2.0, &mut out) };
+    assert_eq!(hr.0, 0);
+    assert_eq!(runtime.eval_script_to_string("globalThis.__seen").as_deref(), Some("NaN,12.25,300,-2"));
+    assert_eq!((out as u64 >> 32) as u32, 300.0f32.to_bits());
+    assert_eq!(out as u64 as u32, 40.5f32.to_bits());
+
+    // A throwing function fails the call and leaves no stale result.
+    let mut out: i64 = 7;
+    let hr = unsafe { invoke(delegate as *mut c_void, 1.0, 2.0, -1.0, 4.0, &mut out) };
+    assert_eq!(hr.0, 0x80004005u32 as i32);
+    assert_eq!(out, 0);
+
+    unsafe { crate::js_delegate_release(delegate) };
+}
+
+/// Event-handler shaped delegates (pointer arguments, no result) keep the shared vtable.
+#[test]
+fn js_delegate_without_value_types_keeps_the_shared_invoke() {
+    use crate::delegate_invoke::{DelegateReturn, DelegateSignature};
+    use crate::value::NativeType;
+    use windows::core::GUID;
+
+    let mut runtime = Box::new(Runtime::new("."));
+    runtime.register_delegate_isolate_ptr();
+    runtime.run_script("globalThis.__handler = function (sender, args) {};", "handler.js");
+    let func = {
+        let context = runtime.global_context().clone();
+        v8::scope!(scope, runtime.isolate_mut());
+        let context = v8::Local::new(scope, &context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let key = v8::String::new(scope, "__handler").unwrap();
+        let value = context.global(scope).get(scope, key.into()).unwrap();
+        v8::Global::new(scope, v8::Local::<v8::Function>::try_from(value).unwrap())
+    };
+    let signature = DelegateSignature::new(vec![NativeType::Pointer, NativeType::Pointer], DelegateReturn::Void);
+    let delegate = crate::new_js_delegate(func, GUID::zeroed(), signature) as *mut crate::JsDelegate;
+    assert!(std::ptr::eq(unsafe { (*delegate).vtable }, &crate::JS_DELEGATE_VTBL));
+    unsafe { crate::js_delegate_release(delegate) };
+}

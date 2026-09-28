@@ -5,6 +5,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod class_helpers;
 mod collection_arg;
+mod delegate_invoke;
 pub mod esm_http;
 pub(crate) mod dotnet;
 mod error;
@@ -78,6 +79,9 @@ use crate::value::{
     MIN_SAFE_INTEGER,
 };
 use crate::value::NativeType;
+#[cfg(feature = "classic")]
+use crate::delegate_invoke::DelegateArg;
+use crate::delegate_invoke::{DelegateReturn, DelegateSignature};
 #[cfg(feature = "classic")]
 use crate::value::NativeValue;
 use ahash::AHashSet;
@@ -6001,21 +6005,11 @@ fn create_ns_ctor_object<'a>(
                         None
                     };
                     if let Some(func) = maybe_func {
-                        if let Some((guid, param_types)) =
-                            js_delegate_params_from_declaration(&*lock, kind)
+                        if let Some((guid, signature)) =
+                            delegate_signature_from_declaration(&*lock, kind)
                         {
                             let global_func = v8::Global::new(scope, func);
-                            let data = Box::new(JsDelegateData {
-                                js_func: global_func,
-                                param_types,
-                            });
-                            let delegate = Box::new(JsDelegate {
-                                vtable: &JS_DELEGATE_VTBL as *const _,
-                                ref_count: AtomicU32::new(1),
-                                guid,
-                                data: Box::into_raw(data),
-                            });
-                            let raw = Box::into_raw(delegate) as *mut c_void;
+                            let raw = crate::new_js_delegate(global_func, guid, signature);
 
                             let result_obj = v8::Object::new(scope);
                             if let Some(key) = v8::String::new(scope, "handle") {
@@ -7751,7 +7745,42 @@ pub(crate) static JS_DELEGATE_VTBL: JsDelegateVtbl = JsDelegateVtbl {
 #[cfg(feature = "classic")]
 pub(crate) struct JsDelegateData {
     pub(crate) js_func: v8::Global<v8::Function>,
-    pub(crate) param_types: Vec<NativeType>,
+    pub(crate) signature: DelegateSignature,
+    /// For a delegate whose Invoke the shared vtable can't implement (see [`delegate_invoke`]):
+    /// the typed Invoke and the delegate's own vtable, which points at it.
+    typed: Option<(delegate_invoke::TypedInvoke, Box<JsDelegateVtbl>)>,
+}
+
+/// Wraps `js_func` as a COM delegate implementing `signature`; returns the IUnknown-compatible
+/// pointer (refcount 1, owned by the caller).
+#[cfg(feature = "classic")]
+pub(crate) fn new_js_delegate(js_func: v8::Global<v8::Function>, guid: GUID, signature: DelegateSignature) -> *mut c_void {
+    let typed = if signature.needs_typed_invoke() {
+        delegate_invoke::TypedInvoke::new(&signature, js_delegate_typed_invoke).map(|invoke| {
+            let vtable = Box::new(JsDelegateVtbl {
+                query_interface: js_delegate_query_interface,
+                add_ref: js_delegate_add_ref,
+                release: js_delegate_release,
+                // Called through the delegate's real signature, never through this type.
+                invoke: unsafe { std::mem::transmute::<*const c_void, unsafe extern "system" fn(*mut JsDelegate, usize, usize, usize, usize) -> HRESULT>(invoke.code_ptr()) },
+            });
+            (invoke, vtable)
+        })
+    } else {
+        None
+    };
+    let vtable: *const JsDelegateVtbl = match &typed {
+        Some((_, vtable)) => &**vtable,
+        None => &JS_DELEGATE_VTBL,
+    };
+    let data = Box::new(JsDelegateData { js_func, signature, typed });
+    let delegate = Box::new(JsDelegate {
+        vtable,
+        ref_count: AtomicU32::new(1),
+        guid,
+        data: Box::into_raw(data),
+    });
+    Box::into_raw(delegate) as *mut c_void
 }
 
 #[cfg(feature = "classic")]
@@ -7813,7 +7842,17 @@ unsafe extern "system" fn js_delegate_invoke(
     // Wrap everything in catch_unwind so Rust panics cannot propagate through
     // the WinRT C++ caller stack (which would be UB and cause CLR FailFast).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        js_delegate_invoke_inner(this, p0, p1, p2)
+        js_delegate_invoke_inner(
+            this,
+            |signature| {
+                [p0, p1, p2]
+                    .into_iter()
+                    .take(signature.params.len().min(3))
+                    .map(DelegateArg::Word)
+                    .collect()
+            },
+            std::ptr::null_mut(),
+        )
     }));
     match result {
         Ok(hr) => hr,
@@ -7821,8 +7860,33 @@ unsafe extern "system" fn js_delegate_invoke(
     }
 }
 
+/// Invoke for delegates with a typed Invoke (see [`delegate_invoke`]): libffi calls this with the
+/// arguments read from wherever the ABI put them.
 #[cfg(feature = "classic")]
-fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usize) -> HRESULT {
+unsafe extern "C" fn js_delegate_typed_invoke(
+    _cif: &delegate_invoke::ffi_cif,
+    result: &mut u64,
+    args: *const *const c_void,
+    _userdata: &(),
+) {
+    let hr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let this = *(*args as *const *mut JsDelegate);
+        if this.is_null() || (*this).data.is_null() {
+            return HRESULT(0x80004005u32 as i32);
+        }
+        let (_, values, result_slot) = delegate_invoke::read_invoke_args(args, &(*(*this).data).signature);
+        js_delegate_invoke_inner(this, |_| values, result_slot)
+    }))
+    .unwrap_or(HRESULT(0x80004005u32 as i32));
+    delegate_invoke::set_hresult(result, hr.0);
+}
+
+#[cfg(feature = "classic")]
+fn js_delegate_invoke_inner(
+    this: *mut JsDelegate,
+    args: impl FnOnce(&DelegateSignature) -> Vec<DelegateArg>,
+    result_slot: *mut c_void,
+) -> HRESULT {
     if this.is_null() {
         return HRESULT(0x80004005u32 as i32);
     }
@@ -7833,6 +7897,7 @@ fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usi
         }
         &*data_ptr
     };
+    let args = args(&data.signature);
 
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
     if isolate_ptr.is_null() {
@@ -7872,7 +7937,7 @@ fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usi
         };
         let context = v8::Local::new(base, &ctx_global);
         let scope = &mut v8::ContextScope::new(base, context);
-        js_delegate_run(data, scope, p0, p1, p2)
+        js_delegate_run(data, scope, &args, result_slot)
     } else {
         let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
         v8::scope!(base, isolate);
@@ -7882,7 +7947,7 @@ fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usi
         };
         let context = v8::Local::new(base, &ctx_global);
         let scope = &mut v8::ContextScope::new(base, context);
-        js_delegate_run(data, scope, p0, p1, p2)
+        js_delegate_run(data, scope, &args, result_slot)
     }
 }
 
@@ -7892,9 +7957,8 @@ fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usi
 fn js_delegate_run(
     data: &JsDelegateData,
     scope: &mut v8::PinScope<'_, '_>,
-    p0: usize,
-    p1: usize,
-    p2: usize,
+    args: &[DelegateArg],
+    result_slot: *mut c_void,
 ) -> HRESULT {
     // TryCatch so JS exceptions don't escape into WinRT C++ frames.
     v8::tc_scope!(tc, scope);
@@ -7902,13 +7966,21 @@ fn js_delegate_run(
     let func = v8::Local::new(tc, &data.js_func);
     let recv = v8::undefined(tc);
 
-    let params_raw = [p0, p1, p2];
-    let n = data.param_types.len().min(3);
-    let mut js_args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(n);
+    let mut js_args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(args.len());
 
-    for i in 0..n {
-        let raw = params_raw[i] as *mut c_void;
-        let val: v8::Local<v8::Value> = match data.param_types[i] {
+    for (i, arg) in args.iter().enumerate() {
+        let raw = match *arg {
+            DelegateArg::Word(raw) => raw as *mut c_void,
+            DelegateArg::F32(v) => {
+                js_args.push(v8::Number::new(tc, v as f64).into());
+                continue;
+            }
+            DelegateArg::F64(v) => {
+                js_args.push(v8::Number::new(tc, v).into());
+                continue;
+            }
+        };
+        let val: v8::Local<v8::Value> = match data.signature.params[i] {
             NativeType::Pointer => {
                 if raw.is_null() {
                     v8::null(tc).into()
@@ -7962,8 +8034,11 @@ fn js_delegate_run(
         js_args.push(val);
     }
 
-    let _ = func.call(tc, recv.into(), &js_args);
-    if tc.has_caught() {
+    let returned = func.call(tc, recv.into(), &js_args);
+    let threw = tc.has_caught();
+    // Read before the microtask checkpoint below can run more JS.
+    let value = if threw { None } else { returned.and_then(|v| js_delegate_return_value(tc, v)) };
+    if threw {
         if let Some(ex) = tc.exception() {
             let msg = ex.to_rust_string_lossy(tc);
             store_last_js_error(msg);
@@ -7975,7 +8050,30 @@ fn js_delegate_run(
     if !defer_microtask_drain() {
         tc.perform_microtask_checkpoint();
     }
+    if data.signature.ret != DelegateReturn::Void {
+        unsafe { delegate_invoke::write_return(result_slot, &data.signature.ret, value) };
+        // A delegate the caller expects a value from reports the exception as a failure.
+        if threw {
+            return HRESULT(0x80004005u32 as i32);
+        }
+    }
     HRESULT(0)
+}
+
+/// A JS delegate's result as a scalar: a BigInt keeps all 64 bits (`Int64` results such as a packed
+/// width/height pair), numbers and booleans convert, anything else is no result.
+#[cfg(feature = "classic")]
+fn js_delegate_return_value(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<delegate_invoke::ReturnValue> {
+    if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
+        return Some(delegate_invoke::ReturnValue::Int(big.i64_value().0));
+    }
+    if value.is_boolean() {
+        return Some(delegate_invoke::ReturnValue::Bool(value.boolean_value(scope)));
+    }
+    if value.is_number() {
+        return value.number_value(scope).map(delegate_invoke::ReturnValue::Float);
+    }
+    None
 }
 
 /// Resolves the NativeType for a single delegate `Invoke` parameter signature.
@@ -8144,6 +8242,78 @@ pub(crate) fn sealed_class_for_type_name(
     sealed.then(|| (Arc::from(type_name), decl))
 }
 
+/// The return of a delegate's `Invoke` (`type_args` substitutes `Var!N` placeholders).
+fn delegate_return_from_invoke(method: &MethodDeclaration, type_args: &[String]) -> DelegateReturn {
+    let Some(meta) = method.metadata() else {
+        return DelegateReturn::Void;
+    };
+    let sig = Signature::to_string(meta, &method.return_type());
+    let placeholder = sig.strip_prefix("Var!").and_then(|n| n.parse::<usize>().ok());
+    let sig = match placeholder.and_then(|n| type_args.get(n)) {
+        Some(arg) => arg.clone(),
+        None => sig,
+    };
+    delegate_invoke::delegate_return_for_signature(&sig, ffi_type_for_delegate_param)
+}
+
+/// The return of the `Invoke` of a delegate declaration.
+pub(crate) fn delegate_return_from_declaration(lock: &dyn Declaration, kind: DeclarationKind) -> DelegateReturn {
+    let invoke = match kind {
+        DeclarationKind::Delegate => lock.as_any().downcast_ref::<DelegateDeclaration>().map(|d| d.invoke_method()),
+        DeclarationKind::GenericDelegate => lock.as_any().downcast_ref::<GenericDelegateDeclaration>().map(|d| d.invoke_method()),
+        DeclarationKind::GenericDelegateInstance => lock
+            .as_any()
+            .downcast_ref::<GenericDelegateInstanceDeclaration>()
+            .map(|d| d.invoke_method()),
+        _ => None,
+    };
+    invoke.map_or(DelegateReturn::Void, |method| delegate_return_from_invoke(method, &[]))
+}
+
+/// The return of the `Invoke` of the delegate named `iid_name` (see [`delegate_info_from_type_sig`]).
+pub(crate) fn delegate_return_from_type_sig(iid_name: &str) -> DelegateReturn {
+    if let Some(open_name) = iid_name.split_once('<').map(|(prefix, _)| prefix) {
+        let type_args = extract_generic_type_args(iid_name);
+        let Some(open_decl) = MetadataReader::find_by_name(open_name) else {
+            return DelegateReturn::Void;
+        };
+        let lock = open_decl.read();
+        return lock
+            .as_any()
+            .downcast_ref::<GenericDelegateDeclaration>()
+            .map_or(DelegateReturn::Void, |d| delegate_return_from_invoke(d.invoke_method(), &type_args));
+    }
+    let Some(decl) = MetadataReader::find_by_name(iid_name) else {
+        return DelegateReturn::Void;
+    };
+    let lock = decl.read();
+    delegate_return_from_declaration(&*lock, lock.kind())
+}
+
+/// [`delegate_info_from_type_sig`] with the `Invoke` return: what a JS delegate needs to implement
+/// the delegate's exact signature.
+pub(crate) fn delegate_signature_from_type_sig(iid_name: &str) -> Option<(GUID, DelegateSignature)> {
+    let (guid, params) = delegate_info_from_type_sig(iid_name)?;
+    Some((guid, DelegateSignature::new(params, delegate_return_from_type_sig(iid_name))))
+}
+
+/// [`js_delegate_params_from_declaration`] with the `Invoke` return.
+pub(crate) fn delegate_signature_from_declaration(lock: &dyn Declaration, kind: DeclarationKind) -> Option<(GUID, DelegateSignature)> {
+    let (guid, params) = js_delegate_params_from_declaration(lock, kind)?;
+    Some((guid, DelegateSignature::new(params, delegate_return_from_declaration(lock, kind))))
+}
+
+/// [`delegate_info_from_add_method`] with the `Invoke` return (WinRT event handlers return nothing,
+/// so this is `Void` in practice).
+pub(crate) fn delegate_signature_from_add_method(add_method: &MethodDeclaration) -> Option<(GUID, DelegateSignature)> {
+    let param = add_method.parameters().first()?;
+    let iid_name = Signature::to_iid_string(param.metadata()?, &param.type_());
+    if iid_name.is_empty() {
+        return None;
+    }
+    delegate_signature_from_type_sig(&iid_name)
+}
+
 /// Derives the delegate (GUID, param_types) expected by a WinRT event's `add_*`
 /// method from the method's first parameter type.
 pub(crate) fn delegate_info_from_add_method(
@@ -8190,7 +8360,7 @@ pub(crate) fn handle_as_delegate(
         return;
     };
 
-    let Some((guid, param_types)) = delegate_info_from_type_sig(&type_name) else {
+    let Some((guid, signature)) = delegate_signature_from_type_sig(&type_name) else {
         throw_js_error(
             scope,
             &format!("{} is not a known WinRT delegate type", type_name),
@@ -8198,17 +8368,7 @@ pub(crate) fn handle_as_delegate(
         return;
     };
 
-    let data = Box::new(JsDelegateData {
-        js_func: v8::Global::new(scope, func),
-        param_types,
-    });
-    let delegate = Box::new(JsDelegate {
-        vtable: &JS_DELEGATE_VTBL as *const _,
-        ref_count: AtomicU32::new(1),
-        guid,
-        data: Box::into_raw(data),
-    });
-    let raw = Box::into_raw(delegate) as *mut c_void;
+    let raw = crate::new_js_delegate(v8::Global::new(scope, func), guid, signature);
 
     let result_obj = v8::Object::new(scope);
     if let Some(key) = v8::String::new(scope, "handle") {

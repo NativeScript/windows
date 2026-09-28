@@ -1305,19 +1305,8 @@ impl PropertyCall {
                             if let Some(ptr) = handle_ptr {
                                 Ok(NativeValue { pointer: ptr })
                             } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
-                                use std::sync::atomic::AtomicU32;
-                                let data = Box::new(crate::JsDelegateData {
-                                    js_func: v8::Global::new(scope, func),
-                                    param_types: delegate_param_types.clone(),
-                                });
-                                let delegate = Box::new(crate::JsDelegate {
-                                    vtable: &crate::JS_DELEGATE_VTBL as *const _,
-                                    ref_count: AtomicU32::new(1),
-                                    guid: *guid,
-                                    data: Box::into_raw(data),
-                                });
                                 Ok(NativeValue {
-                                    pointer: Box::into_raw(delegate) as *mut c_void,
+                                    pointer: crate::new_js_delegate(v8::Global::new(scope, func), *guid, delegate_param_types.clone()),
                                 })
                             } else {
                                 ffi_parse_pointer_arg(scope, value)

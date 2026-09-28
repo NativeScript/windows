@@ -55,8 +55,8 @@ pub(crate) enum PointerPlan {
     TypeName,
     /// Other struct parameter — serialize field-by-field (declaration pre-resolved).
     Struct(Arc<RwLock<dyn Declaration>>),
-    /// Delegate parameter — wrap a JS function with the precomputed (IID, invoke param types).
-    Delegate(GUID, Vec<NativeType>),
+    /// Delegate parameter — wrap a JS function with the precomputed (IID, Invoke signature).
+    Delegate(GUID, crate::delegate_invoke::DelegateSignature),
     /// Interface/class parameter — QI the argument to this IID.
     Interface(GUID),
     /// `IIterable<T>`, `IVectorView<T>` or `IVector<T>` — a JS array becomes a native collection;
@@ -104,10 +104,10 @@ impl PointerPlan {
                 let delegate_info = parameter.metadata().and_then(|meta| {
                     let raw_iid = Signature::to_iid_string(meta, &parameter.type_());
                     let iid_name = crate::property_call::substitute_type_vars(&raw_iid, type_args);
-                    crate::delegate_info_from_type_sig(&iid_name)
+                    crate::delegate_signature_from_type_sig(&iid_name)
                 });
                 match delegate_info {
-                    Some((guid, param_types)) => PointerPlan::Delegate(guid, param_types),
+                    Some((guid, signature)) => PointerPlan::Delegate(guid, signature),
                     None => PointerPlan::Plain,
                 }
             }
@@ -1110,19 +1110,8 @@ impl MethodCall {
                                     } else if let Ok(func) =
                                         v8::Local::<v8::Function>::try_from(value)
                                     {
-                                        use std::sync::atomic::AtomicU32;
-                                        let data = Box::new(crate::JsDelegateData {
-                                            js_func: v8::Global::new(scope, func),
-                                            param_types: delegate_param_types.clone(),
-                                        });
-                                        let delegate = Box::new(crate::JsDelegate {
-                                            vtable: &crate::JS_DELEGATE_VTBL as *const _,
-                                            ref_count: AtomicU32::new(1),
-                                            guid: *guid,
-                                            data: Box::into_raw(data),
-                                        });
                                         Ok(NativeValue {
-                                            pointer: Box::into_raw(delegate) as *mut c_void,
+                                            pointer: crate::new_js_delegate(v8::Global::new(scope, func), *guid, delegate_param_types.clone()),
                                         })
                                     } else {
                                         ffi_parse_pointer_arg(scope, value)
