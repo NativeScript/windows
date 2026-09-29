@@ -851,10 +851,33 @@ pub fn box_as_typed_value(env: &Env, arg: &JsUnknown, type_name: &str) -> Option
     }
 }
 
-/// Alias used by method_call / property_call for IReference<T> params.
-#[inline]
-pub fn box_as_ireference(env: &Env, arg: &JsUnknown, inner_type: &str) -> Option<NativeValue> {
-    box_as_typed_value(env, arg, inner_type)
+/// Marshal a JS value for an `IReference<T>` parameter. See `crate::value::box_as_ireference`.
+pub fn box_as_ireference(
+    env: &Env,
+    arg: &JsUnknown,
+    inner_type: &str,
+    iid: &GUID,
+) -> Option<(NativeValue, Option<IUnknown>)> {
+    let vt = arg.get_type().ok()?;
+    if vt == ValueType::Null || vt == ValueType::Undefined {
+        return Some((
+            NativeValue {
+                pointer: std::ptr::null_mut(),
+            },
+            None,
+        ));
+    }
+    let wrapped = if vt == ValueType::Object || vt == ValueType::Function {
+        let obj: JsObject = unsafe { arg.cast() };
+        try_get_external_handle(env, &obj).filter(|ptr| !ptr.is_null())
+    } else {
+        None
+    };
+    let boxed = match wrapped {
+        Some(ptr) => (*ManuallyDrop::new(unsafe { IUnknown::from_raw(ptr) })).clone(),
+        None => unsafe { IUnknown::from_raw(box_as_typed_value(env, arg, inner_type)?.pointer) },
+    };
+    Some(crate::value::query_reference(boxed, iid))
 }
 
 // 

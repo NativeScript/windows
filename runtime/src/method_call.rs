@@ -49,8 +49,9 @@ pub(crate) enum PointerPlan {
     /// Plain pointer parse: non-WinRT signature, unresolvable type, or a resolvable kind
     /// that takes no special handling.
     Plain,
-    /// `IReference<T>` parameter — box primitives via the typed Create* call (inner type name).
-    IReference(String),
+    /// `IReference<T>` parameter — box primitives via the typed Create* call (inner type name)
+    /// and pass the `IReference<T>` interface (IID).
+    IReference(String, GUID),
     /// `Windows.UI.Xaml.Interop.TypeName` struct — synthesize {Name, Kind} from a class ctor.
     TypeName,
     /// Other struct parameter — serialize field-by-field (declaration pre-resolved).
@@ -78,7 +79,15 @@ impl PointerPlan {
         typename_special: bool,
     ) -> Self {
         if let Some(inner) = crate::helpers::ireference_inner_type(signature) {
-            return PointerPlan::IReference(inner.to_string());
+            let name = signature.trim();
+            let name = name.strip_prefix("ByRef ").unwrap_or(name);
+            let iid = GenericInstanceIdBuilder::generate_id_from_name(
+                &crate::property_call::substitute_type_vars(name, type_args),
+            );
+            return PointerPlan::IReference(
+                crate::property_call::substitute_type_vars(inner, type_args),
+                iid,
+            );
         }
         if !signature.contains('.') {
             return PointerPlan::Plain;
@@ -993,11 +1002,13 @@ impl MethodCall {
                         PointerPlan::Plain => ffi_parse_pointer_arg(scope, value),
                         // IReference<T> parameters: box JS primitives with the correct Create* call
                         // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
-                        PointerPlan::IReference(inner) => {
-                            if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
-                                Ok(nv)
-                            } else {
-                                ffi_parse_pointer_arg(scope, value)
+                        PointerPlan::IReference(inner, iid) => {
+                            match crate::value::box_as_ireference(scope, value, inner, iid) {
+                                Some((nv, guard)) => {
+                                    queried_interfaces.extend(guard);
+                                    Ok(nv)
+                                }
+                                None => ffi_parse_pointer_arg(scope, value),
                             }
                         }
                         PointerPlan::TypeName => {
@@ -1625,12 +1636,14 @@ impl MethodCall {
                     // resolved once into the per-parameter plan when the static info was built.
                     match &self.si.param_plans[i] {
                         PointerPlan::Plain => nv::napi_parse_pointer(env, &value),
-                        PointerPlan::IReference(inner) => {
+                        PointerPlan::IReference(inner, iid) => {
                             // IReference<T>: box primitives with the correct typed Create* call.
-                            if let Some(nvv) = nv::box_as_ireference(env, &value, inner) {
-                                Ok(nvv)
-                            } else {
-                                nv::napi_parse_pointer(env, &value)
+                            match nv::box_as_ireference(env, &value, inner, iid) {
+                                Some((nvv, guard)) => {
+                                    queried_interfaces.extend(guard);
+                                    Ok(nvv)
+                                }
+                                None => nv::napi_parse_pointer(env, &value),
                             }
                         }
                         PointerPlan::TypeName => {

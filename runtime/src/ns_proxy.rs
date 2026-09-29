@@ -698,6 +698,11 @@ pub(crate) fn handle_named_property_getter(
                                         .return_kind()
                                     {
                                         ReturnKind::Void => None,
+                                        kind @ ReturnKind::Reference { .. } => {
+                                            Some(crate::return_value_from_kind(
+                                                kind, result, None, scope,
+                                            ))
+                                        }
                                         ReturnKind::Guid => {
                                             let obj = unsafe {
                                                 crate::guid_ptr_to_js_object(result, scope)
@@ -1023,6 +1028,9 @@ fn instance_method_dispatch(
 
     let return_value_opt: Option<Local<v8::Value>> = match method.return_kind() {
         ReturnKind::Void => None,
+        kind @ ReturnKind::Reference { .. } => {
+            Some(crate::return_value_from_kind(kind, result, None, scope))
+        }
         ReturnKind::Guid => {
             let obj = unsafe { crate::guid_ptr_to_js_object(result, scope) };
             Some(obj.into())
@@ -1308,6 +1316,9 @@ pub(crate) fn handle_instance_property_getter(
 
         let ret_val: Option<Local<v8::Value>> = match property_call.return_kind() {
             ReturnKind::Void => None,
+            kind @ ReturnKind::Reference { .. } => {
+                Some(crate::return_value_from_kind(kind, result, None, scope))
+            }
             ReturnKind::Guid => {
                 let obj = unsafe { crate::guid_ptr_to_js_object(result, scope) };
                 Some(obj.into())
@@ -2120,6 +2131,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         } else if !method.is_void() {
                             let ret_v: Option<Local<v8::Value>> = match method.return_kind() {
                                 ReturnKind::Void => None,
+                                kind @ ReturnKind::Reference { .. } => {
+                                    Some(crate::return_value_from_kind(kind, result, None, scope))
+                                }
                                 ReturnKind::Guid => {
                                     let obj = unsafe { guid_ptr_to_js_object(result, scope) };
                                     Some(obj.into())
@@ -2268,6 +2282,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             } else if !method.is_void() {
                                 let ret_v: Option<Local<v8::Value>> = match method.return_kind() {
                                     ReturnKind::Void => None,
+                                    kind @ ReturnKind::Reference { .. } => Some(
+                                        crate::return_value_from_kind(kind, result, None, scope),
+                                    ),
                                     ReturnKind::Guid => {
                                         let obj = unsafe { guid_ptr_to_js_object(result, scope) };
                                         Some(obj.into())

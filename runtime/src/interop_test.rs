@@ -2577,3 +2577,34 @@ fn js_delegate_without_value_types_keeps_the_shared_invoke() {
     assert!(std::ptr::eq(unsafe { (*delegate).vtable }, &crate::JS_DELEGATE_VTBL));
     unsafe { crate::js_delegate_release(delegate) };
 }
+
+/// `IReference<T>` parameters take a JS number or null, and `IReference<T>` results come
+/// back as the number or null.
+#[test]
+fn ireference_parameters_and_results() {
+    run_js_assert(
+        "ireference_parameters_and_results",
+        r#"
+            const formatter = new Windows.Globalization.NumberFormatting.DecimalFormatter();
+            const parsed = formatter.ParseDouble('1.5');
+            if (parsed !== 1.5) throw new Error(`ParseDouble('1.5') returned ${parsed}`);
+            const invalid = formatter.ParseDouble('not a number');
+            if (invalid !== null) throw new Error(`ParseDouble of junk returned ${invalid}`);
+            const int = formatter.ParseInt('42');
+            if (int !== 42) throw new Error(`ParseInt('42') returned ${int}`);
+
+            const date = new Windows.ApplicationModel.Contacts.ContactDate();
+            if (date.Day !== null) throw new Error(`unset Day was ${date.Day}`);
+            date.Day = 12;
+            date.Year = -5;
+            if (date.Day !== 12) throw new Error(`Day was ${date.Day}`);
+            if (date.Year !== -5) throw new Error(`Year was ${date.Year}`);
+            date.Day = null;
+            if (date.Day !== null) throw new Error(`cleared Day was ${date.Day}`);
+            date.Year = undefined;
+            if (date.Year !== null) throw new Error(`cleared Year was ${date.Year}`);
+            date.Month = NSWinRT.interop.reference('UInt32', 7);
+            if (date.Month !== 7) throw new Error(`boxed Month was ${date.Month}`);
+        "#,
+    );
+}

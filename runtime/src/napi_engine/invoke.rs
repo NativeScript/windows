@@ -103,6 +103,19 @@ pub(crate) fn convert_call_result(
             .map_err(|e| generic_error(e.to_string()))?;
             return Ok(nv::as_unknown(env, proxy));
         }
+        ReturnKind::Reference { value, size } => {
+            let inner = crate::helpers::ireference_inner_type(return_type).unwrap_or(return_type);
+            return match unsafe { crate::value::read_reference_value(result, *size) } {
+                Some(mut buf) => {
+                    let ptr = buf.as_mut_ptr() as *mut c_void;
+                    convert_call_result(env, value, false, inner, hr, ptr)
+                }
+                None => {
+                    let n = env.get_null().map_err(|e| type_error(e.to_string()))?;
+                    Ok(nv::as_unknown(env, n))
+                }
+            };
+        }
         ReturnKind::Primitive(nt) => match nt {
             NativeType::Pointer
             | NativeType::Buffer

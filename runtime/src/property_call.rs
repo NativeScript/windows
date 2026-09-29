@@ -1259,11 +1259,13 @@ impl PropertyCall {
                         }
                         // IReference<T> parameters: box JS primitives with the correct Create* call
                         // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
-                        PointerPlan::IReference(inner) => {
-                            if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
-                                Ok(nv)
-                            } else {
-                                ffi_parse_pointer_arg(scope, value)
+                        PointerPlan::IReference(inner, iid) => {
+                            match crate::value::box_as_ireference(scope, value, inner, iid) {
+                                Some((nv, guard)) => {
+                                    queried_interfaces.extend(guard);
+                                    Ok(nv)
+                                }
+                                None => ffi_parse_pointer_arg(scope, value),
                             }
                         }
                         PointerPlan::Struct(declaration) => {
@@ -1651,11 +1653,13 @@ impl PropertyCall {
                         PointerPlan::Plain | PointerPlan::TypeName => {
                             nv::napi_parse_pointer(env, &value)
                         }
-                        PointerPlan::IReference(inner) => {
-                            if let Some(nvv) = nv::box_as_ireference(env, &value, inner) {
-                                Ok(nvv)
-                            } else {
-                                nv::napi_parse_pointer(env, &value)
+                        PointerPlan::IReference(inner, iid) => {
+                            match nv::box_as_ireference(env, &value, inner, iid) {
+                                Some((nvv, guard)) => {
+                                    queried_interfaces.extend(guard);
+                                    Ok(nvv)
+                                }
+                                None => nv::napi_parse_pointer(env, &value),
                             }
                         }
                         PointerPlan::Struct(declaration) => {
