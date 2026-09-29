@@ -351,7 +351,7 @@ public static partial class Bridge
             : DispatchResult.Handle(id, typeName);
     }
 
-    private static bool IsAwaitable(object value, Type t)
+    private static bool IsAwaitable(object? value, Type t)
     {
         if (value is Task || value is ValueTask) return true;
         if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(ValueTask<>)) return true;
