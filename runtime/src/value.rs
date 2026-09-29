@@ -1084,15 +1084,77 @@ pub fn box_as_typed_value(
     }
 }
 
-/// Keep the old name as an alias — used by method_call / property_call for IReference<T> params.
+/// Marshal a JS value for an `IReference<T>` parameter: `null`/`undefined` is a null reference;
+/// anything else is boxed as `inner_type` (or taken from its wrapper) and queried for `iid`.
+/// The returned guard keeps the reference alive for the call.
 #[cfg(feature = "classic")]
-#[inline]
 pub fn box_as_ireference(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
     inner_type: &str,
-) -> Option<NativeValue> {
-    box_as_typed_value(scope, arg, inner_type)
+    iid: &GUID,
+) -> Option<(NativeValue, Option<IUnknown>)> {
+    if arg.is_null_or_undefined() {
+        return Some((
+            NativeValue {
+                pointer: std::ptr::null_mut(),
+            },
+            None,
+        ));
+    }
+    let wrapped = if arg.is_object() {
+        arg.to_object(scope)
+            .and_then(|obj| try_get_external_handle(scope, obj))
+            .filter(|ptr| !ptr.is_null())
+    } else {
+        None
+    };
+    let boxed = match wrapped {
+        Some(ptr) => (*ManuallyDrop::new(unsafe { IUnknown::from_raw(ptr) })).clone(),
+        None => unsafe { IUnknown::from_raw(box_as_typed_value(scope, arg, inner_type)?.pointer) },
+    };
+    Some(query_reference(boxed, iid))
+}
+
+/// QI an owned boxed value for an `IReference<T>` IID, falling back to the value itself.
+pub(crate) fn query_reference(
+    boxed: windows::core::IUnknown,
+    iid: &windows::core::GUID,
+) -> (NativeValue, Option<windows::core::IUnknown>) {
+    use windows::core::Interface;
+    let mut queried: *mut c_void = std::ptr::null_mut();
+    if unsafe { boxed.query(iid, &mut queried) }.is_ok() && !queried.is_null() {
+        let queried = unsafe { windows::core::IUnknown::from_raw(queried) };
+        return (
+            NativeValue {
+                pointer: queried.as_raw(),
+            },
+            Some(queried),
+        );
+    }
+    (
+        NativeValue {
+            pointer: boxed.as_raw(),
+        },
+        Some(boxed),
+    )
+}
+
+/// Read an `IReference<T>` return through its `get_Value` into a buffer of at least `size`
+/// bytes, releasing the reference. `None` for a null reference or a failed read.
+pub(crate) unsafe fn read_reference_value(reference: *mut c_void, size: usize) -> Option<Vec<u64>> {
+    use windows::core::Interface;
+    if reference.is_null() {
+        return None;
+    }
+    let reference = windows::core::IUnknown::from_raw(reference);
+    type GetValue = unsafe extern "system" fn(*mut c_void, *mut c_void) -> windows::core::HRESULT;
+    let vtable = *(reference.as_raw() as *const *const usize);
+    let get_value: GetValue = std::mem::transmute(*vtable.add(6));
+    let mut buf = vec![0u64; size.div_ceil(8).max(2)];
+    get_value(reference.as_raw(), buf.as_mut_ptr() as *mut c_void)
+        .is_ok()
+        .then_some(buf)
 }
 
 /// Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into a GUID.

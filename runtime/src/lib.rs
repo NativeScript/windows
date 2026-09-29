@@ -992,11 +992,43 @@ pub(crate) enum ReturnKind {
     },
     /// Return type is `Object`/IInspectable: concrete type only known at runtime.
     DynamicObject,
+    /// `IReference<T>` return: `get_Value` is read into a `size`-byte buffer and converted as
+    /// `value`; a null reference is JS `null`.
+    Reference {
+        value: Box<ReturnKind>,
+        size: usize,
+    },
+}
+
+fn classify_reference_return(inner: &str) -> Option<ReturnKind> {
+    use crate::value::NativeType;
+    let value = classify_return(inner, false);
+    let size = match &value {
+        ReturnKind::Primitive(
+            NativeType::Void
+            | NativeType::Pointer
+            | NativeType::Buffer
+            | NativeType::Function
+            | NativeType::Struct(_),
+        ) => return None,
+        ReturnKind::Primitive(nt) => nt.size(),
+        ReturnKind::Struct(_) => crate::helpers::struct_native_type_for_sig(inner)?.size(),
+        _ => return None,
+    };
+    Some(ReturnKind::Reference {
+        value: Box::new(value),
+        size,
+    })
 }
 
 pub(crate) fn classify_return(return_type: &str, is_void: bool) -> ReturnKind {
     if is_void {
         return ReturnKind::Void;
+    }
+    if let Some(kind) =
+        crate::helpers::ireference_inner_type(return_type).and_then(classify_reference_return)
+    {
+        return kind;
     }
     if return_type == "Guid" {
         return ReturnKind::Guid;
@@ -1092,6 +1124,14 @@ pub(crate) fn return_value_from_kind<'a>(
                     Some(v) => v,
                     None => v8::External::new(scope, result).into(),
                 }
+            }
+        }
+        ReturnKind::Reference { value, size } => {
+            match unsafe { crate::value::read_reference_value(result, *size) } {
+                Some(mut buf) => {
+                    return_value_from_kind(value, buf.as_mut_ptr() as *mut c_void, None, scope)
+                }
+                None => v8::null(scope).into(),
             }
         }
         ReturnKind::Primitive(nt) => match nt {
