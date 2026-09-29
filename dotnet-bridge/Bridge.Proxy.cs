@@ -421,7 +421,6 @@ public static partial class Bridge
             // look up or dynamically emit a proxy for the correct base class.
             string? resolveFrom = typeName;
             if (!string.IsNullOrEmpty(assemblyName)
-                && typeName != null
                 && typeName.StartsWith("com.tns.gen.winrt.", StringComparison.Ordinal))
             {
                 resolveFrom = assemblyName;

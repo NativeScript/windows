@@ -115,7 +115,7 @@ public static partial class Bridge
                             var simple = Path.GetFileNameWithoutExtension(file);
                             if (string.IsNullOrEmpty(simple)) continue;
 
-                            Assembly asm = AppDomain.CurrentDomain.GetAssemblies()
+                            Assembly? asm = AppDomain.CurrentDomain.GetAssemblies()
                                 .FirstOrDefault(a => string.Equals(a.GetName().Name, simple, StringComparison.OrdinalIgnoreCase));
                             if (asm is null)
                             {
@@ -540,7 +540,7 @@ public static partial class Bridge
                 {
                     var handlerType = ev.EventHandlerType;
                     var method = typeof(Bridge).GetMethod(nameof(CoreApplicationUnhandledErrorHandler), BindingFlags.NonPublic | BindingFlags.Static);
-                    if (method != null)
+                    if (handlerType != null && method != null)
                     {
                         var del = Delegate.CreateDelegate(handlerType, method);
                         ev.AddEventHandler(null, del);
@@ -633,7 +633,7 @@ public static partial class Bridge
         try
         {
             var iidLocal = s_iidIInspectable;
-            var hr = Marshal.QueryInterface(iunknown, ref iidLocal, out var inspectable);
+            var hr = Marshal.QueryInterface(iunknown, in iidLocal, out var inspectable);
             if (hr == 0 && inspectable != IntPtr.Zero)
             {
                 Marshal.Release(iunknown);

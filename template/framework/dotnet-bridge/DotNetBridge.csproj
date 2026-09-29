@@ -16,6 +16,14 @@
          host process is already running on net10. LatestMajor accepts any version >= 9. -->
     <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- The bridge only runs inside a Windows host, but the TFM stays plain net9.0 so the
+         net9.0 test/benchmark projects can reference it. Declaring the platform here keeps
+         CA1416 quiet for the Marshal COM APIs. Skipped when an OS-specific TFM already emits it. -->
+    <AssemblyAttribute Include="System.Runtime.Versioning.SupportedOSPlatformAttribute" Condition="'$(TargetPlatformIdentifier)' == ''">
+      <_Parameter1>windows</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
   <Target Name="WriteDotNetToolDone" AfterTargets="Publish">
     <PropertyGroup>
       <DotNetToolDoneFile>$(MSBuildProjectDirectory)\publish\.dotnet_tool_done</DotNetToolDoneFile>
