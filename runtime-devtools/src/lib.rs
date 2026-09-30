@@ -26,7 +26,7 @@ impl Default for DevtoolsServerConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 42000,
+            port: 43000,
         }
     }
 }
@@ -229,7 +229,10 @@ impl ChannelImpl for DevtoolsChannel {
 // ─── Client impl (breakpoint pause loop) ─────────────────────────────────────
 
 struct DevtoolsClient {
+    isolate: *mut v8::Isolate,
+    context: v8::Global<v8::Context>,
     paused: Arc<AtomicBool>,
+    debugger_released: Arc<AtomicBool>,
     inbound_rx: Arc<Mutex<Receiver<String>>>,
     session_ptr: Arc<AtomicUsize>,
 }
@@ -259,6 +262,20 @@ impl V8InspectorClientImpl for DevtoolsClient {
     fn quit_message_loop_on_pause(&self) {
         self.paused.store(false, Ordering::Release);
     }
+
+    // Default context for CDP calls sent without a `contextId`.
+    fn ensure_default_context_in_group(&self, _ctx_group_id: i32) -> Option<v8::Local<'_, v8::Context>> {
+        // SAFETY: V8 calls this inside its HandleScope; CallbackScope adds none.
+        let isolate = unsafe { &mut *self.isolate };
+        v8::callback_scope!(unsafe scope, isolate);
+        let context = v8::Local::new(scope, &self.context);
+        Some(unsafe { std::mem::transmute::<v8::Local<'_, v8::Context>, v8::Local<'_, v8::Context>>(context) })
+    }
+
+    // Sent by the frontend once its startup handshake is done.
+    fn run_if_waiting_for_debugger(&self, _ctx_group_id: i32) {
+        self.debugger_released.store(true, Ordering::Release);
+    }
 }
 
 // ─── DevtoolsServer ───────────────────────────────────────────────────────────
@@ -269,9 +286,10 @@ pub struct DevtoolsServer {
     session_ptr: Arc<AtomicUsize>,
     outbound_tx: SyncSender<String>,
     message_dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
-    // Declare inspector before session so session is dropped first (LIFO field drops).
+    debugger_released: Arc<AtomicBool>,
+    // Fields drop in order: the session must drop before its inspector.
+    session: Box<V8InspectorSession>,
     _inspector: V8Inspector,
-    _session: Box<V8InspectorSession>,
 }
 
 impl DevtoolsServer {
@@ -304,10 +322,14 @@ impl DevtoolsServer {
         let inbound_rx = Arc::new(Mutex::new(inbound_rx));
 
         let paused = Arc::new(AtomicBool::new(false));
+        let debugger_released = Arc::new(AtomicBool::new(false));
         let session_ptr = Arc::new(AtomicUsize::new(0));
 
         let client = V8InspectorClient::new(Box::new(DevtoolsClient {
+            isolate: isolate as *mut v8::Isolate,
+            context: global_context.clone(),
             paused,
+            debugger_released: Arc::clone(&debugger_released),
             inbound_rx: Arc::clone(&inbound_rx),
             session_ptr: Arc::clone(&session_ptr),
         }));
@@ -355,8 +377,9 @@ impl DevtoolsServer {
             session_ptr,
             outbound_tx,
             message_dispatcher,
+            debugger_released,
+            session,
             _inspector: inspector,
-            _session: session,
         })
     }
 
@@ -398,6 +421,25 @@ impl DevtoolsServer {
 
     pub fn endpoint(&self) -> &DevtoolsEndpoint {
         &self.endpoint
+    }
+
+    /// Pumps CDP until a frontend attaches, then pauses; `false` on timeout.
+    pub fn wait_for_debugger(&mut self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.pump_messages();
+            if self.debugger_released.load(Ordering::Acquire) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let reason = b"Break on start";
+        self.session
+            .schedule_pause_on_next_statement(StringView::from(&reason[..]), StringView::empty());
+        true
     }
 
     /// Dispatch any pending CDP messages that arrived from a connected DevTools
@@ -563,12 +605,12 @@ mod tests {
     fn default_config() {
         let cfg = DevtoolsServerConfig::default();
         assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 42000);
+        assert_eq!(cfg.port, 43000);
     }
 
     #[test]
     fn version_json_is_valid() {
-        let ws = "ws://127.0.0.1:42000/devtools/page/runtime";
+        let ws = "ws://127.0.0.1:43000/devtools/page/runtime";
         let v: serde_json::Value = serde_json::from_str(&build_version_json(ws)).unwrap();
         assert!(v.get("Browser").is_some());
         assert!(v.get("Protocol-Version").is_some());
@@ -580,7 +622,7 @@ mod tests {
 
     #[test]
     fn list_json_contains_ws_url() {
-        let ws = "ws://127.0.0.1:42000/devtools/page/runtime";
+        let ws = "ws://127.0.0.1:43000/devtools/page/runtime";
         let v: serde_json::Value = serde_json::from_str(&build_list_json(ws)).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);

@@ -408,6 +408,23 @@ pub extern "C" fn runtime_devtools_pump(_runtime: i64) {
     });
 }
 
+/// Blocks until a DevTools frontend attaches, then pauses on the next statement.
+#[cfg(feature = "devtools")]
+#[no_mangle]
+pub extern "C" fn runtime_devtools_wait_for_debugger(_runtime: i64, timeout_ms: u32) -> bool {
+    std::panic::catch_unwind(|| {
+        DEVTOOLS.with(|d| {
+            if let Ok(mut guard) = d.try_borrow_mut() {
+                if let Some(s) = guard.as_mut() {
+                    return s.wait_for_debugger(std::time::Duration::from_millis(timeout_ms as u64));
+                }
+            }
+            false
+        })
+    })
+    .unwrap_or(false)
+}
+
 /// Drain the JS timer queue on the calling thread.
 ///
 /// Must be called regularly on the V8/UI thread so that `setTimeout` /
