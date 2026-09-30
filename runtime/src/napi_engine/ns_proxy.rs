@@ -581,7 +581,7 @@ fn instance_type_name(env: &Env, inst: &JsUnknown) -> Option<String> {
 /// Resolve `full_name` and produce the right JS value: nested namespace proxy, class ctor
 /// proxy, or undefined for unknown/unported kinds.
 fn resolve_member(env: &Env, full_name: &str) -> napi::Result<JsUnknown> {
-    let Some(declaration) = MetadataReader::find_by_name(full_name) else {
+    let Some(declaration) = MetadataReader::find_by_name(full_name).filter(MetadataReader::visible_to_js) else {
         return undefined_js(env);
     };
     let kind = declaration.read().kind();
@@ -648,7 +648,9 @@ pub fn create_namespace_proxy(env: &Env, full_name: &str) -> napi::Result<JsObje
         let Some(prop) = trap_prop(&ctx)? else {
             return Ok(false);
         };
-        Ok(MetadataReader::find_by_name(&format!("{}.{}", has_ns, prop)).is_some())
+        Ok(MetadataReader::find_by_name(&format!("{}.{}", has_ns, prop))
+            .filter(MetadataReader::visible_to_js)
+            .is_some())
     })?;
     handler.set_named_property("has", has_fn)?;
 

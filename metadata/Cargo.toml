@@ -12,6 +12,7 @@ ahash = "0.8"
 parking_lot = "0.12"
 dyn-clone = "1.0"
 sha1 = "0.10"
+metadata-filter = { path = "../metadata-filter" }
 
 [dependencies.windows]
 workspace = true

@@ -9,7 +9,7 @@
 //! Unlike the runtime binding generator, SBG outputs are compiled BEFORE
 //! the app is finalized, ensuring all proxy classes are available at link time.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,10 @@ pub struct SbgConfig {
     /// Optional list of directories with developer-authored C# sources that should be
     /// compiled into the generated proxy assembly.
     pub app_cs_sources_dirs: Vec<PathBuf>,
+
+    /// The app's native API filter (`SBG_WHITELIST` / `SBG_BLACKLIST`): extensions of a base it
+    /// leaves out are skipped, since JS can't reach that base at run time.
+    pub filter: metadata_filter::MetadataFilter,
 }
 
 impl Default for SbgConfig {
@@ -59,6 +63,7 @@ impl Default for SbgConfig {
             target_platform_min_version: None,
             use_uwp: true,
             app_cs_sources_dirs: Vec::new(),
+            filter: metadata_filter::MetadataFilter::default(),
         }
     }
 }
@@ -90,7 +95,7 @@ impl StaticBindingGenerator {
             extensions_metadata.len()
         );
 
-        let extensions_metadata = retain_extendable(extensions_metadata);
+        let extensions_metadata = retain_extendable(extensions_metadata, &self.config.filter);
 
         // Proxies from an earlier run whose extension is gone (or now skipped) must not stay in
         // the build: the app compiles whatever is in the directory.
@@ -337,6 +342,10 @@ fn main() -> Result<()> {
             "" | "false" | "0" | "no"
         );
     }
+    let filter_file = |name: &str| std::env::var_os(name).filter(|path| !path.is_empty()).map(PathBuf::from);
+    let (whitelist, blacklist) = (filter_file("SBG_WHITELIST"), filter_file("SBG_BLACKLIST"));
+    config.filter = metadata_filter::MetadataFilter::from_files(whitelist.as_deref(), blacklist.as_deref())
+        .context("reading the metadata filter")?;
     if let Ok(app_sources) = std::env::var("SBG_APP_CS_SOURCES_DIR") {
         let parsed = parse_source_dirs_from_env(app_sources.as_str());
         if !parsed.is_empty() {
@@ -369,50 +378,82 @@ fn remove_generated_proxies(project_dir: &Path) {
     }
 }
 
-/// Root namespaces of types a JS extension can derive from without WinRT metadata sbg can read
-/// (the Windows App SDK's `Microsoft.UI.*` lives in a framework package, not system metadata).
-const EXTENDABLE_ROOTS: &[&str] = &["Windows", "Microsoft", "System", "NativeScript"];
-
-fn is_identifier(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 /// Whether an auto-captured extension's base can be a real WinRT/.NET type.
 fn is_extendable_base(base: &str) -> bool {
-    let generic_root = base.split('`').next().unwrap_or(base);
-    let segments: Vec<&str> = generic_root.split('.').collect();
-    if segments.len() < 2 || !segments.iter().all(|s| is_identifier(s)) {
-        return false;
-    }
-    EXTENDABLE_ROOTS.contains(&segments[0]) || signature_resolver::is_known_type(base)
+    metadata_filter::plausible_base(base)
+        || (metadata_filter::is_dotted_identifier(base) && signature_resolver::is_known_type(base))
 }
 
 /// The bundle scan (dotnet-tool) is syntactic: any class extending a dotted name looks like an
 /// extension, including ordinary classes of bundled libraries (minified `e.Foo`, `Ua.$`). A proxy
 /// for such a "base" cannot compile, so auto-captured ones are dropped; explicitly named ones
 /// (`@CSharpProxy`) are kept as asked.
-fn retain_extendable(extensions: Vec<metadata_reader::ExtensionMetadata>) -> Vec<metadata_reader::ExtensionMetadata> {
-    let (kept, dropped): (Vec<_>, Vec<_>) = extensions.into_iter().partition(|ext| {
-        let base = ext.base_class.as_deref().map(str::trim).unwrap_or("");
-        !ext.is_auto_generated_name || base.is_empty() || base == "object" || base == "Object" || is_extendable_base(base)
+fn retain_extendable(
+    extensions: Vec<metadata_reader::ExtensionMetadata>,
+    filter: &metadata_filter::MetadataFilter,
+) -> Vec<metadata_reader::ExtensionMetadata> {
+    let base_of = |ext: &metadata_reader::ExtensionMetadata| ext.base_class.as_deref().map(str::trim).unwrap_or("").to_owned();
+    let (kept, not_winrt): (Vec<_>, Vec<_>) = extensions.into_iter().partition(|ext| {
+        let base = base_of(ext);
+        !ext.is_auto_generated_name || base.is_empty() || base == "object" || base == "Object" || is_extendable_base(&base)
     });
-    if !dropped.is_empty() {
-        let names: Vec<&str> = dropped.iter().filter_map(|e| e.base_class.as_deref()).take(8).collect();
-        println!(
-            "[SBG] Skipped {} captured extension(s) whose base is not a WinRT type ({}{})",
-            dropped.len(),
-            names.join(", "),
-            if dropped.len() > names.len() { ", ..." } else { "" }
-        );
-    }
+    report_skipped(&not_winrt, "whose base is not a WinRT type");
+    let (kept, filtered): (Vec<_>, Vec<_>) = kept.into_iter().partition(|ext| {
+        let base = base_of(ext);
+        base.is_empty() || base == "object" || base == "Object" || filter.allows(&base)
+    });
+    report_skipped(&filtered, "whose base the app's metadata filter leaves out");
     kept
+}
+
+fn report_skipped(skipped: &[metadata_reader::ExtensionMetadata], why: &str) {
+    if skipped.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = skipped.iter().filter_map(|e| e.base_class.as_deref()).take(8).collect();
+    println!(
+        "[SBG] Skipped {} captured extension(s) {why} ({}{})",
+        skipped.len(),
+        names.join(", "),
+        if skipped.len() > names.len() { ", ..." } else { "" }
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_extendable_base;
+    use super::{is_extendable_base, retain_extendable};
+    use crate::metadata_reader::ExtensionMetadata;
+    use metadata_filter::{MetadataFilter, PatternList};
+
+    fn extension(base: &str, auto: bool) -> ExtensionMetadata {
+        ExtensionMetadata {
+            type_name: None,
+            class_name: format!("Ext_{base}"),
+            namespace: None,
+            base_class: Some(base.to_owned()),
+            methods: Vec::new(),
+            properties: Vec::new(),
+            interfaces: Vec::new(),
+            is_auto_generated_name: auto,
+        }
+    }
+
+    #[test]
+    fn the_apps_filter_drops_extensions_of_bases_it_leaves_out() {
+        let filter = MetadataFilter::new(None, PatternList::parse("Microsoft.UI.Xaml.Controls:ListView"));
+        let kept = retain_extendable(
+            vec![
+                extension("Microsoft.UI.Xaml.Controls.Button", true),
+                extension("Microsoft.UI.Xaml.Controls.ListView", true),
+                // Named (@CSharpProxy) but of a base JS can't reach.
+                extension("Microsoft.UI.Xaml.Controls.ListView", false),
+                extension("Phaser.Utils", true),
+            ],
+            &filter,
+        );
+        let bases: Vec<_> = kept.iter().filter_map(|e| e.base_class.as_deref()).collect();
+        assert_eq!(bases, ["Microsoft.UI.Xaml.Controls.Button"]);
+    }
 
     #[test]
     fn winrt_bases_are_extendable() {

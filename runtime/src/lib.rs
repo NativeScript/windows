@@ -7477,7 +7477,9 @@ fn handle_named_property_getter(
                 if let Some(dec) = dec {
                     let full_name = format!("{}.{}", dec.full_name(), name.as_str());
 
-                    if let Some(dec) = MetadataReader::find_by_name_or_generic(full_name.as_str()) {
+                    if let Some(dec) = MetadataReader::find_by_name_or_generic(full_name.as_str())
+                        .filter(MetadataReader::visible_to_js)
+                    {
                         let declaration = Arc::clone(&dec);
                         let lock = dec.read();
 
@@ -8618,6 +8620,7 @@ impl Runtime {
                 .and_then(|p| p.parent().map(|p| p.to_path_buf())),
             Some(std::path::PathBuf::from(app_root)),
         ];
+        metadata::meta_data_reader::MetadataReader::load_filter(scan_dirs.iter().flatten().cloned());
         for dir in scan_dirs.into_iter().flatten() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;

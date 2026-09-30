@@ -4,7 +4,9 @@ use glob::glob;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use metadata_filter::MetadataFilter;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
@@ -33,6 +35,15 @@ struct Args {
 
     #[arg(long)]
     sbg_output: Option<String>,
+
+    /// The app's metadata filter (`whitelist.mdg`), by default next to the app root's project
+    /// directory, where the CLI writes it.
+    #[arg(long)]
+    whitelist: Option<String>,
+
+    /// The app's metadata filter (`blacklist.mdg`), found like `--whitelist`.
+    #[arg(long)]
+    blacklist: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -67,10 +78,43 @@ struct DetectedExtension {
     interfaces: Vec<String>,
 }
 
+/// A dotted name a JS class could extend a WinRT type through. Syntactic, so a bundled library's
+/// classes (`u.MaterialDefines`) pass too; sbg, with WinRT metadata, has the last word. Minified
+/// names that can't be types at all (`Ua.$`) don't.
 fn is_winrt_type(s: &str) -> bool {
-    s.contains('.')
+    metadata_filter::is_dotted_identifier(s)
         && s.split('.')
             .any(|seg| seg.starts_with(|c: char| c.is_uppercase()))
+}
+
+/// Drops extensions of a base the app's filter leaves out (JS can't reach it at run time), warning
+/// about the ones that were surely meant, and says whether any left is surely real: named
+/// (`@CSharpProxy`, `@NativeClass`, `.extend("Name", …)`) or of a base under a root JS extends
+/// native types from. Only then does the build need the .NET bridge for them.
+fn select_extensions(extensions: Vec<DetectedExtension>, filter: &MetadataFilter) -> (Vec<DetectedExtension>, bool) {
+    let surely_real = |ext: &DetectedExtension| ext.proxy_name.is_some() || metadata_filter::plausible_base(&ext.base_type);
+    let (kept, filtered): (Vec<_>, Vec<_>) = extensions.into_iter().partition(|ext| filter.allows(&ext.base_type));
+    for ext in filtered.iter().filter(|ext| surely_real(ext)) {
+        eprintln!(
+            "[dotnet-tool] Skipped an extension of {}: {}",
+            ext.base_type,
+            filter.check(&ext.base_type)
+        );
+    }
+    let any_real = kept.iter().any(surely_real);
+    (kept, any_real)
+}
+
+/// `path`, or `name` in the directory above the app root's (`platforms/windows`), if there.
+fn filter_file(path: Option<&str>, app_root: &Path, name: &str) -> Option<PathBuf> {
+    match path {
+        Some(path) => Some(PathBuf::from(path)),
+        None => app_root
+            .canonicalize()
+            .ok()
+            .and_then(|root| root.parent().map(|parent| parent.join(name)))
+            .filter(|path| path.is_file()),
+    }
 }
 
 fn build_sbg_entries(extensions: &[DetectedExtension]) -> Vec<SbgEntry> {
@@ -154,6 +198,14 @@ fn main() -> Result<()> {
         }
     }
 
+    let app_root = PathBuf::from(&args.app_root);
+    let filter = MetadataFilter::from_files(
+        filter_file(args.whitelist.as_deref(), &app_root, metadata_filter::WHITELIST_FILE).as_deref(),
+        filter_file(args.blacklist.as_deref(), &app_root, metadata_filter::BLACKLIST_FILE).as_deref(),
+    )
+    .context("reading the metadata filter")?;
+    let (all_extensions, any_real_extension) = select_extensions(all_extensions, &filter);
+
     let sbg_output_dir = args
         .sbg_output
         .as_deref()
@@ -173,11 +225,13 @@ fn main() -> Result<()> {
                 out_path.display()
             );
         } else {
+            // One from an earlier build would have sbg generate proxies for extensions now gone.
+            let _ = fs::remove_file(dir.join("sbg_metadata.json"));
             eprintln!("[dotnet-tool] No WinRT extensions found; sbg_metadata.json not written");
         }
     }
 
-    if has_dotnet || !all_extensions.is_empty() || args.force {
+    if has_dotnet || any_real_extension || args.force {
         if let Err(e) = publish_and_copy_bridge(PathBuf::from(&args.app_root)) {
             eprintln!("Warning: failed to publish/copy dotnet-bridge: {}", e);
         } else {
@@ -695,4 +749,52 @@ fn find_bridge_dir(start: &PathBuf) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metadata_filter::PatternList;
+
+    // What bundles hold: a minified library class, a library class under a capitalised name, an
+    // app class extending a WinUI control, and a named proxy.
+    const BUNDLE: &str = r#"
+        var t = (function (e) { return e; })(Ua.$);
+        var n = (function (e) { return e; })(Phaser.Utils);
+        var MyButton = (function (_super) { return _super; })(Microsoft.UI.Xaml.Controls.Button);
+        var Engine = Sa.ThinEngine.extend("NativeScript.Gen.Engine", {});
+    "#;
+
+    fn scan(filter: &MetadataFilter) -> (Vec<String>, bool) {
+        let mut found = Vec::new();
+        scan_file_ast(BUNDLE, &mut found);
+        let (kept, any_real) = select_extensions(found, filter);
+        let mut bases: Vec<_> = kept.into_iter().map(|ext| ext.base_type).collect();
+        bases.sort();
+        (bases, any_real)
+    }
+
+    #[test]
+    fn minified_names_are_not_extensions() {
+        let (bases, any_real) = scan(&MetadataFilter::default());
+        assert_eq!(bases, ["Microsoft.UI.Xaml.Controls.Button", "Phaser.Utils", "Sa.ThinEngine"]);
+        assert!(any_real);
+    }
+
+    #[test]
+    fn library_classes_alone_need_no_bridge() {
+        let mut found = Vec::new();
+        scan_file_ast("var n = (function (e) { return e; })(Phaser.Utils);", &mut found);
+        let (kept, any_real) = select_extensions(found, &MetadataFilter::default());
+        assert_eq!(kept.len(), 1);
+        assert!(!any_real);
+    }
+
+    #[test]
+    fn the_apps_filter_drops_bases_it_leaves_out() {
+        let filter = MetadataFilter::new(Some(PatternList::parse("Microsoft.UI.Xaml.Controls:Button")), PatternList::default());
+        let (bases, any_real) = scan(&filter);
+        assert_eq!(bases, ["Microsoft.UI.Xaml.Controls.Button"]);
+        assert!(any_real);
+    }
 }

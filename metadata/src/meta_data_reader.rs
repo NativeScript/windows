@@ -1,5 +1,5 @@
 use crate::declarations::class_declaration::ClassDeclaration;
-use crate::declarations::declaration::Declaration;
+use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::declarations::delegate_declaration::DelegateDeclaration;
 use crate::declarations::enum_declaration::EnumDeclaration;
@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::ffi::OsString;
 use std::mem::MaybeUninit;
 use std::os::windows::prelude::OsStringExt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::RO_E_METADATA_NAME_IS_NAMESPACE;
 use windows::Win32::System::WinRT::Metadata::{
@@ -37,7 +37,11 @@ thread_local! {
     // opened import scope plus its typedef names (for namespace synthesis).
     static SIDELOADED_SCOPES: RefCell<Vec<SideloadedScope>> = RefCell::new(Vec::new());
     static SIDELOADED_PATHS: RefCell<AHashSet<String>> = RefCell::new(AHashSet::new());
+    // What `FILTER` said about each type JS asked for, so each is matched once.
+    static FILTER_VERDICTS: RefCell<AHashMap<String, bool>> = RefCell::new(AHashMap::new());
 }
+
+static FILTER: OnceLock<metadata_filter::MetadataFilter> = OnceLock::new();
 
 struct SideloadedScope {
     import: IMetaDataImport2,
@@ -68,6 +72,55 @@ impl MetadataReader {
             }
         }
         None
+    }
+
+    /// The app's native API filter (`whitelist.mdg` / `blacklist.mdg`), set once at startup.
+    pub fn set_filter(filter: metadata_filter::MetadataFilter) {
+        let _ = FILTER.set(filter);
+    }
+
+    /// Loads the filter from the first of `dirs` holding `whitelist.mdg` or `blacklist.mdg` (the build
+    /// copies them next to the exe).
+    pub fn load_filter(dirs: impl IntoIterator<Item = std::path::PathBuf>) {
+        use metadata_filter::{MetadataFilter, BLACKLIST_FILE, WHITELIST_FILE};
+        let Some(dir) = dirs
+            .into_iter()
+            .find(|dir| [WHITELIST_FILE, BLACKLIST_FILE].iter().any(|file| dir.join(file).is_file()))
+        else {
+            return;
+        };
+        match MetadataFilter::load(&dir) {
+            Ok(filter) => MetadataReader::set_filter(filter),
+            Err(error) => eprintln!(
+                "[NativeScript] metadata filter in {} not loaded: {error}",
+                dir.display()
+            ),
+        }
+    }
+
+    /// Whether JS may reach `declaration` by name. A type the app's filter leaves out isn't there,
+    /// as on Android and iOS where it's left out of the metadata; namespaces always are, so JS can
+    /// still reach the types it may use. The runtime's own lookups (return types, bases,
+    /// interfaces, an instance's runtime class) are not filtered.
+    pub fn visible_to_js(declaration: &Arc<RwLock<dyn Declaration>>) -> bool {
+        let Some(filter) = FILTER.get().filter(|filter| !filter.is_empty()) else {
+            return true;
+        };
+        let lock = declaration.read();
+        if lock.kind() == DeclarationKind::Namespace {
+            return true;
+        }
+        let full_name = lock.full_name();
+        if let Some(visible) = FILTER_VERDICTS.with(|verdicts| verdicts.borrow().get(full_name).copied()) {
+            return visible;
+        }
+        let verdict = filter.check(full_name);
+        let visible = verdict == metadata_filter::Verdict::Allowed;
+        if !visible {
+            eprintln!("[NativeScript] metadata filter: {full_name} is unavailable ({verdict})");
+        }
+        FILTER_VERDICTS.with(|verdicts| verdicts.borrow_mut().insert(full_name.to_string(), visible));
+        visible
     }
 
     pub fn find_by_name(full_name: &str) -> Option<Arc<RwLock<dyn Declaration>>> {
@@ -480,6 +533,32 @@ mod sideload_tests {
         let lock = decl.read();
         assert_eq!(lock.kind(), DeclarationKind::Struct);
         assert_eq!(lock.full_name(), "Windows.Foundation.TimeSpan");
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use metadata_filter::{MetadataFilter, PatternList};
+
+    // The only test that sets the process-wide filter; the others never ask `visible_to_js`.
+    #[test]
+    fn filtered_types_are_hidden_from_js_but_resolve_for_the_runtime() {
+        MetadataReader::set_filter(MetadataFilter::new(
+            None,
+            PatternList::parse("Windows.Storage.Pickers:FileOpen*"),
+        ));
+        let picker = MetadataReader::find_by_name("Windows.Storage.Pickers.FileOpenPicker")
+            .expect("the runtime still resolves a filtered type");
+        assert!(!MetadataReader::visible_to_js(&picker));
+        // Twice: the second answer comes from the verdict cache.
+        assert!(!MetadataReader::visible_to_js(&picker));
+        let save = MetadataReader::find_by_name("Windows.Storage.Pickers.FileSavePicker").unwrap();
+        assert!(MetadataReader::visible_to_js(&save));
+        let namespace = MetadataReader::find_by_name("Windows.Storage.Pickers").unwrap();
+        assert!(MetadataReader::visible_to_js(&namespace));
+        let handler = MetadataReader::find_by_name_or_generic("Windows.Foundation.EventHandler").unwrap();
+        assert!(MetadataReader::visible_to_js(&handler));
     }
 }
 

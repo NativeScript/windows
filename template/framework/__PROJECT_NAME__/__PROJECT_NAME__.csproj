@@ -101,6 +101,17 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
+    <!-- The app's metadata filter (App_Resources/Windows/native-api-usage.json, which the CLI writes
+         out next to this project): the runtime reads it next to the exe. -->
+    <Content Include="$(NSWindowsRoot)\whitelist.mdg" Condition="Exists('$(NSWindowsRoot)\whitelist.mdg')">
+      <Link>whitelist.mdg</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(NSWindowsRoot)\blacklist.mdg" Condition="Exists('$(NSWindowsRoot)\blacklist.mdg')">
+      <Link>blacklist.mdg</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
     <!-- Logo and splash assets required for the packaged desktop app manifest -->
     <Content Include="Assets\**\*" Condition="Exists('Assets')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -175,6 +186,12 @@
         SkipUnchangedFiles="true" />
     </Target>
 
+  <!-- A filter the app dropped must not stay in force from an earlier build's copy. -->
+  <Target Name="RemoveStaleMetadataFilter" BeforeTargets="CopyFilesToOutputDirectory">
+    <Delete Files="$(OutDir)whitelist.mdg" Condition="!Exists('$(NSWindowsRoot)\whitelist.mdg')" />
+    <Delete Files="$(OutDir)blacklist.mdg" Condition="!Exists('$(NSWindowsRoot)\blacklist.mdg')" />
+  </Target>
+
     <!-- Run the Static Binding Generator (sbg) when project contains an sbg entry script
      or when pre-existing metadata is present. Generated proxies will be written
      into $(NSGenDir) and included in compilation. -->
@@ -193,11 +210,11 @@
            Search order: pre-built tools/ binary, then cargo run for dev. -->
       <Exec
         Command="&quot;$(SbgExe)&quot;"
-        EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory)"
+        EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory);SBG_WHITELIST=$(NSWindowsRoot)\whitelist.mdg;SBG_BLACKLIST=$(NSWindowsRoot)\blacklist.mdg"
         Condition="'$(SbgExe)' != '' and Exists('$(SBGMetadataSource)')" />
       <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
         Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p sbg"
-        EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory)"
+        EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory);SBG_WHITELIST=$(NSWindowsRoot)\whitelist.mdg;SBG_BLACKLIST=$(NSWindowsRoot)\blacklist.mdg"
         Condition="'$(SbgExe)' == '' and Exists('$(SBGMetadataSource)') and Exists('$(WindowsRuntimeRepoRoot)\Cargo.toml')" />
       <!-- The proxies are picked up here, after sbg ran: a glob evaluated with the project would
            still compile proxies an earlier run generated for extensions that are gone. -->

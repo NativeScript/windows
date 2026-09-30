@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["metadata", "playground", "runtime", "runtime-binding-gen", "sbg", "nativescript", "typings-generator", "integration-tests", "runtime-devtools", "metadata-generator","tools/dotnet-tool", "windows-napi", "napi-v8-shim"]
+members = ["metadata", "metadata-filter", "playground", "runtime", "runtime-binding-gen", "sbg", "nativescript", "typings-generator", "integration-tests", "runtime-devtools", "metadata-generator","tools/dotnet-tool", "windows-napi", "napi-v8-shim"]
 # Excluded so their C builds / prebuilt-engine links don't run on normal `cargo` invocations.
 exclude = ["packages/common", "packages/demo", "packages/windows-quickjs", "packages/windows-hermes", "packages/windows-jsc", "packages/windows-v8"]
 
