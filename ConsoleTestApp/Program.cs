@@ -36,7 +36,7 @@ IntPtr devtoolsPtr = IntPtr.Zero;
 try {
 	// runtime_devtools_start may not be present in non-devtools builds of the
 	// native DLL; guard the call and continue if the symbol is missing.
-	devtoolsPtr = runtime_devtools_start(runtime, 42000);
+	devtoolsPtr = runtime_devtools_start(runtime, 43000);
 } catch (EntryPointNotFoundException) {
 	devtoolsPtr = IntPtr.Zero;
 }

@@ -53,6 +53,7 @@ namespace NativeScriptWindowsDemo
         private static extern void runtime_free_js_error(IntPtr ptr);
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_has_devtools))]
+        [return: MarshalAs(UnmanagedType.U1)]
         private static extern bool runtime_has_devtools();
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_pump_timers))]
@@ -98,6 +99,21 @@ namespace NativeScriptWindowsDemo
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_free_string))]
         private static extern void runtime_free_string(IntPtr ptr);
 
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_devtools_wait_for_debugger))]
+        [return: MarshalAs(UnmanagedType.U1)]
+        private static extern bool runtime_devtools_wait_for_debugger(long runtime, uint timeoutMs);
+
+        // iOS uses 41000 and Android 42000.
+        private const ushort DevtoolsPort = 43000;
+        private const uint DebuggerWaitTimeoutMs = 30000;
+
+        // LocalFolder sentinel files shared with the CLI's WindowsApplicationManager.
+        private const string InspectorMarker = "ns-inspector";
+        private const string DebugBreakMarker = "ns-debugbreak";
+        private const string DebuggerStartedMarker = "ns-debugger-started";
+
+        private bool _waitForDebugger;
+
         public string DevtoolsFrontendUrl { get; private set; }
 
         private bool _devtoolsAvailable;
@@ -118,7 +134,7 @@ namespace NativeScriptWindowsDemo
             IntPtr urlPtr = IntPtr.Zero;
             try
             {
-                urlPtr = runtime_devtools_start(_runtime, 42000);
+                urlPtr = runtime_devtools_start(_runtime, DevtoolsPort);
                 if (urlPtr == IntPtr.Zero) return;
                 var wsUrl = Marshal.PtrToStringUTF8(urlPtr);
                 DevtoolsFrontendUrl = wsUrl != null
@@ -127,6 +143,8 @@ namespace NativeScriptWindowsDemo
                 if (DevtoolsFrontendUrl != null)
                 {
                     _devtoolsAvailable = true;
+                    // The server may fall back to the next free port.
+                    WriteMarker(DebuggerStartedMarker, new Uri(wsUrl).Port.ToString());
                     System.Diagnostics.Debug.WriteLine($"[NativeScript DevTools] {DevtoolsFrontendUrl}");
                 }
             }
@@ -178,30 +196,47 @@ namespace NativeScriptWindowsDemo
                 }
             }
             catch { }
-            if (ConsumeDebugBreakMarker())
+            DeleteMarker(DebuggerStartedMarker);
+            var debugBreak = ConsumeMarker(DebugBreakMarker);
+            if (ConsumeMarker(InspectorMarker) || debugBreak)
+            {
                 StartDevtoolsSafely();
+                _waitForDebugger = debugBreak && _devtoolsAvailable;
+            }
 #endif
             _initialized = true;
         }
 
 #if DEBUG
-        /// <summary>
-        /// Returns true and deletes the marker if the CLI wrote ns-debugbreak to LocalFolder,
-        /// matching the Android sentinel-file pattern used by the NativeScript CLI.
-        /// </summary>
-        private static bool ConsumeDebugBreakMarker()
+        private static string MarkerPath(string name) =>
+            Path.Combine(Windows.Storage.ApplicationData.Current.LocalFolder.Path, name);
+
+        private static bool ConsumeMarker(string name)
         {
             try
             {
-                var markerPath = System.IO.Path.Combine(
-                    Windows.Storage.ApplicationData.Current.LocalFolder.Path,
-                    "ns-debugbreak");
-                if (!System.IO.File.Exists(markerPath))
+                var markerPath = MarkerPath(name);
+                if (!File.Exists(markerPath))
                     return false;
-                System.IO.File.Delete(markerPath);
+                File.Delete(markerPath);
                 return true;
             }
             catch { return false; }
+        }
+
+        private static void WriteMarker(string name, string contents)
+        {
+            try { File.WriteAllText(MarkerPath(name), contents); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[NativeScript DevTools] Could not write {name}: {ex.Message}");
+            }
+        }
+
+        private static void DeleteMarker(string name)
+        {
+            try { File.Delete(MarkerPath(name)); }
+            catch { }
         }
 #endif
 
@@ -231,6 +266,15 @@ namespace NativeScriptWindowsDemo
             if (!_initialized)
                 throw new InvalidOperationException("Runtime must be initialized before running scripts.");
 
+#if DEBUG
+            if (_waitForDebugger)
+            {
+                // --debug-brk: hold the first script until DevTools attaches.
+                _waitForDebugger = false;
+                if (!runtime_devtools_wait_for_debugger(_runtime, DebuggerWaitTimeoutMs))
+                    System.Diagnostics.Debug.WriteLine("[NativeScript DevTools] No debugger attached, continuing.");
+            }
+#endif
             var entryPath = ResolveEntryScriptPath();
             if (entryPath == null)
             {
