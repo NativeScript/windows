@@ -584,7 +584,9 @@ pub(crate) fn handle_named_property_getter(
                 if let Some(dec) = dec {
                     let full_name = format!("{}.{}", dec.full_name(), name.as_str());
 
-                    if let Some(dec) = MetadataReader::find_by_name_or_generic(full_name.as_str()) {
+                    if let Some(dec) = MetadataReader::find_by_name_or_generic(full_name.as_str())
+                        .filter(MetadataReader::visible_to_js)
+                    {
                         let declaration = Arc::clone(&dec);
                         let lock = dec.read();
 

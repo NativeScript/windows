@@ -67,10 +67,20 @@ pub fn scan_winmd_dir(dir: &str) -> usize {
 }
 
 /// Scan the default locations once (cwd + the addon/executable directory) for third-party
-/// `.winmd` files, mirroring `Runtime::new`'s auto-scan for the napi path.
+/// `.winmd` files and the app's metadata filter, mirroring `Runtime::new` for the napi path.
 pub fn scan_default_winmd_dirs() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        metadata::meta_data_reader::MetadataReader::load_filter(
+            [
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf())),
+                std::env::current_dir().ok(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         if let Ok(cwd) = std::env::current_dir() {
             if let Some(s) = cwd.to_str() {
                 scan_winmd_dir(s);
