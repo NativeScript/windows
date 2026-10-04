@@ -1,6 +1,6 @@
 {
   "name": "@nativescript/windows",
-  "version": "0.1.0-beta.4",
+  "version": "1.0.0-beta.8",
   "description": "NativeScript Windows runtime with a WinUI 3 app template",
   "repository": {
         "type": "git",
