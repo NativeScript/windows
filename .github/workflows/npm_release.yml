@@ -43,7 +43,7 @@ permissions:
 # runtime DLL staged as framework/libs/<arch>/nativescript.dll:
 #
 #   classic  `template/build.ps1` builds the workspace `nativescript` cdylib (rusty_v8) for x64 and
-#            arm64, release and devtools, rebuilds the tools (dotnet-tool, nsbundle_pack, sbg,
+#            arm64, release and devtools, rebuilds the tools (dotnet-tool, nsbundle_pack,
 #            typings-generator, ManifestMerger, dotnet-typings-gen) and stages it all under
 #            template/framework. Published from template/ as @nativescript/windows.
 #   variant  `template/build.ps1 -Engine <engine>` copies the shared scaffolding out of
@@ -232,7 +232,7 @@ jobs:
             foreach ($arch in $archs) {
               $expected += (Join-Path $libs "$arch/nativescript.dll")
               $expected += (Join-Path $libs "devtools/$arch/nativescript.dll")
-              foreach ($tool in @('dotnet-tool', 'nsbundle_pack', 'sbg', 'typings-generator')) {
+              foreach ($tool in @('dotnet-tool', 'nsbundle_pack', 'typings-generator')) {
                 $expected += (Join-Path $tools "$tool-$arch.exe")
               }
             }
