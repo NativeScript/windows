@@ -328,40 +328,6 @@ if (Test-Path $nsbundlePackX64Path) {
     Write-Host "  copied nsbundle_pack-x64.exe -> nsbundle_pack.exe"
 }
 
-# sbg prebuilt binaries
-Write-Host "`n=== Build sbg prebuilt binaries ===" -ForegroundColor Cyan
-
-foreach ($t in $Targets) {
-    $arch = $t.Arch
-    $rustTarget = $t.RustTarget
-    Write-Host "Building sbg for $arch ($rustTarget)..."
-    Push-Location $RepoRoot
-    try {
-        & cargo build -p sbg --release --target $rustTarget
-        $buildExit = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
-    if ($buildExit -ne 0) {
-        Write-Host "cargo build for sbg failed for target $rustTarget (exit $buildExit). Skipping copy for $arch." -ForegroundColor Yellow
-        continue
-    }
-    $candidate = Join-Path $RepoRoot "target\$rustTarget\release\sbg.exe"
-    if (Test-Path $candidate) {
-        $dest = Join-Path $ToolsDir "sbg-$arch.exe"
-        Copy-Item -Force $candidate $dest
-        Write-Host "  copied sbg -> $(Resolve-Path $dest -Relative)"
-    } else {
-        Write-Host "Expected build output not found: $candidate" -ForegroundColor Yellow
-    }
-}
-
-$x64Path = Join-Path $ToolsDir "sbg-x64.exe"
-if (Test-Path $x64Path) {
-    Copy-Item -Force $x64Path (Join-Path $ToolsDir "sbg.exe")
-    Write-Host "  copied sbg-x64.exe -> sbg.exe"
-}
-
 # typings-generator: shipped so `ns typings windows` can generate WinRT/.NET typings.
 Write-Host "`n=== Build typings-generator prebuilt binaries ===" -ForegroundColor Cyan
 

@@ -123,8 +123,12 @@ public static partial class Bridge
                                 catch { continue; }
                             }
 
+                            // The app's own assembly (C# sources compiled into the app) contributes
+                            // its internal types too: they are reachable from JS (type resolution
+                            // finds non-public types), so their namespaces must be as well.
                             Type[] types;
-                            try { types = asm.GetExportedTypes(); }
+                            try { types = asm == Assembly.GetEntryAssembly() ? asm.GetTypes() : asm.GetExportedTypes(); }
+                            catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
                             catch { types = Array.Empty<Type>(); }
 
                             var assemblyName = asm.GetName().Name;
@@ -132,7 +136,7 @@ public static partial class Bridge
 
                             foreach (var t in types)
                             {
-                                if (string.IsNullOrEmpty(t.Namespace)) continue;
+                                if (string.IsNullOrEmpty(t.Namespace) || t.Name.StartsWith('<')) continue;
                                 map[t.Namespace] = assemblyName;
                                 var root = t.Namespace.Split('.')[0];
                                 if (!map.ContainsKey(root)) map[root] = assemblyName;
@@ -597,6 +601,12 @@ public static partial class Bridge
     // WinRT interfaces (e.g. IUIElement for a FlexboxLayout subclass).
     private static IntPtr ObtainNativePtr(object obj)
     {
+        // Path 0 — a JS subclass of a WinRT class: the composed object's outer (its C#/WinRT CCW).
+        // XAML holds and hands back the outer, so using it here lets the runtime map those objects
+        // back to the JS instance. The base class's interfaces resolve through the inner.
+        if (IsJsBacked(obj) && TryGetOuterInspectable(obj) is { } outer && outer != IntPtr.Zero)
+            return outer;
+
         // Path 1 — C#/WinRT IWinRTObject: use the projected inner object's pointer.
         // This gives the real native WinRT pointer, not the managed CCW, so
         // QueryInterface will succeed for all WinRT interfaces inherited by the type.
@@ -644,6 +654,36 @@ public static partial class Bridge
 
         // Path 3 — bare IUnknown fallback.
         return iunknown;
+    }
+
+    private static MethodInfo? s_marshalInspectableFromManaged;
+
+    // WinRT.MarshalInspectable<object>.FromManaged(obj), found by reflection (the bridge has no
+    // compile-time reference to C#/WinRT): an AddRef'd IInspectable of the object's CCW.
+    private static IntPtr? TryGetOuterInspectable(object obj)
+    {
+        if (obj.GetType().GetInterface("WinRT.IWinRTObject") is null) return null;
+        try
+        {
+            if (s_marshalInspectableFromManaged is null)
+            {
+                var open = AppDomain.CurrentDomain.GetAssemblies()
+                    .Select(a => a.GetType("WinRT.MarshalInspectable`1"))
+                    .FirstOrDefault(t => t is not null);
+                s_marshalInspectableFromManaged = open?.MakeGenericType(typeof(object))
+                    .GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "FromManaged" && m.GetParameters() is { Length: > 0 } ps
+                        && ps[0].ParameterType == typeof(object) && ps.Skip(1).All(p => p.IsOptional));
+            }
+            var method = s_marshalInspectableFromManaged;
+            if (method is null) return null;
+            var args = method.GetParameters().Select((p, i) => i == 0 ? obj : p.DefaultValue).ToArray();
+            return method.Invoke(null, args) as IntPtr?;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static void OnAppDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)

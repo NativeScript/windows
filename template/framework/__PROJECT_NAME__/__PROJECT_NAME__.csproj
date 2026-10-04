@@ -25,19 +25,14 @@
     <NSWindowsRoot>$(MSBuildProjectDirectory)\..</NSWindowsRoot>
   </PropertyGroup>
 
-  <!-- Static Binding Generator (SBG) output folder and helper properties for integrating generated proxies. -->
   <PropertyGroup>
-    <NSGenDir>$(BaseIntermediateOutputPath)_ns_\gen</NSGenDir>
-    <SBG_OUTPUT_DIR>$(MSBuildProjectDirectory)\$(NSGenDir)</SBG_OUTPUT_DIR>
         <!-- Path to the windows-runtime repository root. Can be overridden by setting the environment
           variable `NS_WINDOWS_RUNTIME_ROOT` (useful when building an app that lives outside the
           runtime repo). If not set, fall back to the project parent directory (legacy behavior). -->
         <WindowsRuntimeRepoRoot Condition="'$(WindowsRuntimeRepoRoot)'=='' and '$(NS_WINDOWS_RUNTIME_ROOT)' != ''">$(NS_WINDOWS_RUNTIME_ROOT)</WindowsRuntimeRepoRoot>
         <WindowsRuntimeRepoRoot Condition="'$(WindowsRuntimeRepoRoot)'==''">$(MSBuildProjectDirectory)\..</WindowsRuntimeRepoRoot>
-    <SBGMetadataSource>$(SBG_OUTPUT_DIR)\sbg_metadata.json</SBGMetadataSource>
     <!-- Resolve pre-built tool binaries shipped inside the npm package tools/ directory -->
     <NSToolsDir>$(NSWindowsRoot)\tools</NSToolsDir>
-    <SbgExe Condition="Exists('$(NSToolsDir)\sbg.exe')">$(NSToolsDir)\sbg.exe</SbgExe>
     <DotNetToolExe Condition="Exists('$(NSToolsDir)\dotnet-tool.exe')">$(NSToolsDir)\dotnet-tool.exe</DotNetToolExe>
   </PropertyGroup>
 
@@ -96,8 +91,12 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
-    <!-- App_Resources: platform-specific assets (images, fonts, etc.) -->
-    <Content Include="App_Resources\**\*" Condition="Exists('App_Resources')">
+    <!-- App_Resources: platform-specific assets (images, fonts, etc.). C# sources anywhere under
+         App_Resources\Windows (e.g. App_Resources\Windows\src\*.cs) and in plugins\<plugin>\ are
+         compiled into the app by the SDK's default Compile glob — the counterpart of Java/Kotlin in
+         App_Resources/Android/src and Objective-C/Swift in App_Resources/iOS/src — and JavaScript
+         reaches their types by namespace. Sources and MSBuild files aren't copied to the output. -->
+    <Content Include="App_Resources\**\*" Exclude="App_Resources\**\*.cs;App_Resources\**\*.csproj;App_Resources\**\*.props;App_Resources\**\*.targets" Condition="Exists('App_Resources')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
@@ -192,46 +191,16 @@
     <Delete Files="$(OutDir)blacklist.mdg" Condition="!Exists('$(NSWindowsRoot)\blacklist.mdg')" />
   </Target>
 
-    <!-- Run the Static Binding Generator (sbg) when project contains an sbg entry script
-     or when pre-existing metadata is present. Generated proxies will be written
-     into $(NSGenDir) and included in compilation. -->
-    <Target Name="RunStaticBindingGenerator" BeforeTargets="CoreCompile">
-      <MakeDir Directories="$(NSGenDir)" />
-      <!-- Run dotnet-tool to auto-detect .NET usage and publish/copy DotNetBridge.
-           Prefer the pre-built binary shipped in the npm package; fall back to cargo run for dev. -->
-      <Exec Command="&quot;$(DotNetToolExe)&quot; --app-root &quot;$(MSBuildProjectDirectory)&quot; --dir App --sbg-output &quot;$(SBG_OUTPUT_DIR)&quot;"
+    <!-- Run dotnet-tool to auto-detect .NET usage and publish/copy DotNetBridge. Prefer the pre-built
+         binary shipped in the npm package; fall back to cargo run for dev. JS subclasses of .NET and
+         WinRT classes need no generated code: the bridge creates their managed types at runtime. -->
+    <Target Name="RunDotNetTool" BeforeTargets="CoreCompile">
+      <Exec Command="&quot;$(DotNetToolExe)&quot; --app-root &quot;$(MSBuildProjectDirectory)&quot; --dir App"
         Condition="'$(DotNetToolExe)' != ''" />
       <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
-        Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p dotnet-tool -- --app-root &quot;$(MSBuildProjectDirectory)&quot; --dir App --sbg-output &quot;$(SBG_OUTPUT_DIR)&quot;"
+        Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p dotnet-tool -- --app-root &quot;$(MSBuildProjectDirectory)&quot; --dir App"
         Condition="'$(DotNetToolExe)' == '' and Exists('$(WindowsRuntimeRepoRoot)\Cargo.toml')" />
-      <!-- Run SBG to generate C# proxies from captured metadata.
-           sbg_metadata.json is written by __nsProxyAutoCapture when the app runs
-           with extensions that use .extend() / @Interfaces / @CSharpProxy.
-           Search order: pre-built tools/ binary, then cargo run for dev. -->
-      <Exec
-        Command="&quot;$(SbgExe)&quot;"
-        EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory);SBG_WHITELIST=$(NSWindowsRoot)\whitelist.mdg;SBG_BLACKLIST=$(NSWindowsRoot)\blacklist.mdg"
-        Condition="'$(SbgExe)' != '' and Exists('$(SBGMetadataSource)')" />
-      <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
-        Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p sbg"
-        EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory);SBG_WHITELIST=$(NSWindowsRoot)\whitelist.mdg;SBG_BLACKLIST=$(NSWindowsRoot)\blacklist.mdg"
-        Condition="'$(SbgExe)' == '' and Exists('$(SBGMetadataSource)') and Exists('$(WindowsRuntimeRepoRoot)\Cargo.toml')" />
-      <!-- The proxies are picked up here, after sbg ran: a glob evaluated with the project would
-           still compile proxies an earlier run generated for extensions that are gone. -->
-      <ItemGroup>
-        <Compile Include="$(NSGenDir)\NSWinRTProxies\**\*.cs" Exclude="$(NSGenDir)\NSWinRTProxies\obj\**\*.cs" Visible="false" />
-      </ItemGroup>
     </Target>
-
-  <Target Name="CleanStaticBindingGeneratorOutput" AfterTargets="CoreClean">
-    <RemoveDir Directories="$(NSGenDir)" Condition="Exists('$(NSGenDir)')" />
-  </Target>
-
-  <ItemGroup>
-    <Content Include="$(NSGenDir)\sbg-manifest.json" Link="sbg-manifest.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\sbg-manifest.json')" />
-    <Content Include="$(NSGenDir)\NSWinRTProxies\bin\Release\**\NSWinRTProxies.dll" Link="NSWinRTProxies.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\NSWinRTProxies\bin\Release')" />
-  </ItemGroup>
-  
 
   <!-- Ensure bridge files are included in the final `dotnet publish` output. -->
   <Target Name="CopyDotNetBridgeToPublishDir"

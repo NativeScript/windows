@@ -521,6 +521,23 @@ fn class_prototype(env: &Env, class_name: &str) -> napi::Result<JsObject> {
     // __typeName__ is the same for every instance → carry it once on the prototype, not per-instance.
     proto.set_named_property("__typeName__", env.create_string(class_name)?)?;
 
+    // The base class's prototype is next in the chain, so `x instanceof BaseClass` holds for
+    // instances of derived classes (a StackPanel is a Panel and a UIElement).
+    let base_name = {
+        let lock = declaration.read();
+        lock.as_any()
+            .downcast_ref::<ClassDeclaration>()
+            .map(|c| c.base_full_name().to_string())
+            .unwrap_or_default()
+    };
+    if !base_name.is_empty() && base_name != "System.Object" && base_name != class_name {
+        if let Ok(base_proto) = class_prototype(env, &base_name) {
+            let (object, _create, _define) = object_helpers(env)?;
+            let set_proto: JsFunction = object.get_named_property("setPrototypeOf")?;
+            set_proto.call(Some(&object), &[as_unknown(env, unsafe { JsObject::from_raw_unchecked(env.raw(), proto.raw()) }), as_unknown(env, base_proto)])?;
+        }
+    }
+
     HOST_PROTOS.with(|c| {
         c.borrow_mut().insert(class_name.to_string(), make_ref(env, &proto));
     });
@@ -566,10 +583,27 @@ fn make_ctor_wrapper(
     impl_fn: &JsFunction,
     proto: &JsObject,
     class_name: &str,
+    sealed: bool,
 ) -> napi::Result<JsFunction> {
+    // A JS subclass (`class Sub extends ThisClass`, or TypeScript's ES5 `_super.call(this, ...)`)
+    // of an unsealed class is constructed by the bootstrap's `__nsConstructWinRTSubclass`: a
+    // composed object whose overridable members call back into Sub. It returns undefined when the
+    // .NET bridge isn't available; then (and for sealed classes) the instance is a plain one
+    // re-linked to Sub's prototype.
     const BODY: &str = r#"'use strict';
 function Ctor() {
-    if (!new.target) { throw new TypeError(clsName + ' is a WinRT class constructor — use `new`'); }
+    var sub = globalThis.__nsConstructWinRTSubclass;
+    if (!new.target) {
+        if (!sealed && this && typeof this === 'object' && typeof sub === 'function') {
+            var es5 = sub(clsName, null, Array.prototype.slice.call(arguments), this);
+            if (es5) { return es5; }
+        }
+        throw new TypeError(clsName + ' is a WinRT class constructor — use `new`');
+    }
+    if (!sealed && new.target !== Ctor && typeof sub === 'function') {
+        var composed = sub(clsName, new.target, Array.prototype.slice.call(arguments), undefined);
+        if (composed) { return composed; }
+    }
     var obj = arguments.length === 0 ? native() : native.apply(null, arguments);
     var p = new.target.prototype;
     if (p && typeof p === 'object' && p !== sharedProto) {
@@ -590,6 +624,7 @@ return Ctor;"#;
             as_unknown(env, env.create_string("native")?),
             as_unknown(env, env.create_string("sharedProto")?),
             as_unknown(env, env.create_string("clsName")?),
+            as_unknown(env, env.create_string("sealed")?),
             as_unknown(env, env.create_string(BODY)?),
         ],
     )?;
@@ -604,6 +639,7 @@ return Ctor;"#;
                 JsUnknown::from_raw_unchecked(env.raw(), proto.raw())
             }),
             as_unknown(env, env.create_string(class_name)?),
+            as_unknown(env, env.get_boolean(sealed)?),
         ],
     )?;
     Ok(unsafe { wrapper_unknown.cast() })
@@ -674,7 +710,7 @@ pub fn build_host_ctor(env: &Env, class_name: &str, declaration: Decl) -> napi::
     // It enforces construct-only calls and, for `class Sub extends WinRTClass`, re-links the
     // wrapped instance to new.target.prototype when that prototype chains through the shared
     // class prototype.
-    let ctor = make_ctor_wrapper(env, &impl_fn, &proto, class_name)?;
+    let ctor = make_ctor_wrapper(env, &impl_fn, &proto, class_name, ctor_sealed)?;
 
     let ctor_raw = unsafe { ctor.raw() };
     let mut ctor_obj = unsafe { JsObject::from_raw_unchecked(env.raw(), ctor_raw) };
@@ -788,6 +824,42 @@ pub fn build_host_ctor(env: &Env, class_name: &str, declaration: Decl) -> napi::
             None
         };
         define_accessor(env, &ctor_obj, &name, getter, setter)?;
+    }
+
+    // Static events (CompositionTarget.Rendering, ...): `Class.Event = handler` subscribes through
+    // the class's statics interface on its activation factory, replacing the previous handler;
+    // `= null` unsubscribes; reading returns the current handler. Same syntax as instance events.
+    let static_events: Vec<_> = {
+        let lock = declaration.read();
+        lock.as_any()
+            .downcast_ref::<ClassDeclaration>()
+            .map(|class| {
+                use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+                class.events().iter().filter(|e| e.is_static()).cloned().collect()
+            })
+            .unwrap_or_default()
+    };
+    for e in &static_events {
+        let name = e.name().to_string();
+        let (cls_get, cls_set) = (class_name.to_string(), class_name.to_string());
+        let (add, remove) = (e.add_method().clone(), e.remove_method().clone());
+        let gname = name.clone();
+        let getter = env.create_function_from_closure(&name, move |ctx: CallContext| {
+            let factory = crate::class_activation_factory(&cls_get)
+                .map_err(|err| napi::Error::from_reason(err.to_string()))?;
+            read_winrt_event_napi(&ctx.env, &factory, &gname)
+        })?;
+        let sname = name.clone();
+        let setter = env.create_function_from_closure(&name, move |ctx: CallContext| {
+            let env = &ctx.env;
+            crate::napi_engine::invoke::ensure_winrt_initialized();
+            let factory = crate::class_activation_factory(&cls_set)
+                .map_err(|err| napi::Error::from_reason(format!("{cls_set}.{sname}: {err}")))?;
+            let value = ctx.get::<JsUnknown>(0)?;
+            wire_winrt_event_napi(env, &sname, &factory, &add, &remove, &value)?;
+            Ok(as_unknown(env, env.get_undefined()?))
+        })?;
+        define_accessor(env, &ctor_obj, &name, getter, Some(setter))?;
     }
 
     HOST_CTORS.with(|c| {

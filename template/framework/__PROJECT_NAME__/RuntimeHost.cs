@@ -175,13 +175,38 @@ namespace __PROJECT_NAME__
         private long _runtime;
         private bool _initialized;
 
+        private static string _localFolderPath;
+
+        /// The app's local data folder: ApplicationData's LocalFolder for a packaged app, or
+        /// %LOCALAPPDATA%\<AssemblyName> for an unpackaged one (WindowsPackageType=None), which has
+        /// no package identity and therefore no ApplicationData.
+        internal static string LocalFolderPath
+        {
+            get
+            {
+                if (_localFolderPath != null) return _localFolderPath;
+                try
+                {
+                    _localFolderPath = Windows.Storage.ApplicationData.Current.LocalFolder.Path;
+                }
+                catch (InvalidOperationException)
+                {
+                    var name = Assembly.GetEntryAssembly()?.GetName().Name ?? "NativeScriptApp";
+                    _localFolderPath = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), name);
+                    Directory.CreateDirectory(_localFolderPath);
+                }
+                return _localFolderPath;
+            }
+        }
+
         public void Initialize()
         {
             if (_initialized) return;
             bool attached = false;
             try { attached = AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
             runtime_install_ctrlc_handler(0);
-            runtime_set_local_folder(Windows.Storage.ApplicationData.Current.LocalFolder.Path);
+            runtime_set_local_folder(LocalFolderPath);
             _runtime = runtime_init(AppContext.BaseDirectory);
 #if DEBUG
             TrySetDebugBuild();
@@ -222,7 +247,7 @@ namespace __PROJECT_NAME__
 
 #if DEBUG
         private static string MarkerPath(string name) =>
-            Path.Combine(Windows.Storage.ApplicationData.Current.LocalFolder.Path, name);
+            Path.Combine(LocalFolderPath, name);
 
         private static bool ConsumeMarker(string name)
         {

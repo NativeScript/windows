@@ -1,0 +1,11 @@
+<Project>
+  <!-- run.ps1 builds the test runner unpackaged (WindowsPackageType=None, self-contained Windows App
+       SDK) so it can be started straight from bin\ with environment variables; an unpackaged build
+       must not declare the MSIX manifest. -->
+  <ItemGroup Condition="'$(WindowsPackageType)' == 'None'">
+    <AppxManifest Remove="@(AppxManifest)" />
+  </ItemGroup>
+  <PropertyGroup>
+    <AppDisplayName>NativeScript Windows TestRunner</AppDisplayName>
+  </PropertyGroup>
+</Project>

@@ -22,3 +22,4 @@ node_modules/
 AppPackages/
 dotnet-bridge/publish/
 /dotnet-bridge-benchmarks/BenchmarkDotNet.Artifacts
+test-app/platforms/

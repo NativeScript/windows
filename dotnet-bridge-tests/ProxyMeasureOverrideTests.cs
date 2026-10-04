@@ -77,7 +77,7 @@ public sealed class ProxyMeasureOverrideTests : IDisposable
         Assert.Equal(777, s_capturedId);
         Assert.True(s_capturedArgs.Length > 0);
 
-        // Parse captured binary: [count=3][handle][string][handle(args)]
+        // Parse captured binary: [count=3][handle][string member][i32 argument]
         var span = s_capturedArgs.AsSpan();
         Assert.Equal(3, span[0]);
         var off = 1;
@@ -93,13 +93,9 @@ public sealed class ProxyMeasureOverrideTests : IDisposable
         var strLen = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(off, 4)); off += 4;
         var name = Encoding.UTF8.GetString(span.Slice(off, (int)strLen)); off += (int)strLen;
         Assert.Equal("MeasureOverride", name);
-        Assert.Equal(0x06, span[off++]);
-        var argsHandle = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(off, 4)); off += 4;
-
-        Assert.True(Bridge.s_handles.TryGetValue(argsHandle, out var arrObj));
-        var arr = Assert.IsType<object?[]>(arrObj);
-        Assert.Single(arr);
-        Assert.Equal(123, Convert.ToInt32(arr[0]));
+        // The argument travels as its own value, not as a handle to an object[].
+        Assert.Equal(0x03, span[off++]);
+        Assert.Equal(123, BinaryPrimitives.ReadInt32LittleEndian(span.Slice(off, 4)));
 
         // Release created instance
         Bridge.Dispatch(new InvokeRequest(null, null, "__release", handle, null));

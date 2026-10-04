@@ -12,91 +12,129 @@ namespace NativeScriptBridge;
 public static partial class Bridge
 {
     // opcode 0x09: given a delegate type name (or "" for System.Action) and a
-    // JS callback id, compile a .NET delegate that serialises its parameters as
-    // binary and calls back into V8 via the s_jsInvoker function pointer.
-
+    // JS callback id, create a .NET delegate that calls back into V8.
     private static DispatchResult CreateJsDelegate(string typeName, int callbackId)
     {
         var delegateType = string.IsNullOrEmpty(typeName)
             ? typeof(Action)
             : ResolveType(null, typeName)
               ?? throw new TypeLoadException($"Delegate type not found: {typeName}");
+        return Box(MakeJsDelegate(delegateType, callbackId));
+    }
 
+    // The target a JS-backed delegate is bound to. When the delegate is collected the finalizer
+    // tells the runtime, which then drops its reference to the JS function.
+    internal sealed class JsCallbackTarget(int callbackId)
+    {
+        public readonly int CallbackId = callbackId;
+
+        public object? Invoke(object?[] args) => CallJsCallback(CallbackId, args, expectsResult: true);
+
+        public void InvokeVoid(object?[] args) => CallJsCallback(CallbackId, args, expectsResult: false);
+
+        ~JsCallbackTarget()
+        {
+            ReleaseJsCallback(CallbackId);
+        }
+    }
+
+    // Function pointer registered by the runtime (RegisterJsCallbackRelease) to drop a JS function
+    // whose delegate was collected. Called from the finalizer thread; the runtime queues the id.
+    internal static unsafe delegate* unmanaged[Cdecl]<int, void> s_jsCallbackRelease;
+
+    [UnmanagedCallersOnly(EntryPoint = "RegisterJsCallbackRelease",
+        CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+    public static unsafe int RegisterJsCallbackRelease(delegate* unmanaged[Cdecl]<int, void> release)
+    {
+        s_jsCallbackRelease = release;
+        return 0;
+    }
+
+    internal static unsafe void ReleaseJsCallback(int callbackId)
+    {
+        var release = s_jsCallbackRelease;
+        if (release == null) return;
+        try { release(callbackId); } catch { }
+    }
+
+    // One invoker per delegate type: (JsCallbackTarget target, <delegate params>) -> <delegate return>.
+    // It packs the arguments into object[] and calls target.Invoke/InvokeVoid; a delegate instance is
+    // that invoker closed over its target, so creating a delegate emits no code.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, DynamicMethod> s_jsDelegateInvokers = new();
+
+    internal static Delegate MakeJsDelegate(Type delegateType, int callbackId)
+    {
+        var invoker = s_jsDelegateInvokers.GetOrAdd(delegateType, BuildJsDelegateInvoker);
+        return invoker.CreateDelegate(delegateType, new JsCallbackTarget(callbackId));
+    }
+
+    private static DynamicMethod BuildJsDelegateInvoker(Type delegateType)
+    {
         var invokeMethod = delegateType.GetMethod("Invoke")
             ?? throw new MissingMethodException($"No Invoke method on {delegateType}");
+        var paramTypes = invokeMethod.GetParameters().Select(p => p.ParameterType).ToArray();
+        var returnType = invokeMethod.ReturnType;
 
-        var parameters  = invokeMethod.GetParameters();
-        var returnType  = invokeMethod.ReturnType;
-
-        // Build a dynamic method that marshals parameters into an object[] and
-        // calls back into JS via CallJsCallback/CallJsCallbackVoid. Expression
-        // compilation occasionally generates incorrect code for some delegate
-        // shapes; emitting IL here is reliable across signatures.
-        var paramTypes = parameters.Select(p => p.ParameterType).ToArray();
-        
-        var dm = new DynamicMethod($"__ns_js_delegate_{callbackId}",
-            returnType, paramTypes, typeof(Bridge).Module, skipVisibility: true);
-
+        // Emitting IL (rather than compiling an expression tree) is reliable across delegate shapes.
+        var dm = new DynamicMethod($"__ns_js_delegate_{delegateType.Name}", returnType,
+            [typeof(JsCallbackTarget), .. paramTypes], typeof(Bridge).Module, skipVisibility: true);
         var il = dm.GetILGenerator();
-        // local: object[] argsArray
-        var argsLocal = il.DeclareLocal(typeof(object[]));
+
+        il.Emit(OpCodes.Ldarg_0);
         il.Emit(OpCodes.Ldc_I4, paramTypes.Length);
         il.Emit(OpCodes.Newarr, typeof(object));
-        il.Emit(OpCodes.Stloc, argsLocal);
-
         for (int i = 0; i < paramTypes.Length; i++)
         {
-            il.Emit(OpCodes.Ldloc, argsLocal);
+            var paramType = paramTypes[i].IsByRef ? paramTypes[i].GetElementType()! : paramTypes[i];
+            il.Emit(OpCodes.Dup);
             il.Emit(OpCodes.Ldc_I4, i);
-            // load argument (Ldarg_0..)
-            switch (i + 1)
-            {
-                case 1: il.Emit(OpCodes.Ldarg_0); break;
-                case 2: il.Emit(OpCodes.Ldarg_1); break;
-                case 3: il.Emit(OpCodes.Ldarg_2); break;
-                case 4: il.Emit(OpCodes.Ldarg_3); break;
-                default: il.Emit(OpCodes.Ldarg, i + 1); break;
-            }
-            if (paramTypes[i].IsValueType) il.Emit(OpCodes.Box, paramTypes[i]);
+            il.Emit(OpCodes.Ldarg, i + 1);
+            if (paramTypes[i].IsByRef) il.Emit(OpCodes.Ldobj, paramType);
+            if (paramType.IsValueType) il.Emit(OpCodes.Box, paramType);
             il.Emit(OpCodes.Stelem_Ref);
         }
 
-        
-
         if (returnType == typeof(void))
         {
-            var callVoid = typeof(Bridge).GetMethod(nameof(CallJsCallbackVoid), BindingFlags.Static | BindingFlags.NonPublic)!;
-            il.Emit(OpCodes.Ldc_I4, callbackId);
-            il.Emit(OpCodes.Ldloc, argsLocal);
-            il.Emit(OpCodes.Call, callVoid);
-            il.Emit(OpCodes.Ret);
+            il.Emit(OpCodes.Call, typeof(JsCallbackTarget).GetMethod(nameof(JsCallbackTarget.InvokeVoid))!);
         }
         else
         {
-            var callObj = typeof(Bridge).GetMethod(nameof(CallJsCallback), BindingFlags.Static | BindingFlags.NonPublic)!;
-            il.Emit(OpCodes.Ldc_I4, callbackId);
-            il.Emit(OpCodes.Ldloc, argsLocal);
-            il.Emit(OpCodes.Call, callObj);
-            // ignore returned object and return default(returnType)
-            if (returnType.IsValueType)
-            {
-                var loc = il.DeclareLocal(returnType);
-                il.Emit(OpCodes.Ldloca_S, loc);
-                il.Emit(OpCodes.Initobj, returnType);
-                il.Emit(OpCodes.Ldloc, loc);
-            }
-            else
-            {
-                il.Emit(OpCodes.Ldnull);
-            }
-            il.Emit(OpCodes.Ret);
+            il.Emit(OpCodes.Call, typeof(JsCallbackTarget).GetMethod(nameof(JsCallbackTarget.Invoke))!);
+            il.Emit(OpCodes.Ldtoken, returnType);
+            il.Emit(OpCodes.Call, typeof(Type).GetMethod(nameof(Type.GetTypeFromHandle))!);
+            il.Emit(OpCodes.Call, typeof(Bridge).GetMethod(nameof(ConvertJsResult), BindingFlags.Static | BindingFlags.NonPublic)!);
+            il.Emit(OpCodes.Unbox_Any, returnType);
         }
-
-        var del = dm.CreateDelegate(delegateType);
-        return Box(del);
+        il.Emit(OpCodes.Ret);
+        return dm;
     }
 
-    internal static unsafe object? CallJsCallback(int id, object?[] args)
+    // A JS callback's result, converted to the type the managed caller expects (a delegate's return
+    // type or an overridden member's).
+    internal static object? ConvertJsResult(object? value, Type returnType)
+    {
+        if (value is null)
+            return returnType.IsValueType && Nullable.GetUnderlyingType(returnType) is null
+                ? Activator.CreateInstance(returnType)
+                : null;
+        var coerced = CoerceBin(value, returnType);
+        if (coerced is null || returnType.IsInstanceOfType(coerced)) return coerced;
+        var underlying = Nullable.GetUnderlyingType(returnType) ?? returnType;
+        try { return Convert.ChangeType(coerced, underlying); }
+        catch (Exception e)
+        {
+            throw new InvalidCastException(
+                $"JavaScript returned {coerced.GetType().Name}, which can't be converted to {returnType.FullName}", e);
+        }
+    }
+
+    internal static object? CallJsCallback(int id, object?[] args) => CallJsCallback(id, args, expectsResult: true);
+
+    // Calls the JS function registered under `id`. When it throws, a caller that expects a result
+    // gets a JsException (a delegate with a return value, an overridden member); a void delegate or
+    // event just returns, the error having been reported as an uncaught JS error.
+    internal static unsafe object? CallJsCallback(int id, object?[] args, bool expectsResult)
     {
         if (s_jsInvoker == null) return null;
 
@@ -116,16 +154,21 @@ public static partial class Bridge
         // Response is only set for non-void delegates; parse and free when present.
         if (respPtr != null && respLen > 0)
         {
+            string? jsError = null;
             try
             {
                 var span = new ReadOnlySpan<byte>(respPtr, respLen);
-                result = ParseCallbackResponse(span);
+                if (span[0] == 0x0F)
+                    jsError = span.Length > 5 ? new BinReader(span[1..]).ReadString32() : "the JavaScript callback could not run";
+                else
+                    result = ParseCallbackResponse(span);
             }
             catch { result = null; }
             finally
             {
                 Marshal.FreeHGlobal((IntPtr)respPtr);
             }
+            if (jsError != null && expectsResult) throw new JsException(jsError);
         }
 
         return result;
@@ -176,6 +219,15 @@ public static partial class Bridge
         if (arg is float f) { w.WriteByte(0x04); w.WriteF64((double)f); return; }
         if (arg is double d){ w.WriteByte(0x04); w.WriteF64(d); return; }
         if (arg is string s){ w.WriteByte(0x05); w.WriteString32(s); return; }
+        if (arg is Enum e)  { w.WriteByte(0x04); w.WriteF64(Convert.ToDouble(e)); return; }
+        if (arg is decimal m){ w.WriteByte(0x04); w.WriteF64((double)m); return; }
+        // A struct (Windows.Foundation.Size, a C# record struct, ...) arrives as a plain JS object.
+        if (arg.GetType().IsValueType && !arg.GetType().IsPrimitive)
+        {
+            string? json = null;
+            try { json = System.Text.Json.JsonSerializer.Serialize(arg, arg.GetType(), s_jsJsonOptions); } catch { }
+            if (json != null) { w.WriteByte(0x0D); w.WriteString32(json); return; }
+        }
 
         // Object: box in the handle map and send as a handle reference.
         // The JS side receives {__handle, __type} which can be turned into a
@@ -209,6 +261,7 @@ public static partial class Bridge
             case 0x05: return (object)r.ReadString32();
             case 0x06: return (object)new HandleRef(r.ReadI32());
             case 0x0A: return (object)new WinRtRef(r.ReadI64());
+            case 0x0D: return new JsJsonValue(r.ReadString32());
             case 0x07: // array: u32 count + N tagged items
             {
                 var count = (int)r.ReadU32();
@@ -237,8 +290,11 @@ public static partial class Bridge
 
     internal static unsafe void CallJsCallbackVoid(int id, object?[] args)
     {
-        CallJsCallback(id, args);
+        CallJsCallback(id, args, expectsResult: false);
     }
 
     
 }
+
+/// Thrown into managed code when a JavaScript callback that was expected to return a value threw.
+public sealed class JsException(string message) : Exception(message);

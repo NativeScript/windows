@@ -17,12 +17,28 @@ internal readonly struct WinRtRef(long ptr)
     public readonly long Ptr = ptr;
 }
 
+// A JS function passed where a delegate is expected (tag 0x0C): the runtime's callback id, wrapped
+// in a delegate of the parameter's type when the call's arguments are coerced.
+internal readonly struct JsFunctionRef(int id)
+{
+    public readonly int Id = id;
+}
+
+// A plain JS object (tag 0x0D) as JSON, deserialized into the struct/record/class the parameter or
+// return type expects (e.g. `{ Width: 120, Height: 40 }` for Windows.Foundation.Size).
+internal sealed class JsJsonValue(string json)
+{
+    public readonly string Json = json;
+}
+
 internal ref struct BinReader(ReadOnlySpan<byte> buf)
 {
     private readonly ReadOnlySpan<byte> _buf = buf;
     private int _pos = 0;
 
     public byte ReadByte() => _buf[_pos++];
+
+    public bool HasMore => _pos < _buf.Length;
 
     public int ReadI32()
     {
@@ -96,6 +112,8 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
                 0x05 => (object)ReadString16(),
                 0x06 => (object)new HandleRef(ReadI32()),
                 0x0A => (object)new WinRtRef(ReadI64()),
+                0x0C => (object)new JsFunctionRef(ReadI32()),
+                0x0D => (object)new JsJsonValue(ReadString32()),
                 _    => null,
             };
         }

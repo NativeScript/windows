@@ -22,9 +22,10 @@ public static partial class Bridge
                 $"Object of type {obj.GetType().FullName} is not awaitable. " +
                 $"Expected Task<T>, ValueTask<T>, IAsyncOperation<T>, or any type implementing GetAwaiter().");
 
+        // The handle stays valid after completion (the JS proxy releases it when collected), so
+        // the same Task can be awaited again.
         task.ContinueWith(completed =>
         {
-            s_handles.TryRemove(handleId, out _);
             try
             {
                 if (completed.IsFaulted)

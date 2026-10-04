@@ -90,8 +90,11 @@ pub fn install_module_natives(env: &Env, app_root: &str) -> napi::Result<()> {
                 // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`,
                 // so also check the sealed bundle's table — otherwise a relative require() from a
                 // bundle-only file would wrongly treat the referrer as the base dir, not its parent.
+                // A referrer that doesn't exist but names a file (the `app/bundle.js` fallback the
+                // top-level `require` uses when the entry script is not a bundle) is a file too.
                 let base = if parent.is_file()
                     || crate::source_protect::contains(&parent.to_string_lossy())
+                    || (!parent.exists() && parent.extension().is_some())
                 {
                     parent.parent().map(Path::to_path_buf).unwrap_or(parent)
                 } else {
