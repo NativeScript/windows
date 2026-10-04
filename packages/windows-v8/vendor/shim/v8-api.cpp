@@ -3,6 +3,10 @@
 #include <cmath>
 #include <string_view> // string_view, u16string_view
 #include <sstream>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #define NAPI_EXPERIMENTAL
 
@@ -2995,6 +2999,41 @@ const v8::ArrayBuffer *v8__ArrayBuffer__New__with_backing_store(
 void std__shared_ptr__v8__BackingStore__reset(void *shared_ptr_ref);
 }
 
+namespace {
+// An external ArrayBuffer's finalizer. Its backing store can outlive the env (it goes with the
+// isolate's heap), so the env's teardown runs it instead and clears `cb`, as Node does.
+struct AbFinalize {
+    napi_env env;
+    napi_finalize cb;
+    void *data;
+    void *hint;
+};
+
+std::mutex ab_finalizers_mutex;
+std::unordered_map<napi_env, std::unordered_set<AbFinalize *>> ab_finalizers;
+}
+
+// [windows port] Called by the env's teardown (napi-v8-shim/csrc/env_ext.cpp).
+void ns_napi_finalize_external_arraybuffers(napi_env env) {
+    // Copies: once `cb` is cleared, a deleter on another thread may free the record.
+    std::vector<AbFinalize> pending;
+    {
+        std::lock_guard<std::mutex> lock(ab_finalizers_mutex);
+        auto found = ab_finalizers.find(env);
+        if (found == ab_finalizers.end()) {
+            return;
+        }
+        for (AbFinalize *fd : found->second) {
+            pending.push_back(*fd);
+            fd->cb = nullptr;
+        }
+        ab_finalizers.erase(found);
+    }
+    for (const AbFinalize &fd : pending) {
+        fd.cb(env, fd.data, fd.hint);
+    }
+}
+
 napi_status NAPI_CDECL
 napi_create_external_arraybuffer(napi_env env,
                                  void *external_data,
@@ -3010,19 +3049,30 @@ napi_create_external_arraybuffer(napi_env env,
     // [windows port] TRUE zero-copy: build a BackingStore that aliases external_data with a deleter
     // that invokes the napi finalizer when the ArrayBuffer is GC'd. Goes through rusty_v8's C
     // bindings (see above) to avoid the libc++ std::unique_ptr ABI boundary.
-    struct AbFinalize {
-        napi_env env;
-        napi_finalize cb;
-        void *hint;
-    };
     void *deleter_data = nullptr;
-    void (*deleter)(void *, size_t, void *) = nullptr;
+    // V8 calls the deleter unconditionally when the backing store goes (at the latest when the
+    // isolate is disposed, as a terminated worker's is), so it can't be null.
+    void (*deleter)(void *, size_t, void *) = [](void *, size_t, void *) {};
     if (finalize_cb != nullptr) {
-        deleter_data = new AbFinalize{env, finalize_cb, finalize_hint};
+        auto *fd = new AbFinalize{env, finalize_cb, external_data, finalize_hint};
+        {
+            std::lock_guard<std::mutex> lock(ab_finalizers_mutex);
+            ab_finalizers[env].insert(fd);
+        }
+        deleter_data = fd;
         deleter = [](void *data, size_t, void *dd) {
             auto *fd = static_cast<AbFinalize *>(dd);
-            if (fd->cb) {
-                fd->cb(fd->env, data, fd->hint);
+            napi_finalize cb;
+            {
+                std::lock_guard<std::mutex> lock(ab_finalizers_mutex);
+                cb = fd->cb;
+                auto found = ab_finalizers.find(fd->env);
+                if (cb && found != ab_finalizers.end()) {
+                    found->second.erase(fd);
+                }
+            }
+            if (cb) {
+                cb(fd->env, data, fd->hint);
             }
             delete fd;
         };
