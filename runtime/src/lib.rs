@@ -374,6 +374,89 @@ pub fn pump_messages() -> bool {
     dispatched
 }
 
+/// Runs `f` on the JS thread whose isolate is `owner` (the UI thread's or a worker's) and waits for
+/// its result: inline when that is the current thread, otherwise handed over the way a callback
+/// invoked on a background thread is. `None` when that thread can't run it (gone, or unknown).
+#[cfg(feature = "classic")]
+pub(crate) fn run_on_js_thread_sync<R: Send>(owner: *mut v8::Isolate, f: impl FnOnce() -> R + Send) -> Option<R> {
+    if !is_live_isolate(owner) {
+        return None;
+    }
+    if DELEGATE_ISOLATE_PTR.with(|c| c.get()) == owner {
+        return Some(f());
+    }
+    if worker_threads::is_worker_isolate(owner as usize) {
+        return worker_threads::run_on_worker_sync(owner as usize, f);
+    }
+    if ui_dispatcher::is_ui_thread() {
+        return None;
+    }
+    ui_dispatcher::run_on_ui_thread_sync(f)
+}
+
+/// Queues `f` on the JS thread whose isolate is `owner` without waiting; runs it inline when that
+/// is the current thread. `false` when there is no such thread to run it on.
+#[cfg(feature = "classic")]
+pub(crate) fn post_to_js_thread(owner: *mut v8::Isolate, f: impl FnOnce() + Send + 'static) -> bool {
+    if !is_live_isolate(owner) {
+        return false;
+    }
+    if DELEGATE_ISOLATE_PTR.with(|c| c.get()) == owner {
+        f();
+        return true;
+    }
+    if worker_threads::is_worker_isolate(owner as usize) {
+        return worker_threads::post_to_worker(owner as usize, f);
+    }
+    if !ui_dispatcher::is_initialized() {
+        return false;
+    }
+    ui_dispatcher::post_to_ui_thread(f);
+    true
+}
+
+/// The isolates of the runtimes alive in this process (the UI thread's and each worker's). A
+/// callback that outlives its worker can't run anywhere: work for a disposed isolate is refused.
+#[cfg(feature = "classic")]
+static LIVE_ISOLATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(feature = "classic")]
+fn is_live_isolate(isolate: *mut v8::Isolate) -> bool {
+    !isolate.is_null() && LIVE_ISOLATES.lock().is_ok_and(|live| live.contains(&(isolate as usize)))
+}
+
+/// The isolate each .NET callback's JS function belongs to (callback ids are process-wide, the
+/// functions live in their JS thread's `DOTNET_JS_CALLBACKS`), so a callback the bridge invokes on
+/// another thread is run on the right one.
+#[cfg(feature = "classic")]
+static DOTNET_CALLBACK_OWNERS: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(feature = "classic")]
+pub(crate) fn record_dotnet_callback_owner(callback_id: i32) {
+    let owner = DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+    if let Ok(mut owners) = DOTNET_CALLBACK_OWNERS.lock() {
+        owners.insert(callback_id, owner);
+    }
+}
+
+#[cfg(feature = "classic")]
+pub(crate) fn dotnet_callback_owner(callback_id: i32) -> Option<*mut v8::Isolate> {
+    DOTNET_CALLBACK_OWNERS
+        .lock()
+        .ok()
+        .and_then(|owners| owners.get(&callback_id).copied())
+        .map(|o| o as *mut v8::Isolate)
+}
+
+#[cfg(feature = "classic")]
+pub(crate) fn forget_dotnet_callback_owner(callback_id: i32) {
+    if let Ok(mut owners) = DOTNET_CALLBACK_OWNERS.lock() {
+        owners.remove(&callback_id);
+    }
+}
+
 /// Retrieve (and clear) the last stored JS error.
 pub fn get_last_js_error() -> Option<String> {
     LAST_JS_ERROR.with(|e| e.borrow_mut().take())
@@ -8009,8 +8092,8 @@ pub(crate) struct JsDelegateData {
     /// For a delegate whose Invoke the shared vtable can't implement (see [`delegate_invoke`]):
     /// the typed Invoke and the delegate's own vtable, which points at it.
     typed: Option<(delegate_invoke::TypedInvoke, Box<JsDelegateVtbl>)>,
-    /// The isolate `js_func` belongs to: the UI thread's, or null for a delegate created where no
-    /// isolate is registered (a worker), which can't be handed to the UI thread.
+    /// The isolate `js_func` belongs to (the UI thread's or a worker's): Invoke and the final
+    /// Release run on that isolate's thread.
     owner_isolate: *mut v8::Isolate,
 }
 
@@ -8090,15 +8173,21 @@ unsafe extern "system" fn js_delegate_release(this: *mut JsDelegate) -> u32 {
         std::sync::atomic::fence(AtomicOrdering::Acquire);
         let b = Box::from_raw(this);
         let data = Box::from_raw(b.data);
-        // The function handle belongs to the UI thread's isolate: a final release on a background
-        // thread (the component that invoked the delegate there) frees it on the UI thread.
-        if !data.owner_isolate.is_null() && !ui_dispatcher::is_ui_thread() && ui_dispatcher::is_initialized() {
-            struct SendData(Box<JsDelegateData>);
-            unsafe impl Send for SendData {}
-            let data = SendData(data);
-            ui_dispatcher::post_to_ui_thread(move || drop(data));
-        } else {
+        // The function handle belongs to its JS thread's isolate: a final release on another thread
+        // (the component that invoked the delegate there) frees it on that thread.
+        let owner = data.owner_isolate;
+        if DELEGATE_ISOLATE_PTR.with(|c| c.get()) == owner || owner.is_null() {
             drop(data);
+        } else {
+            // Never dropped elsewhere: if that thread is gone (a terminated worker), the handle
+            // leaks rather than being freed into a disposed isolate.
+            struct SendData(std::mem::ManuallyDrop<Box<JsDelegateData>>);
+            unsafe impl Send for SendData {}
+            let data = SendData(std::mem::ManuallyDrop::new(data));
+            post_to_js_thread(owner, move || {
+                let data = data;
+                drop(std::mem::ManuallyDrop::into_inner(data.0));
+            });
         }
         // b (JsDelegate) dropped here
     }
@@ -8183,23 +8272,16 @@ fn js_delegate_invoke_with_args(
     result_slot: *mut c_void,
 ) -> HRESULT {
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
-    if !isolate_ptr.is_null() && isolate_ptr != data.owner_isolate {
-        // Never run a function against an isolate it doesn't belong to.
-        return HRESULT(0x8001010Eu32 as i32); // RPC_E_WRONG_THREAD
-    }
-    if isolate_ptr.is_null() {
-        // Invoked directly on a background thread (a component that calls its handlers without
-        // marshaling them back to the registering apartment): run the JS on the JS (UI) thread
-        // and wait, so the call is delivered and its result written before Invoke returns. The
-        // arguments are borrowed for the duration of Invoke, which is exactly how long they're used.
-        // Only the UI thread's functions can go there; a worker's stay undeliverable.
-        if ui_dispatcher::is_ui_thread() || data.owner_isolate.is_null() {
-            return HRESULT(0x80004005u32 as i32);
-        }
+    if isolate_ptr != data.owner_isolate {
+        // Invoked on another thread (a component that calls its handlers without marshaling them
+        // back to the registering apartment): run the JS on the thread that owns the function —
+        // the UI thread or a worker — and wait, so the call is delivered and its result written
+        // before Invoke returns. The arguments are borrowed for the duration of Invoke, which is
+        // exactly how long they're used.
         struct SendPtr(*mut JsDelegate, *mut c_void);
         unsafe impl Send for SendPtr {}
         let ptrs = SendPtr(this, result_slot);
-        return ui_dispatcher::run_on_ui_thread_sync(move || {
+        return run_on_js_thread_sync(data.owner_isolate, move || {
             let ptrs = ptrs;
             // SAFETY: the caller holds a reference on the delegate for the duration of Invoke.
             let data = unsafe { &*(*ptrs.0).data };
@@ -9036,6 +9118,9 @@ impl Runtime {
     pub fn register_delegate_isolate_ptr(&mut self) {
         let raw_isolate: *mut v8::Isolate = &mut *self.isolate as *mut v8::Isolate;
         DELEGATE_ISOLATE_PTR.with(|cell| cell.set(raw_isolate));
+        if let Ok(mut live) = LIVE_ISOLATES.lock() {
+            live.insert(raw_isolate as usize);
+        }
     }
 
     /// Provides mutable access to the underlying V8 isolate.
@@ -9352,6 +9437,9 @@ impl Drop for Runtime {
         // raw isolate pointers) must be cleared here, while `self.isolate` is
         // still alive. Anything left behind dangles into freed isolate memory
         // and crashes the next Runtime created on this thread.
+        if let Ok(mut live) = LIVE_ISOLATES.lock() {
+            live.remove(&(&mut *self.isolate as *mut v8::Isolate as usize));
+        }
         crate::wrapper_cache::clear();
         EVENT_REGISTRY.with(|m| m.borrow_mut().clear());
         ESM_MODULE_REGISTRY.with(|m| m.borrow_mut().clear());
@@ -9360,6 +9448,8 @@ impl Drop for Runtime {
         ESM_HTTP_URLS.with(|m| m.borrow_mut().clear());
         ESM_LOAD_ERRORS.with(|m| m.borrow_mut().clear());
         crate::esm_http::clear_thread_vocabulary();
+        // The ids keep their owner: a managed delegate that outlives this runtime (a terminated
+        // worker's) is refused rather than run elsewhere, until .NET releases it.
         DOTNET_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         DOTNET_ONESHOT_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         crate::timers::clear_thread_tasks();

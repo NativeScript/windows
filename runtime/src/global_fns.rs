@@ -1080,6 +1080,46 @@ pub(crate) fn handle_worker_post_message(
     }
 }
 
+/// Runs on a worker's creating thread when the worker has queued messages: hands them to that
+/// `Worker` object (`__nsWorkerDeliver`, installed by the Worker shim).
+pub(crate) fn deliver_worker_events(worker_id: u64) {
+    let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    if isolate_ptr.is_null() {
+        return;
+    }
+    let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+    v8::scope!(scope, isolate);
+    let Some(ctx_global) = scope.get_slot::<v8::Global<v8::Context>>().cloned() else {
+        return;
+    };
+    let context = v8::Local::new(scope, &ctx_global);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(tc, scope);
+
+    let global = context.global(tc);
+    let Some(key) = v8::String::new(tc, "__nsWorkerDeliver") else {
+        return;
+    };
+    let Some(deliver) = global
+        .get(tc, key.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
+    else {
+        return;
+    };
+    let id: v8::Local<v8::Value> = v8::Number::new(tc, worker_id as f64).into();
+    let _ = deliver.call(tc, global.into(), &[id]);
+    if tc.has_caught() {
+        if let Some(ex) = tc.exception() {
+            let msg = ex.to_rust_string_lossy(tc);
+            crate::store_last_js_error(msg);
+        }
+        tc.reset();
+    }
+    if !crate::defer_microtask_drain() {
+        tc.perform_microtask_checkpoint();
+    }
+}
+
 pub(crate) fn handle_worker_poll_messages(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -4510,18 +4550,23 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     _resp_len: *mut i32,
 ) {
     let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
-    if isolate_ptr.is_null() {
+    let owner = crate::dotnet_callback_owner(callback_id);
+    if isolate_ptr.is_null() || owner.is_some_and(|o| o != isolate_ptr) {
         // A managed delegate, event, Task continuation or overridden member running on a thread
-        // other than the JS thread: hand the call to the JS (UI) thread and wait for it, so the
-        // callback runs and its result reaches the managed caller (see `run_on_ui_thread_sync`).
-        if !crate::ui_dispatcher::is_ui_thread() {
-            let (args, resp, resp_len) = (args_ptr as usize, _resp_ptr as usize, _resp_len as usize);
-            let delivered = crate::ui_dispatcher::run_on_ui_thread_sync(move || {
-                invoke_dotnet_js_callback(callback_id, args as *const u8, args_len, resp as *mut *mut u8, resp_len as *mut i32)
-            });
-            if delivered.is_none() {
-                write_callback_response(&[0x0F, 0, 0, 0, 0][..], _resp_ptr, _resp_len);
-            }
+        // other than the one its JS function belongs to (the UI thread or a worker): hand the call
+        // to that thread and wait for it, so the callback runs and its result reaches the managed
+        // caller (see `run_on_js_thread_sync`).
+        let (args, resp, resp_len) = (args_ptr as usize, _resp_ptr as usize, _resp_len as usize);
+        let call = move || {
+            invoke_dotnet_js_callback(callback_id, args as *const u8, args_len, resp as *mut *mut u8, resp_len as *mut i32)
+        };
+        let delivered = match owner {
+            Some(owner) => crate::run_on_js_thread_sync(owner, call),
+            None if !crate::ui_dispatcher::is_ui_thread() => crate::ui_dispatcher::run_on_ui_thread_sync(call),
+            None => None,
+        };
+        if delivered.is_none() {
+            write_callback_response(&[0x0F, 0, 0, 0, 0][..], _resp_ptr, _resp_len);
         }
         return;
     }
@@ -4590,6 +4635,7 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
             crate::DOTNET_JS_CALLBACKS.with(|m| {
                 m.borrow_mut().remove(&callback_id);
             });
+            crate::forget_dotnet_callback_owner(callback_id);
             set.remove(&callback_id);
         }
     });
@@ -4620,18 +4666,43 @@ unsafe fn write_callback_response(bytes: &[u8], resp_ptr: *mut *mut u8, resp_len
     }
 }
 
-/// Drops the JS functions whose managed delegates the .NET GC has collected.
+/// Drops the JS functions whose managed delegates the .NET GC has collected. The release queue is
+/// process-wide; a function that belongs to another JS thread (a worker's) is dropped there.
 pub(crate) fn release_collected_js_callbacks() {
     let released = crate::dotnet::take_released_js_callbacks();
     if released.is_empty() {
         return;
     }
+    let current = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    let mut elsewhere: HashMap<usize, Vec<i32>> = HashMap::new();
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         let mut m = m.borrow_mut();
         for id in released {
-            m.remove(&id);
+            match crate::dotnet_callback_owner(id) {
+                Some(owner) if owner != current => elsewhere.entry(owner as usize).or_default().push(id),
+                _ => {
+                    m.remove(&id);
+                    crate::forget_dotnet_callback_owner(id);
+                }
+            }
         }
     });
+    for (owner, ids) in elsewhere {
+        let owned = ids.clone();
+        let queued = crate::post_to_js_thread(owner as *mut v8::Isolate, move || {
+            crate::DOTNET_JS_CALLBACKS.with(|m| {
+                let mut m = m.borrow_mut();
+                for id in ids {
+                    m.remove(&id);
+                    crate::forget_dotnet_callback_owner(id);
+                }
+            });
+        });
+        if !queued {
+            // That runtime is gone and took its functions with it.
+            owned.into_iter().for_each(crate::forget_dotnet_callback_owner);
+        }
+    }
 }
 
 /// Registers `func` as a callback the bridge can invoke and returns its id.
@@ -4640,6 +4711,7 @@ pub(crate) fn register_dotnet_js_callback(scope: &mut v8::PinScope<'_, '_>, func
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         m.borrow_mut().insert(cb_id, v8::Global::new(scope, func));
     });
+    crate::record_dotnet_callback_owner(cb_id);
     cb_id
 }
 
@@ -4700,6 +4772,7 @@ pub(crate) fn handle_dotnet_create_delegate(
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         m.borrow_mut().insert(cb_id, v8::Global::new(scope, func));
     });
+    crate::record_dotnet_callback_owner(cb_id);
 
     // opcode 0x09 | type_name (str16) | callback_id (i32)
     let mut req: Vec<u8> = Vec::with_capacity(32);
@@ -4787,6 +4860,7 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         m.borrow_mut().insert(cb_id, v8::Global::new(scope, cb_fn));
     });
+    crate::record_dotnet_callback_owner(cb_id);
 
     let mut req: Vec<u8> = Vec::with_capacity(64);
     req.push(0x0A);
@@ -4871,6 +4945,8 @@ pub(crate) fn handle_dotnet_await_task(
         map.insert(resolve_id, v8::Global::new(scope, resolve_fn));
         map.insert(reject_id, v8::Global::new(scope, reject_fn));
     });
+    crate::record_dotnet_callback_owner(resolve_id);
+    crate::record_dotnet_callback_owner(reject_id);
 
     // Binary instance call: 0x01 | handle(i32) | "__dotnet_await__"(str16) | 2 | i32 resolveId | i32 rejectId
     let mut req: Vec<u8> = Vec::with_capacity(32);
@@ -4889,6 +4965,8 @@ pub(crate) fn handle_dotnet_await_task(
             map.remove(&resolve_id);
             map.remove(&reject_id);
         });
+        crate::forget_dotnet_callback_owner(resolve_id);
+        crate::forget_dotnet_callback_owner(reject_id);
         throw_js_error(scope, &e);
     }
 }

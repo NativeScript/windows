@@ -17,6 +17,7 @@ const specs = [
 	"./tests/extend-dotnet.js",
 	"./tests/extend-winrt.js",
 	"./tests/threading.js",
+	"./tests/boxing.js",
 	"./tests/layout-mutation.js",
 	"./tests/lifetime.js",
 ];

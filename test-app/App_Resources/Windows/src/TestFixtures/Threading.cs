@@ -16,6 +16,8 @@ namespace TestFixtures.Threading
 
         public static bool IsUiThread() => Environment.CurrentManagedThreadId == UiThreadId;
 
+        public static int CurrentThreadId() => Environment.CurrentManagedThreadId;
+
         /// Calls `compute` on a thread-pool thread and reports its result through `done`, also
         /// from that thread: (result, ranOnBackgroundThread).
         public static void ComputeInBackground(Func<int, int> compute, int value, Action<int, bool> done)
@@ -44,6 +46,28 @@ namespace TestFixtures.Threading
                 }) { IsBackground = true }.Start();
             }
         }
+
+        /// Calls `callback` from a thread-pool thread after `delayMs`; whether it was delivered is
+        /// reported through `LastLateCall` ("delivered" or the exception's type name). A Func, so a
+        /// call that can't run surfaces as an exception (a void delegate just returns).
+        public static void CallLater(Func<int> callback, int delayMs)
+        {
+            LastLateCall = null;
+            Task.Delay(delayMs).ContinueWith(_ =>
+            {
+                try
+                {
+                    callback();
+                    LastLateCall = "delivered";
+                }
+                catch (Exception e)
+                {
+                    LastLateCall = e.GetType().Name;
+                }
+            });
+        }
+
+        public static string LastLateCall { get; private set; }
 
         public static void ThrowInBackground(Func<int> callback, Action<string> done)
         {

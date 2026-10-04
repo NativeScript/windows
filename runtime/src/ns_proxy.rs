@@ -466,6 +466,11 @@ pub(crate) fn try_wrap_inspectable_pointer<'a>(
         return None;
     }
     let instance = unsafe { IUnknown::from_raw(value) };
+    // A boxed primitive (an `Object` property such as `Tag` holding a string, a PropertySet
+    // value) reads back as the JS primitive; dropping `instance` releases the box.
+    if let Some(v) = try_unbox_property_value(&instance, scope) {
+        return Some(v);
+    }
     let resolved = instance
         .cast::<IInspectable>()
         .ok()
@@ -491,6 +496,38 @@ pub(crate) fn try_wrap_inspectable_pointer<'a>(
             let _ = std::mem::ManuallyDrop::new(instance);
             None
         }
+    }
+}
+
+/// The JS primitive for a boxed scalar (`IPropertyValue`: numbers, booleans, strings, GUIDs), or
+/// `None` for anything else (arrays, structs and real objects stay wrapped).
+fn try_unbox_property_value<'a>(
+    instance: &IUnknown,
+    scope: &mut v8::PinScope<'a, '_>,
+) -> Option<v8::Local<'a, v8::Value>> {
+    use windows::Foundation::{IPropertyValue, PropertyType};
+    let pv: IPropertyValue = instance.cast().ok()?;
+    let num = |scope: &mut v8::PinScope<'a, '_>, v: f64| Some(v8::Number::new(scope, v).into());
+    match pv.Type().ok()? {
+        PropertyType::UInt8 => num(scope, pv.GetUInt8().ok()? as f64),
+        PropertyType::Int16 => num(scope, pv.GetInt16().ok()? as f64),
+        PropertyType::UInt16 => num(scope, pv.GetUInt16().ok()? as f64),
+        PropertyType::Int32 => num(scope, pv.GetInt32().ok()? as f64),
+        PropertyType::UInt32 => num(scope, pv.GetUInt32().ok()? as f64),
+        PropertyType::Int64 => num(scope, pv.GetInt64().ok()? as f64),
+        PropertyType::UInt64 => num(scope, pv.GetUInt64().ok()? as f64),
+        PropertyType::Single => num(scope, pv.GetSingle().ok()? as f64),
+        PropertyType::Double => num(scope, pv.GetDouble().ok()?),
+        PropertyType::Boolean => Some(v8::Boolean::new(scope, pv.GetBoolean().ok()?).into()),
+        PropertyType::String => {
+            let s = pv.GetString().ok()?;
+            v8::String::new_from_two_byte(scope, &s, v8::NewStringType::Normal).map(Into::into)
+        }
+        PropertyType::Guid => {
+            let g = pv.GetGuid().ok()?;
+            v8::String::new(scope, &format!("{g:?}")).map(Into::into)
+        }
+        _ => None,
     }
 }
 

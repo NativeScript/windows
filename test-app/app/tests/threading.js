@@ -104,4 +104,108 @@ describe("Threading", () => {
 			expect(value).toBe(3);
 		});
 	});
+
+	// A callback created in a worker belongs to that worker's isolate: invoked on a background
+	// thread, it runs on the worker's thread (as on iOS and Android), not the UI thread. The
+	// Node-API engines don't implement workers.
+	(typeof Worker === "function" ? describe : xdescribe)("Workers", () => {
+		const workerSource = `
+			for (const name of ["setTimeout", "setInterval", "clearTimeout", "clearInterval"]) {
+				if (typeof globalThis[name] !== "function") globalThis[name] = globalThis["__ns__" + name];
+			}
+			const BI = TestFixtures.Threading.BackgroundInvoker;
+			const workerThread = BI.CurrentThreadId();
+			const onWorker = () => BI.CurrentThreadId() === workerThread;
+			const report = (test, run) =>
+				Promise.resolve()
+					.then(run)
+					.then((result) => self.postMessage({ test, result }), (e) => self.postMessage({ test, error: String(e && e.message || e) }));
+			self.onmessage = (e) => {
+				if (e.data === "winrt") {
+					report("winrt", async () => {
+						let ranOnWorker = null;
+						await NSWinRT.toPromise(Windows.System.Threading.ThreadPool.RunAsync(() => (ranOnWorker = onWorker())));
+						return { ranOnWorker };
+					});
+				} else if (e.data === "dotnet") {
+					report("dotnet", () => new Promise((resolve) => {
+						let computedOnWorker = null;
+						BI.ComputeInBackground(
+							(v) => ((computedOnWorker = onWorker()), v * 2),
+							21,
+							(r, background) => resolve({ r, background, computedOnWorker, doneOnWorker: onWorker() })
+						);
+					}));
+				} else if (e.data === "event") {
+					report("event", () => new Promise((resolve) => {
+						const ticker = new TestFixtures.Threading.Ticker();
+						const ticks = [];
+						ticker.add_Tick((sender, i) => {
+							ticks.push(onWorker() ? i : -i);
+							if (ticks.length === 3) resolve(ticks);
+						});
+						ticker.StartInBackground(3);
+					}));
+				}
+			};
+		`;
+		let worker;
+		const replies = {};
+
+		function ask(test, timeoutMs = 6000) {
+			worker.postMessage(test);
+			return waitFor(() => test in replies, timeoutMs).then(() => {
+				const reply = replies[test];
+				if (reply.error) throw new Error(reply.error);
+				return reply.result;
+			});
+		}
+
+		beforeAll(() => {
+			worker = new Worker(workerSource, { eval: true });
+			worker.onmessage = (e) => (replies[e.data.test] = e.data);
+		});
+
+		afterAll(() => worker.terminate());
+
+		it("delivers a WinRT delegate created in a worker on the worker's thread", async () => {
+			expect(await ask("winrt")).toEqual({ ranOnWorker: true });
+		});
+
+		it("delivers a .NET delegate created in a worker on the worker's thread", async () => {
+			expect(await ask("dotnet")).toEqual({ r: 42, background: true, computedOnWorker: true, doneOnWorker: true });
+		});
+
+		it("delivers C# events subscribed in a worker on the worker's thread", async () => {
+			expect(await ask("event")).toEqual([1, 2, 3]);
+		});
+
+		it("delivers messages a worker posts on its own", async () => {
+			const seen = [];
+			const ticking = new Worker(
+				`for (const name of ["setTimeout", "clearTimeout"]) if (typeof globalThis[name] !== "function") globalThis[name] = globalThis["__ns__" + name];
+				setTimeout(() => self.postMessage("later"), 50);`,
+				{ eval: true }
+			);
+			ticking.onmessage = (e) => seen.push(e.data);
+			await waitFor(() => seen.length > 0);
+			ticking.terminate();
+			expect(seen).toEqual(["later"]);
+		});
+
+		it("refuses a callback whose worker has terminated without crashing", async () => {
+			const BI = TestFixtures.Threading.BackgroundInvoker;
+			let armed = false;
+			const doomed = new Worker(
+				`TestFixtures.Threading.BackgroundInvoker.CallLater(() => 1, 300); self.postMessage("armed");`,
+				{ eval: true }
+			);
+			doomed.onmessage = () => (armed = true);
+			await waitFor(() => armed);
+			doomed.terminate();
+			await waitFor(() => BI.LastLateCall != null);
+			expect(BI.LastLateCall).toBe("JsException");
+			expect(BI.CurrentThreadId()).toBeGreaterThan(0);
+		});
+	});
 });

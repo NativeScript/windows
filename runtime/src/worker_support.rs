@@ -75,6 +75,8 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
             executor(workerGlobal, workerGlobal, workerGlobal.postMessage, MessagePort, MessageChannel, filename);
         }
 
+        var __threadedWorkers = {};
+
         function Worker(specifierOrSource, options) {
             if (!(this instanceof Worker)) {
                 throw new TypeError('Class constructor Worker cannot be invoked without new');
@@ -100,6 +102,10 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
                     resolved.filename,
                     String(globalThis.__nsAppRoot || '')
                 );
+                if (workerId >= 0) {
+                    // The runtime calls this whenever the worker has posted messages.
+                    __threadedWorkers[workerId] = function () { dispatchThreadedMessages(); };
+                }
             }
 
             function dispatchThreadedMessages(messages) {
@@ -138,6 +144,7 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
 
                     if (value && typeof value === 'object' && value.__workerExit) {
                         terminated = true;
+                        delete __threadedWorkers[workerId];
                         delivered += 1;
                         continue;
                     }
@@ -178,6 +185,7 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
             this.terminate = function () {
                 if (terminated) { return; }
                 terminated = true;
+                delete __threadedWorkers[workerId];
 
                 if (canUseThreadedHost && workerId >= 0) {
                     try { globalThis.__nsWorkerTerminate(workerId); } catch (_) {}
@@ -233,6 +241,10 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
         }
 
         globalThis.Worker = Worker;
+        globalThis.__nsWorkerDeliver = function (workerId) {
+            var deliver = __threadedWorkers[workerId];
+            if (deliver) { deliver(); }
+        };
     })();
     "#;
 

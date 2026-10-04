@@ -230,10 +230,17 @@ async function execute(options) {
 	const log = options.log || ((s) => console.log(s));
 	const started = Date.now();
 
+	const fullNameOf = (spec) => `${spec.suite.fullName()} ${spec.description}`.trim();
+	const isSkipped = (spec) => spec.pending || spec.suite.pending || (options.filter && !options.filter.test(fullNameOf(spec)));
+	const willRun = (node) => (!focused || isFocused(node)) && (node.kind === "spec" ? !isSkipped(node) : node.suite.children.some(willRun));
+
 	async function visitSuite(suite) {
 		const runnable = suite.children.filter((c) => !focused || isFocused(c));
 		if (runnable.length === 0) return;
-		for (const fn of suite.beforeAll) {
+		// A suite whose specs are all skipped only reports them: its hooks may depend on what made
+		// it skip (xdescribe on a missing feature).
+		const hooks = runnable.some(willRun);
+		for (const fn of hooks ? suite.beforeAll : []) {
 			try {
 				await runFn(fn, {}, DEFAULT_TIMEOUT_MS, `beforeAll in "${suite.fullName()}"`);
 			} catch (e) {
@@ -244,7 +251,7 @@ async function execute(options) {
 			if (child.kind === "suite") await visitSuite(child.suite);
 			else await visitSpec(child);
 		}
-		for (const fn of suite.afterAll) {
+		for (const fn of hooks ? suite.afterAll : []) {
 			try {
 				await runFn(fn, {}, DEFAULT_TIMEOUT_MS, `afterAll in "${suite.fullName()}"`);
 			} catch (e) {
@@ -254,8 +261,8 @@ async function execute(options) {
 	}
 
 	async function visitSpec(spec) {
-		const fullName = `${spec.suite.fullName()} ${spec.description}`.trim();
-		if (spec.pending || spec.suite.pending || (options.filter && !options.filter.test(fullName))) {
+		const fullName = fullNameOf(spec);
+		if (isSkipped(spec)) {
 			results.push({ suite: spec.suite.fullName(), name: spec.description, fullName, status: "pending", failures: [], time: 0 });
 			return;
 		}

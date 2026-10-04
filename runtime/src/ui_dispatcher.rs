@@ -137,7 +137,24 @@ pub fn run_on_ui_thread_sync<R: Send>(f: impl FnOnce() -> R + Send) -> Option<R>
         return Some(f());
     }
     let dq = UI_QUEUE.get()?;
+    run_job_sync(f, |job| {
+        let cell = std::sync::Mutex::new(Some(job));
+        let handler = DispatcherQueueHandler::new(move || {
+            if let Some(job) = cell.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                job();
+            }
+            Ok(())
+        });
+        dq.TryEnqueue(&handler).unwrap_or(false)
+    })
+}
 
+/// Hands `f` to another thread through `enqueue` and waits for its result. `None` when `enqueue`
+/// reports failure or the job is dropped without running (its thread is shutting down).
+pub(crate) fn run_job_sync<R: Send>(
+    f: impl FnOnce() -> R + Send,
+    enqueue: impl FnOnce(Box<dyn FnOnce() + Send + 'static>) -> bool,
+) -> Option<R> {
     let slot: std::sync::Arc<(std::sync::Mutex<Option<R>>, std::sync::Condvar)> =
         std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
     let slot2 = slot.clone();
@@ -148,21 +165,12 @@ pub fn run_on_ui_thread_sync<R: Send>(f: impl FnOnce() -> R + Send) -> Option<R>
         cvar.notify_all();
     });
     // SAFETY: the job may borrow from the caller's stack (`f` is not 'static). Once queued, this
-    // function waits until the job has run or the dispatcher has dropped it unrun; if queueing
-    // fails, the job is dropped before returning. Either way it never outlives what it borrows.
+    // function waits until the job has run or has been dropped unrun; if queueing fails, the job
+    // is dropped before returning. Either way it never outlives what it borrows.
     let job: Box<dyn FnOnce() + Send + 'static> = unsafe { std::mem::transmute(job) };
-
-    let cell = std::sync::Mutex::new(Some(job));
-    let handler = DispatcherQueueHandler::new(move || {
-        if let Some(job) = cell.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            job();
-        }
-        Ok(())
-    });
-    if !dq.TryEnqueue(&handler).unwrap_or(false) {
+    if !enqueue(job) {
         return None;
     }
-    drop(handler);
 
     let (lock, cvar) = &*slot;
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -170,8 +178,8 @@ pub fn run_on_ui_thread_sync<R: Send>(f: impl FnOnce() -> R + Send) -> Option<R>
         if let Some(r) = guard.take() {
             return Some(r);
         }
-        // The only way out without a result is the dispatcher dropping the job unrun (shutdown):
-        // then nothing else holds the job's half of `slot`.
+        // The only way out without a result is the job being dropped unrun (shutdown): then
+        // nothing else holds the job's half of `slot`.
         if std::sync::Arc::strong_count(&slot) == 1 {
             return None;
         }
