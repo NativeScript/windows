@@ -7,7 +7,7 @@ use napi_derive::napi;
 use windows_core::GUID;
 
 use runtime::napi_engine::delegate::{
-    invoke_delegate_raw, make_napi_delegate, release_delegate_raw,
+    invoke_delegate_raw, make_napi_void_delegate, release_delegate_raw,
 };
 use runtime::napi_engine::NativeType;
 
@@ -37,7 +37,7 @@ pub fn make_delegate(env: Env, func: JsFunction, param_types: Vec<String>) -> na
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| napi::Error::from_reason("unknown param type"))?;
     let guid = GUID::from_u128(0x11223344_5566_7788_99aa_bbccddeeff00);
-    match make_napi_delegate(&env, &func, guid, types) {
+    match make_napi_void_delegate(&env, &func, guid, types) {
         Some(ptr) => Ok(ptr as usize as f64),
         None => Err(napi::Error::from_reason("make_napi_delegate failed")),
     }

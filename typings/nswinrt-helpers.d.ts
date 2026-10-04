@@ -7,6 +7,12 @@ declare global {
   // Usage: @Interfaces([Windows.UI.Xaml.Controls.Primitives.IButtonBase])
   function Interfaces(interfaces: any[]): ClassDecorator;
 
+  // TypeScript @NativeClass decorator — marks a class extending a native (WinRT/.NET) class, as on
+  // iOS/Android. Extending works without it on Windows; it keeps shared code compiling unchanged.
+  // Usage: @NativeClass() class MyPanel extends Microsoft.UI.Xaml.Controls.Panel { ... }
+  function NativeClass<T extends Function>(target: T): T;
+  function NativeClass(): ClassDecorator;
+
   // TypeScript @CSharpProxy decorator — set an explicit managed type name.
   // Usage: @CSharpProxy('MyApp.Namespace.MyButton')
   // When present, creates a real C# subclass via the managed bridge.

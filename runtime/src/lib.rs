@@ -285,17 +285,30 @@ pub fn pump_dispatcher() {
     if isolate_ptr.is_null() {
         return;
     }
+    {
+        let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+        v8::scope!(scope, isolate);
+        let ctx = match scope.get_slot::<v8::Global<v8::Context>>() {
+            Some(g) => g.clone(),
+            None => return,
+        };
+        let ctx = v8::Local::new(scope, &ctx);
+        let scope = &mut v8::ContextScope::new(scope, ctx);
+        v8::tc_scope!(tc, scope);
+        tc.perform_microtask_checkpoint();
+    }
+    // With the explicit microtasks policy V8 leaves both of these to the embedder: WeakRef targets
+    // stay alive until the kept-objects set is cleared, and FinalizationRegistry callbacks (which
+    // release the .NET objects behind collected JS proxies) run as platform tasks.
     let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
-    v8::scope!(scope, isolate);
-    let ctx = match scope.get_slot::<v8::Global<v8::Context>>() {
-        Some(g) => g.clone(),
-        None => return,
-    };
-    let ctx = v8::Local::new(scope, &ctx);
-    let scope = &mut v8::ContextScope::new(scope, ctx);
-    v8::tc_scope!(tc, scope);
-    tc.perform_microtask_checkpoint();
+    isolate.clear_kept_objects();
+    if let Some(platform) = V8_PLATFORM.get() {
+        while v8::Platform::pump_message_loop(platform, isolate, false) {}
+    }
 }
+
+#[cfg(feature = "classic")]
+static V8_PLATFORM: OnceLock<v8::SharedRef<v8::Platform>> = OnceLock::new();
 
 /// Move the post-callback microtask checkpoint out of the current native frame
 /// when that frame may be a re-entrancy-sensitive XAML callout.
@@ -359,6 +372,89 @@ pub fn pump_messages() -> bool {
     #[cfg(feature = "classic")]
     pump_dispatcher();
     dispatched
+}
+
+/// Runs `f` on the JS thread whose isolate is `owner` (the UI thread's or a worker's) and waits for
+/// its result: inline when that is the current thread, otherwise handed over the way a callback
+/// invoked on a background thread is. `None` when that thread can't run it (gone, or unknown).
+#[cfg(feature = "classic")]
+pub(crate) fn run_on_js_thread_sync<R: Send>(owner: *mut v8::Isolate, f: impl FnOnce() -> R + Send) -> Option<R> {
+    if !is_live_isolate(owner) {
+        return None;
+    }
+    if DELEGATE_ISOLATE_PTR.with(|c| c.get()) == owner {
+        return Some(f());
+    }
+    if worker_threads::is_worker_isolate(owner as usize) {
+        return worker_threads::run_on_worker_sync(owner as usize, f);
+    }
+    if ui_dispatcher::is_ui_thread() {
+        return None;
+    }
+    ui_dispatcher::run_on_ui_thread_sync(f)
+}
+
+/// Queues `f` on the JS thread whose isolate is `owner` without waiting; runs it inline when that
+/// is the current thread. `false` when there is no such thread to run it on.
+#[cfg(feature = "classic")]
+pub(crate) fn post_to_js_thread(owner: *mut v8::Isolate, f: impl FnOnce() + Send + 'static) -> bool {
+    if !is_live_isolate(owner) {
+        return false;
+    }
+    if DELEGATE_ISOLATE_PTR.with(|c| c.get()) == owner {
+        f();
+        return true;
+    }
+    if worker_threads::is_worker_isolate(owner as usize) {
+        return worker_threads::post_to_worker(owner as usize, f);
+    }
+    if !ui_dispatcher::is_initialized() {
+        return false;
+    }
+    ui_dispatcher::post_to_ui_thread(f);
+    true
+}
+
+/// The isolates of the runtimes alive in this process (the UI thread's and each worker's). A
+/// callback that outlives its worker can't run anywhere: work for a disposed isolate is refused.
+#[cfg(feature = "classic")]
+static LIVE_ISOLATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(feature = "classic")]
+fn is_live_isolate(isolate: *mut v8::Isolate) -> bool {
+    !isolate.is_null() && LIVE_ISOLATES.lock().is_ok_and(|live| live.contains(&(isolate as usize)))
+}
+
+/// The isolate each .NET callback's JS function belongs to (callback ids are process-wide, the
+/// functions live in their JS thread's `DOTNET_JS_CALLBACKS`), so a callback the bridge invokes on
+/// another thread is run on the right one.
+#[cfg(feature = "classic")]
+static DOTNET_CALLBACK_OWNERS: std::sync::LazyLock<std::sync::Mutex<HashMap<i32, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(feature = "classic")]
+pub(crate) fn record_dotnet_callback_owner(callback_id: i32) {
+    let owner = DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+    if let Ok(mut owners) = DOTNET_CALLBACK_OWNERS.lock() {
+        owners.insert(callback_id, owner);
+    }
+}
+
+#[cfg(feature = "classic")]
+pub(crate) fn dotnet_callback_owner(callback_id: i32) -> Option<*mut v8::Isolate> {
+    DOTNET_CALLBACK_OWNERS
+        .lock()
+        .ok()
+        .and_then(|owners| owners.get(&callback_id).copied())
+        .map(|o| o as *mut v8::Isolate)
+}
+
+#[cfg(feature = "classic")]
+pub(crate) fn forget_dotnet_callback_owner(callback_id: i32) {
+    if let Ok(mut owners) = DOTNET_CALLBACK_OWNERS.lock() {
+        owners.remove(&callback_id);
+    }
 }
 
 /// Retrieve (and clear) the last stored JS error.
@@ -1285,6 +1381,33 @@ fn symbol_has_instance_callback(
         return;
     };
 
+    // `x instanceof Sub` where `class Sub extends SomeWinRTClass`: Sub inherits this function (a
+    // WinRT constructor owns its @@hasInstance), but the question is about Sub, so answer it the
+    // ordinary way (Sub.prototype in x's chain).
+    let receiver = args.this();
+    if let Ok(receiver_fn) = v8::Local::<v8::Function>::try_from(Local::<v8::Value>::from(receiver)) {
+        let has_instance = v8::Symbol::get_has_instance(scope);
+        let native_ctor = receiver_fn.has_own_property(scope, has_instance.into()).unwrap_or(true);
+        if !native_ctor {
+            let proto_key = v8::String::new(scope, "prototype").unwrap();
+            let target = receiver_fn.get(scope, proto_key.into());
+            let mut current = obj.get_prototype(scope);
+            let mut found = false;
+            while let (Some(t), Some(c)) = (target, current) {
+                if c.is_null() {
+                    break;
+                }
+                if c.strict_equals(t) {
+                    found = true;
+                    break;
+                }
+                current = c.to_object(scope).and_then(|o| o.get_prototype(scope));
+            }
+            retval.set_bool(found);
+            return;
+        }
+    }
+
     let data_ext = unsafe { args.data().cast::<v8::External>() };
     let data_ptr = data_ext.value() as *const HasInstanceData;
     let data = unsafe { &*data_ptr };
@@ -1304,7 +1427,10 @@ fn symbol_has_instance_callback(
                 }
 
                 let Some(iid) = data.iid else {
-                    retval.set_bool(false);
+                    // A class: true when the instance's class derives from it
+                    // (a StackPanel is a Panel, a FrameworkElement and a UIElement).
+                    let own_class = dec.read().full_name().to_string();
+                    retval.set_bool(class_derives_from(&own_class, &data.full_name));
                     return;
                 };
                 let Some(instance) = dec.instance.clone() else {
@@ -1835,7 +1961,9 @@ fn resolve_file_specifier(specifier: &str, referrer_path: Option<&str>) -> Strin
         // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`, so also
         // check the sealed bundle's table: otherwise a relative import from a bundle-only module
         // would wrongly treat the referrer itself as the base directory instead of its parent.
-        let base = if parent.is_file() || crate::source_protect::contains(&parent.to_string_lossy())
+        let base = if parent.is_file()
+            || crate::source_protect::contains(&parent.to_string_lossy())
+            || (!parent.exists() && parent.extension().is_some())
         {
             parent.parent().map(Path::to_path_buf).unwrap_or(parent)
         } else {
@@ -5799,6 +5927,128 @@ unsafe fn raw_result_to_local<'s>(
     }
 }
 
+/// A static WinRT event exposed on its class constructor (see `create_ns_ctor_object`).
+#[cfg(feature = "classic")]
+struct StaticEventData {
+    class_name: String,
+    name: String,
+    add: MethodDeclaration,
+    remove: MethodDeclaration,
+}
+
+/// Whether WinRT class `class_name` is `ancestor` or derives from it, following the metadata
+/// base-class chain.
+#[cfg(feature = "classic")]
+fn class_derives_from(class_name: &str, ancestor: &str) -> bool {
+    let mut current = class_name.to_string();
+    for _ in 0..64 {
+        if current == ancestor {
+            return true;
+        }
+        let Some(decl) = MetadataReader::find_by_name(&current) else {
+            return false;
+        };
+        let lock = decl.read();
+        let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+            return false;
+        };
+        let base = clazz.base_full_name();
+        if base.is_empty() || base == "System.Object" || base == current {
+            return false;
+        }
+        current = base.to_string();
+    }
+    false
+}
+
+/// `__nsWrapWinRTPointer(ptr, typeName)`: the WinRT wrapper for a COM object the runtime didn't
+/// create itself — the composed instance behind a JS subclass of a WinRT class, created by the
+/// .NET bridge. Takes its own reference; `ptr` is a BigInt IInspectable/IUnknown pointer.
+#[cfg(feature = "classic")]
+pub(crate) fn handle_wrap_winrt_pointer(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let ptr = match v8::Local::<v8::BigInt>::try_from(args.get(0)) {
+        Ok(b) => b.u64_value().0 as usize,
+        Err(_) => match v8::Local::<v8::Number>::try_from(args.get(0)) {
+            Ok(n) => n.value() as usize,
+            Err(_) => 0,
+        },
+    };
+    let type_name = args.get(1).to_rust_string_lossy(scope);
+    if ptr == 0 {
+        throw_js_error(scope, "__nsWrapWinRTPointer: null pointer");
+        return;
+    }
+    let Some(declaration) = MetadataReader::find_by_name(&type_name) else {
+        throw_js_error(scope, &format!("__nsWrapWinRTPointer: unknown WinRT type {type_name}"));
+        return;
+    };
+    let instance: IUnknown = unsafe {
+        let borrowed = std::mem::ManuallyDrop::new(IUnknown::from_raw(ptr as *mut c_void));
+        (*borrowed).clone()
+    };
+    let short_name = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
+    let wrapper = create_ns_ctor_instance_object(&short_name, None, None, declaration, Some(instance), scope);
+    retval.set(wrapper);
+}
+
+/// `super(...)` from a JS subclass of a WinRT class (or TypeScript's ES5 `_super.call(this, ...)`)
+/// reaching the WinRT constructor. Returns true when the bootstrap constructed the subclass
+/// instance (set as the return value); false when this is an ordinary construction.
+#[cfg(feature = "classic")]
+fn construct_winrt_subclass(
+    scope: &mut v8::PinScope<'_, '_>,
+    full_name: &str,
+    args: &v8::FunctionCallbackArguments,
+    retval: &mut v8::ReturnValue,
+) -> bool {
+    let new_target = args.new_target();
+    let type_key = v8::String::new(scope, "__typeName__").unwrap();
+    let (new_target_arg, this_arg): (Local<v8::Value>, Local<v8::Value>) = if new_target.is_function() {
+        let Some(nt) = new_target.to_object(scope) else { return false };
+        // `new SomeWinRTClass()` itself: the constructor has its own __typeName__.
+        if nt.has_own_property(scope, type_key.into()).unwrap_or(true) {
+            return false;
+        }
+        (new_target, v8::undefined(scope).into())
+    } else {
+        // Called without `new`: only an ES5 subclass constructor does that, passing its `this`.
+        let this: Local<v8::Value> = args.this().into();
+        if !this.is_object() {
+            return false;
+        }
+        (v8::null(scope).into(), this)
+    };
+
+    let global = scope.get_current_context().global(scope);
+    let helper_key = v8::String::new(scope, "__nsConstructWinRTSubclass").unwrap();
+    let Some(helper) = global
+        .get(scope, helper_key.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
+    else {
+        return false;
+    };
+    let ctor_args = v8::Array::new(scope, args.length());
+    for i in 0..args.length() {
+        ctor_args.set_index(scope, i as u32, args.get(i));
+    }
+    let name = v8::String::new(scope, full_name).unwrap();
+    let call_args = [name.into(), new_target_arg, ctor_args.into(), this_arg];
+    let undefined = v8::undefined(scope).into();
+    match helper.call(scope, undefined, &call_args) {
+        Some(result) if result.is_object() => {
+            retval.set(result);
+            true
+        }
+        // undefined: not a subclass construction after all; an exception propagates as is.
+        Some(_) => false,
+        None => true,
+    }
+}
+
 #[cfg(feature = "classic")]
 fn create_ns_ctor_object<'a>(
     name: &str,
@@ -5877,6 +6127,11 @@ fn create_ns_ctor_object<'a>(
                     parent = dec.parent.clone();
                 }
                 drop(lock);
+                // `class X extends ThisClass`: X's instances are composed objects whose overridable
+                // members (MeasureOverride, OnApplyTemplate, ...) call back into X.
+                if !is_sealed && construct_winrt_subclass(scope, &full_name, &args, &mut retval) {
+                    return;
+                }
                 // The constructor's own declaration is the class: no name lookup per `new`.
                 let class_declaration = Arc::clone(&dec.inner);
 
@@ -6702,6 +6957,52 @@ fn create_ns_ctor_object<'a>(
                 None,
                 v8::PropertyAttribute::DONT_DELETE,
             );
+        }
+
+        // Static events (CompositionTarget.Rendering, ...) use the same assignment syntax as
+        // instance events: `Class.Event = handler` subscribes (replacing the previous handler),
+        // `Class.Event = null` unsubscribes, and reading returns the current handler. They're
+        // added and removed through the class's statics interface on its activation factory.
+        for event in clazz.events().iter().filter(|e| e.is_static()) {
+            if !added_names.insert(event.name().to_string()) {
+                continue;
+            }
+            let Some(event_name) = v8::String::new(scope, event.name()) else {
+                continue;
+            };
+            let data = Box::into_raw(Box::new(StaticEventData {
+                class_name: clazz.full_name().to_string(),
+                name: event.name().to_string(),
+                add: event.add_method().clone(),
+                remove: event.remove_method().clone(),
+            }));
+            let data = v8::External::new(scope, data as _);
+            let getter = v8::FunctionTemplate::builder(
+                |scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, mut retval: v8::ReturnValue| {
+                    let data = unsafe { &*(args.data().cast::<v8::External>().value() as *const StaticEventData) };
+                    let factory = class_activation_factory(&data.class_name).ok();
+                    retval.set(crate::ns_proxy::read_winrt_event(scope, factory.as_ref(), &data.name));
+                },
+            )
+            .data(data.into())
+            .build(scope);
+            let setter = v8::FunctionTemplate::builder(
+                |scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue| {
+                    let data = unsafe { &*(args.data().cast::<v8::External>().value() as *const StaticEventData) };
+                    match class_activation_factory(&data.class_name) {
+                        Ok(factory) => {
+                            crate::ns_proxy::wire_winrt_event(scope, &data.name, Some(factory), &data.add, &data.remove, args.get(0));
+                        }
+                        Err(e) => throw_js_error(
+                            scope,
+                            &format!("Failed to subscribe to {}.{}: {}", data.class_name, data.name, e.message()),
+                        ),
+                    }
+                },
+            )
+            .data(data.into())
+            .build(scope);
+            tmpl.set_accessor_property(event_name.into(), Some(getter), Some(setter), v8::PropertyAttribute::DONT_DELETE);
         }
 
         attach_has_instance_to_template(scope, tmpl, None, &clazz.full_name().to_string());
@@ -7791,6 +8092,9 @@ pub(crate) struct JsDelegateData {
     /// For a delegate whose Invoke the shared vtable can't implement (see [`delegate_invoke`]):
     /// the typed Invoke and the delegate's own vtable, which points at it.
     typed: Option<(delegate_invoke::TypedInvoke, Box<JsDelegateVtbl>)>,
+    /// The isolate `js_func` belongs to (the UI thread's or a worker's): Invoke and the final
+    /// Release run on that isolate's thread.
+    owner_isolate: *mut v8::Isolate,
 }
 
 /// Wraps `js_func` as a COM delegate implementing `signature`; returns the IUnknown-compatible
@@ -7815,7 +8119,8 @@ pub(crate) fn new_js_delegate(js_func: v8::Global<v8::Function>, guid: GUID, sig
         Some((_, vtable)) => &**vtable,
         None => &JS_DELEGATE_VTBL,
     };
-    let data = Box::new(JsDelegateData { js_func, signature, typed });
+    let owner_isolate = DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    let data = Box::new(JsDelegateData { js_func, signature, typed, owner_isolate });
     let delegate = Box::new(JsDelegate {
         vtable,
         ref_count: AtomicU32::new(1),
@@ -7867,7 +8172,23 @@ unsafe extern "system" fn js_delegate_release(this: *mut JsDelegate) -> u32 {
     if prev == 1 {
         std::sync::atomic::fence(AtomicOrdering::Acquire);
         let b = Box::from_raw(this);
-        drop(Box::from_raw(b.data));
+        let data = Box::from_raw(b.data);
+        // The function handle belongs to its JS thread's isolate: a final release on another thread
+        // (the component that invoked the delegate there) frees it on that thread.
+        let owner = data.owner_isolate;
+        if DELEGATE_ISOLATE_PTR.with(|c| c.get()) == owner || owner.is_null() {
+            drop(data);
+        } else {
+            // Never dropped elsewhere: if that thread is gone (a terminated worker), the handle
+            // leaks rather than being freed into a disposed isolate.
+            struct SendData(std::mem::ManuallyDrop<Box<JsDelegateData>>);
+            unsafe impl Send for SendData {}
+            let data = SendData(std::mem::ManuallyDrop::new(data));
+            post_to_js_thread(owner, move || {
+                let data = data;
+                drop(std::mem::ManuallyDrop::into_inner(data.0));
+            });
+        }
         // b (JsDelegate) dropped here
     }
     prev - 1
@@ -7940,10 +8261,33 @@ fn js_delegate_invoke_inner(
         &*data_ptr
     };
     let args = args(&data.signature);
+    js_delegate_invoke_with_args(this, data, args, result_slot)
+}
 
+#[cfg(feature = "classic")]
+fn js_delegate_invoke_with_args(
+    this: *mut JsDelegate,
+    data: &JsDelegateData,
+    args: Vec<DelegateArg>,
+    result_slot: *mut c_void,
+) -> HRESULT {
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
-    if isolate_ptr.is_null() {
-        return HRESULT(0x80004005u32 as i32);
+    if isolate_ptr != data.owner_isolate {
+        // Invoked on another thread (a component that calls its handlers without marshaling them
+        // back to the registering apartment): run the JS on the thread that owns the function —
+        // the UI thread or a worker — and wait, so the call is delivered and its result written
+        // before Invoke returns. The arguments are borrowed for the duration of Invoke, which is
+        // exactly how long they're used.
+        struct SendPtr(*mut JsDelegate, *mut c_void);
+        unsafe impl Send for SendPtr {}
+        let ptrs = SendPtr(this, result_slot);
+        return run_on_js_thread_sync(data.owner_isolate, move || {
+            let ptrs = ptrs;
+            // SAFETY: the caller holds a reference on the delegate for the duration of Invoke.
+            let data = unsafe { &*(*ptrs.0).data };
+            js_delegate_invoke_with_args(ptrs.0, data, args, ptrs.1)
+        })
+        .unwrap_or(HRESULT(0x8001010Eu32 as i32)); // RPC_E_WRONG_THREAD: no JS thread to run on
     }
 
     // Re-entrancy guard (see DELEGATE_DEPTH). Mutating XAML inside a delegate (e.g. setting
@@ -8596,6 +8940,7 @@ impl Runtime {
             // can trigger a full GC sweep (useful for debugging and test harnesses).
             v8::V8::set_flags_from_string("--expose-gc");
             let platform = v8::new_default_platform(0, false).make_shared();
+            let _ = V8_PLATFORM.set(platform.clone());
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
         });
@@ -8773,6 +9118,9 @@ impl Runtime {
     pub fn register_delegate_isolate_ptr(&mut self) {
         let raw_isolate: *mut v8::Isolate = &mut *self.isolate as *mut v8::Isolate;
         DELEGATE_ISOLATE_PTR.with(|cell| cell.set(raw_isolate));
+        if let Ok(mut live) = LIVE_ISOLATES.lock() {
+            live.insert(raw_isolate as usize);
+        }
     }
 
     /// Provides mutable access to the underlying V8 isolate.
@@ -9089,6 +9437,9 @@ impl Drop for Runtime {
         // raw isolate pointers) must be cleared here, while `self.isolate` is
         // still alive. Anything left behind dangles into freed isolate memory
         // and crashes the next Runtime created on this thread.
+        if let Ok(mut live) = LIVE_ISOLATES.lock() {
+            live.remove(&(&mut *self.isolate as *mut v8::Isolate as usize));
+        }
         crate::wrapper_cache::clear();
         EVENT_REGISTRY.with(|m| m.borrow_mut().clear());
         ESM_MODULE_REGISTRY.with(|m| m.borrow_mut().clear());
@@ -9097,6 +9448,8 @@ impl Drop for Runtime {
         ESM_HTTP_URLS.with(|m| m.borrow_mut().clear());
         ESM_LOAD_ERRORS.with(|m| m.borrow_mut().clear());
         crate::esm_http::clear_thread_vocabulary();
+        // The ids keep their owner: a managed delegate that outlives this runtime (a terminated
+        // worker's) is refused rather than run elsewhere, until .NET releases it.
         DOTNET_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         DOTNET_ONESHOT_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
         crate::timers::clear_thread_tasks();

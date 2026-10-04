@@ -255,6 +255,11 @@ fn invoke_callback_by_id(id: i32) {
     }
 }
 
+/// Whether this thread's runtime has timers scheduled.
+pub(crate) fn has_pending() -> bool {
+    TASKS.with(|t| !t.borrow().is_empty())
+}
+
 pub fn pump() {
     crate::websocket::pump();
     // If the scheduler hasn't been initialized yet, nothing to do.

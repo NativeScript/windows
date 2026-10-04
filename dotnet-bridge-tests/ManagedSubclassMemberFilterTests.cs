@@ -191,15 +191,14 @@ public sealed class ManagedSubclassMemberFilterTests : IDisposable
         return buf.WrittenSpan.ToArray();
     }
 
-    // Decodes a dispatcher call built by Bridge.JsDelegate's WriteCallbackArg: 3 args —
-    // [HandleRef instance][string32 method][HandleRef argsArray] — resolving the args-array
-    // handle straight out of Bridge.s_handles rather than re-decoding nested tags by hand.
+    // Decodes a dispatcher call built by Bridge.JsDelegate's WriteCallbackArg:
+    // [HandleRef instance][string32 member][arg...], each argument tagged individually.
     private static (string Method, object?[] Args) DecodeCall(ReadOnlySpan<byte> span)
     {
         var r = new BinReader(span);
         var count = r.ReadByte();
-        if (count != 3)
-            throw new InvalidOperationException($"expected 3 dispatcher args, got {count}");
+        if (count < 2)
+            throw new InvalidOperationException($"expected at least 2 dispatcher args, got {count}");
 
         ReadOutgoingHandleTag(ref r); // instance handle — unused by these tests
 
@@ -208,9 +207,23 @@ public sealed class ManagedSubclassMemberFilterTests : IDisposable
             throw new InvalidOperationException($"expected string tag 0x05 for method name, got 0x{methodTag:X2}");
         var method = r.ReadString32();
 
-        var argsHandleId = ReadOutgoingHandleTag(ref r);
-        var argsObj = Bridge.s_handles.TryGetValue(argsHandleId, out var o) ? o as object?[] : null;
-        return (method, argsObj ?? Array.Empty<object?>());
+        var args = new object?[count - 2];
+        for (int i = 0; i < args.Length; i++)
+        {
+            var tag = r.ReadByte();
+            args[i] = tag switch
+            {
+                0x00 => null,
+                0x01 => false,
+                0x02 => true,
+                0x03 => r.ReadI32(),
+                0x04 => r.ReadF64(),
+                0x05 => r.ReadString32(),
+                0x0D => r.ReadString32(),
+                _ => throw new InvalidOperationException($"unexpected argument tag 0x{tag:X2}"),
+            };
+        }
+        return (method, args);
     }
 
     private static int ReadOutgoingHandleTag(ref BinReader r)

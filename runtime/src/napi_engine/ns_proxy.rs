@@ -204,6 +204,9 @@ struct InstanceCacheEntry {
     /// after the old object is freed; if a weak ref hands back a stale proxy for that address
     /// (observed on JSC), returning it would be the wrong type. We validate this on every hit.
     type_name: String,
+    /// The wrapper is the JS object of a JS subclass instance: returned for this identity whatever
+    /// class the caller expects (its runtime class, a managed type, isn't in the metadata).
+    any_type: bool,
     /// Serial of the InstanceState that owns this entry. On that state's Drop we remove the entry
     /// only if the serial still matches — so a newer proxy for a reused COM address is never evicted.
     serial: u64,
@@ -225,7 +228,7 @@ fn cached_instance(env: &Env, identity: usize, class_name: &str) -> Option<JsObj
     NAPI_INSTANCE_CACHE.with(|c| {
         let cache = c.borrow();
         let entry = cache.get(&identity)?;
-        if entry.type_name != class_name {
+        if entry.type_name != class_name && !entry.any_type {
             return None;
         }
         let mut out: napi::sys::napi_value = std::ptr::null_mut();
@@ -254,6 +257,7 @@ fn cache_instance(env: &Env, identity: usize, class_name: &str, serial: u64, pro
                     env: env.raw(),
                     proxy_ref,
                     type_name: class_name.to_string(),
+                    any_type: false,
                     serial,
                 },
             );
@@ -277,6 +281,25 @@ pub(crate) fn evict_instance(identity: usize, serial: u64) {
 }
 
 /// COM identity key (canonical IUnknown pointer) for registry lookups.
+fn cached_js_subclass_instance(env: &Env, instance: &IUnknown) -> Option<JsObject> {
+    let identity = com_identity_key(instance)?;
+    let type_name = NAPI_INSTANCE_CACHE.with(|c| {
+        c.borrow().get(&identity).filter(|e| e.any_type).map(|e| e.type_name.clone())
+    })?;
+    cached_instance(env, identity, &type_name)
+}
+
+/// Marks the cached wrapper of `instance` as the JS object of a JS subclass instance (see
+/// `InstanceCacheEntry::any_type`).
+pub(crate) fn mark_js_subclass_instance(instance: &IUnknown) {
+    let Some(identity) = com_identity_key(instance) else { return };
+    NAPI_INSTANCE_CACHE.with(|c| {
+        if let Some(entry) = c.borrow_mut().get_mut(&identity) {
+            entry.any_type = true;
+        }
+    });
+}
+
 fn com_identity_key(instance: &IUnknown) -> Option<usize> {
     crate::com_identity(instance).map(|k| k as usize)
 }
@@ -1511,6 +1534,10 @@ pub fn try_wrap_inspectable_pointer(env: &Env, raw: *mut c_void) -> Option<JsObj
         let borrowed = std::mem::ManuallyDrop::new(IUnknown::from_raw(raw));
         (*borrowed).clone()
     };
+    // The JS object of a JS subclass instance: its runtime class is a managed type, not metadata.
+    if let Some(existing) = cached_js_subclass_instance(env, &owned) {
+        return Some(existing);
+    }
     let inspectable = owned.cast::<IInspectable>().ok()?;
     let class_name = unsafe { inspectable.GetRuntimeClassName() }.ok()?;
     let name_str = class_name.to_string();

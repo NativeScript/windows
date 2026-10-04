@@ -51,9 +51,7 @@ public static partial class Bridge
         public static T InvokeMethodTyped<T>(object instance, string methodName, object[] args)
         {
             var result = ProxyInvokeMethod(instance, methodName, args);
-            if (result is null) return default!;
-            if (result is T t) return t;
-            return (T)Convert.ChangeType(result, typeof(T), CultureInfo.InvariantCulture);
+            return (T)ConvertJsResult(result, typeof(T))!;
         }
 
         public static object? InvokeMethod(object instance, string methodName, object[] args)
@@ -69,9 +67,7 @@ public static partial class Bridge
         public static T GetProperty<T>(object instance, string propertyName)
         {
             var result = ProxyGetProperty(instance, propertyName);
-            if (result is null) return default!;
-            if (result is T t) return t;
-            return (T)Convert.ChangeType(result, typeof(T), CultureInfo.InvariantCulture);
+            return (T)ConvertJsResult(result, typeof(T))!;
         }
 
         public static void SetProperty(object instance, string propertyName, object? value)
@@ -208,8 +204,10 @@ public static partial class Bridge
         // ctor exists on the derived type. If the base type has no parameterless
         // ctor, emit a parameterless ctor that forwards default(T) values to the
         // first available base ctor (dev-only convenience).
-        var baseCtors = baseType.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
-                        .Where(c => !c.IsGenericMethod)
+        // Public and protected base constructors: a JS subclass can call either through super(...),
+        // and abstract classes / composable WinRT classes (Panel, Control) only have protected ones.
+        var baseCtors = baseType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                        .Where(c => !c.IsGenericMethod && (c.IsPublic || c.IsFamily || c.IsFamilyOrAssembly))
                         .ToArray();
 
         ConstructorInfo? chosenBaseForDefault = null;
@@ -293,8 +291,12 @@ public static partial class Bridge
         // Override only the base virtuals JS actually asked for (memberSet). Anything not in
         // that set is simply never touched, so the base implementation stays live in the vtable —
         // no "call base" IL needed. (Skip ref/out and generic methods — unsupported.)
+        // Abstract members are always implemented (dispatching to JS, which reports a missing
+        // implementation as an error) — a type with an unimplemented abstract member can't be created.
         var virtualMethods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsGenericMethod && !m.IsConstructor && memberSet.Contains(m.Name))
+            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsGenericMethod && !m.IsConstructor
+                && (m.IsPublic || m.IsFamily || m.IsFamilyOrAssembly)
+                && (memberSet.Contains(m.Name) || m.IsAbstract))
             .ToArray();
 
         foreach (var mi in virtualMethods)
@@ -310,6 +312,11 @@ public static partial class Bridge
                     MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
                     mi.CallingConvention, mi.ReturnType, paramTypes, mi.Name);
                 definedSignatures[sigKey] = mb;
+
+                // `super.Name(...)` from JS: a public, non-virtual entry point to the base
+                // implementation (a plain call, so it can't dispatch back into the override).
+                if (!mi.IsAbstract)
+                    EmitBaseCallMethod(tb, mi, paramTypes);
             }
 
             tb.DefineMethodOverride(mb, mi);
@@ -359,6 +366,20 @@ public static partial class Bridge
         return tb.CreateTypeInfo()!.AsType();
     }
 
+    internal const string BaseCallPrefix = "__ns_base_";
+
+    private static void EmitBaseCallMethod(TypeBuilder tb, MethodInfo baseMethod, Type[] paramTypes)
+    {
+        var mb = tb.DefineMethod(BaseCallPrefix + baseMethod.Name,
+            MethodAttributes.Public | MethodAttributes.HideBySig, CallingConventions.HasThis,
+            baseMethod.ReturnType, paramTypes);
+        var il = mb.GetILGenerator();
+        il.Emit(OpCodes.Ldarg_0);
+        for (int i = 0; i < paramTypes.Length; i++) il.Emit(OpCodes.Ldarg, i + 1);
+        il.Emit(OpCodes.Call, baseMethod);
+        il.Emit(OpCodes.Ret);
+    }
+
     // Shared IL body for both base-virtual overrides and interface-member implementations: box
     // args into an object[], forward to ProxyRuntime.InvokeVoid/InvokeMethodTyped<T> by name.
     private static MethodBuilder EmitProxyMethodBody(
@@ -406,82 +427,103 @@ public static partial class Bridge
 
     private static DispatchResult CreateJsSubclass(
         string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames)
+        => CreateJsSubclass(assemblyName, typeName, callbackId, interfaceNames, memberNames, []);
+
+    // Creates an instance of a JS subclass: a dynamic subclass of the base type (or of System.Object
+    // when the "base" is an interface being implemented) whose overridden virtuals and interface
+    // members call the JS object registered under `callbackId`. `ctorArgs` select and feed the
+    // base constructor, as `super(...)` arguments do on Android/iOS.
+    private static DispatchResult CreateJsSubclass(
+        string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames, object?[] ctorArgs)
     {
         EnsureProxyDispatcherCallbacksRegistered();
 
-        s_pendingProxyCallbackId.Value = callbackId;
+        // `typeName` is the base type; older runtimes passed an auto-generated proxy name there and
+        // the base type in `assemblyName`.
+        var baseType = ResolveType(null, typeName)
+            ?? (string.IsNullOrEmpty(assemblyName) ? null : ResolveType(null, assemblyName))
+            ?? throw new TypeLoadException($"Type not found: {typeName}");
 
-        // Try to find a statically-generated proxy type first (Mechanism A: sbg-compiled into
-        // the app itself — already has any requested interfaces baked into real C# source).
-        Type? t = FindGeneratedProxyType(typeName);
-        if (t is null)
+        var interfaces = interfaceNames.ToList();
+        if (baseType.IsInterface)
         {
-            // When typeName is an auto-generated proxy name (com.tns.gen.winrt.*),
-            // the caller puts the real base type name in assemblyName so we can
-            // look up or dynamically emit a proxy for the correct base class.
-            string? resolveFrom = typeName;
-            if (!string.IsNullOrEmpty(assemblyName)
-                && typeName.StartsWith("com.tns.gen.winrt.", StringComparison.Ordinal))
-            {
-                resolveFrom = assemblyName;
-            }
-
-            // Resolve the WinRT/base type and optionally emit a dynamic proxy (Mechanism B fallback).
-            var baseType = ResolveType(null, resolveFrom)
-                ?? ResolveType(assemblyName, typeName)
-                ?? throw new TypeLoadException($"Type not found: {resolveFrom} (proxy: {typeName}, assembly: {assemblyName})");
-
-            if (baseType.IsClass && !baseType.IsSealed)
-            {
-                try { t = GetOrCreateDynamicProxyType(baseType, interfaceNames, memberNames); }
-                catch (Exception) { t = baseType; }
-            }
-            else
-            {
-                t = baseType;
-            }
+            interfaces.Insert(0, baseType.FullName!);
+            baseType = typeof(object);
         }
+        if (baseType.IsSealed)
+            throw new InvalidOperationException($"{baseType.FullName} is sealed and can't be extended.");
 
-        // Create the managed instance. Generated classes should call
-        // ProxyDispatcher.InitializeInstance(this, typeName) in their constructor,
-        // which will invoke our ProxyInitializeInstance and capture the pending callback id.
-        object? instance = Activator.CreateInstance(t);
-        if (instance is null)
-            throw new InvalidOperationException($"Failed to instantiate proxy type {t.FullName}.");
+        var proxyType = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames);
 
-        // Ensure there's a mapping for this instance immediately to avoid any
-        // early virtual calls from constructors reaching the JS side before
-        // the handle is registered. Call our initializer directly to register
-        // the pending callback id when dynamic proxies don't call it.
-        try { ProxyInitializeInstance(instance, typeName); } catch { }
+        // Pick the constructor by argument count, preferring one whose parameters the arguments
+        // convert to.
+        var ctors = proxyType.GetConstructors().Where(c => c.GetParameters().Length == ctorArgs.Length).ToArray();
+        if (ctors.Length == 0)
+            throw new MissingMethodException($"{baseType.FullName} has no constructor taking {ctorArgs.Length} argument(s).");
+        object? instance = null;
+        Exception? lastError = null;
+        s_pendingProxyCallbackId.Value = callbackId;
+        try
+        {
+            foreach (var ctor in ctors)
+            {
+                object?[] built;
+                try { built = BuildArgsBinExact(ctorArgs, ctor.GetParameters()); }
+                catch (Exception e) { lastError = e; continue; }
+                if (!ArgsFit(built, ctor.GetParameters())) continue;
+                instance = ctor.Invoke(built);
+                break;
+            }
+            if (instance is null)
+                throw lastError ?? new MissingMethodException(
+                    $"No constructor of {baseType.FullName} accepts the given {ctorArgs.Length} argument(s).");
+            RegisterJsBacked(instance, callbackId);
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException is not null)
+        {
+            throw tie.InnerException;
+        }
+        finally
+        {
+            s_pendingProxyCallbackId.Value = null;
+        }
 
         // Force COM CCW vtable creation for any implemented WinRT interfaces now, rather than
         // relying on it happening implicitly the first time the instance crosses the ABI boundary.
-        // Best-effort/reflection-only — no-ops cleanly when CsWinRT isn't loaded (e.g. xunit host).
-        if (interfaceNames.Length > 0)
-        {
-            TryActivateWinRTInterfaces(instance);
-        }
+        if (interfaces.Count > 0) TryActivateWinRTInterfaces(instance);
 
-        // Box the instance into a handle to return to the runtime.
         var result = Box(instance);
-
-        // Populate holder with handle id now that a handle exists.
         if (s_proxyCallbacks.TryGetValue(instance, out var holder))
-        {
-            try { holder.HandleId = result.HandleId(); } catch { holder.HandleId = 0; }
-        }
-        else
-        {
-            // If the generated proxy did not call InitializeInstance, create mapping now.
-            int hid = 0;
-            try { hid = result.HandleId(); } catch { hid = 0; }
-            var newHolder = new ProxyCallbackHolder(callbackId) { HandleId = hid };
-            s_proxyCallbacks.Add(instance, newHolder);
-        }
-
-        s_pendingProxyCallbackId.Value = null;
+            holder.HandleId = result.HandleId();
         return result;
+    }
+
+    private static bool ArgsFit(object?[] built, ParameterInfo[] parameters)
+    {
+        for (int i = 0; i < parameters.Length; i++)
+        {
+            var p = parameters[i].ParameterType;
+            if (built[i] is null) { if (p.IsValueType && Nullable.GetUnderlyingType(p) is null) return false; continue; }
+            if (!p.IsInstanceOfType(built[i])) return false;
+        }
+        return true;
+    }
+
+    private static void RegisterJsBacked(object instance, int callbackId)
+    {
+        if (!s_proxyCallbacks.TryGetValue(instance, out _))
+            s_proxyCallbacks.Add(instance, new ProxyCallbackHolder(callbackId));
+    }
+
+    internal static bool IsJsBacked(object instance) => s_proxyCallbacks.TryGetValue(instance, out _);
+
+    private static bool TryGetJsBackedHandle(object instance, out int handle)
+    {
+        handle = 0;
+        if (!s_proxyCallbacks.TryGetValue(instance, out var holder) || holder.HandleId == 0) return false;
+        if (!s_handles.TryGetValue(holder.HandleId, out var current) || !ReferenceEquals(current, instance)) return false;
+        handle = holder.HandleId;
+        return true;
     }
 
     // Locates CsWinRT's ComWrappersSupport via reflection (same style as the WinRT.IWinRTObject
@@ -531,42 +573,56 @@ public static partial class Bridge
     private static void ProxyInitializeInstance(object instance, string typeName)
     {
         var cb = s_pendingProxyCallbackId.Value;
-        if (cb.HasValue)
+        if (cb.HasValue) RegisterJsBacked(instance, cb.Value);
+    }
+
+    // The holder for a JS-backed instance. A virtual the base constructor calls runs before
+    // CreateJsSubclass has registered the instance, so fall back to the pending callback id.
+    private static ProxyCallbackHolder JsHolderFor(object instance)
+    {
+        if (s_proxyCallbacks.TryGetValue(instance, out var holder)) return holder;
+        var pending = s_pendingProxyCallbackId.Value;
+        if (pending.HasValue)
         {
-            var holder = new ProxyCallbackHolder(cb.Value);
-            s_proxyCallbacks.Add(instance, holder);
+            RegisterJsBacked(instance, pending.Value);
+            if (s_proxyCallbacks.TryGetValue(instance, out holder)) return holder;
         }
+        throw new InvalidOperationException("No JS callback registered for proxy instance.");
+    }
+
+    // Payload for the JS dispatcher: (self handle, member name, ...args). The arguments are sent
+    // individually so each arrives as its JS value (numbers, strings, structs as plain objects,
+    // objects as handles).
+    private static object?[] DispatchPayload(ProxyCallbackHolder holder, string memberName, object?[] args)
+    {
+        var payload = new object?[args.Length + 2];
+        payload[0] = new HandleRef(holder.HandleId);
+        payload[1] = memberName;
+        Array.Copy(args, 0, payload, 2, args.Length);
+        return payload;
     }
 
     private static object? ProxyInvokeMethod(object instance, string methodName, object[] args)
     {
-        if (!s_proxyCallbacks.TryGetValue(instance, out var holder)) throw new InvalidOperationException("No JS callback registered for proxy instance.");
-        var payload = new object?[] { new HandleRef(holder.HandleId), methodName, args };
-        return CallJsCallback(holder.CallbackId, payload);
+        var holder = JsHolderFor(instance);
+        return CallJsCallback(holder.CallbackId, DispatchPayload(holder, methodName, args), expectsResult: true);
     }
 
     private static void ProxyInvokeVoid(object instance, string methodName, object[] args)
     {
-        if (!s_proxyCallbacks.TryGetValue(instance, out var holder)) throw new InvalidOperationException("No JS callback registered for proxy instance.");
-        
-        var payload = new object?[] { new HandleRef(holder.HandleId), methodName, args };
-        CallJsCallback(holder.CallbackId, payload);
+        var holder = JsHolderFor(instance);
+        CallJsCallback(holder.CallbackId, DispatchPayload(holder, methodName, args), expectsResult: false);
     }
 
     private static object? ProxyGetProperty(object instance, string propertyName)
     {
-        if (!s_proxyCallbacks.TryGetValue(instance, out var holder)) throw new InvalidOperationException("No JS callback registered for proxy instance.");
-        // Tag "get:" prefix so the JS dispatcher can distinguish getter from method call.
-        var payload = new object?[] { new HandleRef(holder.HandleId), "get:" + propertyName };
-        return CallJsCallback(holder.CallbackId, payload);
+        var holder = JsHolderFor(instance);
+        return CallJsCallback(holder.CallbackId, DispatchPayload(holder, "get_" + propertyName, []), expectsResult: true);
     }
 
     private static void ProxySetProperty(object instance, string propertyName, object? value)
     {
-        if (!s_proxyCallbacks.TryGetValue(instance, out var holder)) throw new InvalidOperationException("No JS callback registered for proxy instance.");
-        // Tag "set:" prefix so the JS dispatcher can distinguish setter from method call.
-        var payload = new object?[] { new HandleRef(holder.HandleId), "set:" + propertyName, value };
-        CallJsCallback(holder.CallbackId, payload);
+        var holder = JsHolderFor(instance);
+        CallJsCallback(holder.CallbackId, DispatchPayload(holder, "set_" + propertyName, [value]), expectsResult: false);
     }
 }
-

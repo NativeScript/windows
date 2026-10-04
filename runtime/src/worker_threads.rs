@@ -1,16 +1,77 @@
 use crate::Runtime;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
+use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT};
 
-#[derive(Debug)]
 enum WorkerCommand {
     PostMessage(Vec<u8>),
+    /// Work handed to the worker's thread from another thread: a callback created in the worker
+    /// (see [`run_on_worker_sync`]) or the release of one.
+    Run(Box<dyn FnOnce() + Send>),
     Terminate,
+}
+
+/// An auto-reset event that wakes a worker's loop; the loop also wakes for Windows messages, which
+/// a worker (an STA thread) needs pumped for WinRT to deliver marshaled calls and completions.
+#[derive(Clone, Copy)]
+struct WakeEvent(isize);
+
+impl WakeEvent {
+    fn new() -> Self {
+        let handle = unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default();
+        WakeEvent(handle.0 as isize)
+    }
+
+    fn handle(self) -> HANDLE {
+        HANDLE(self.0 as *mut std::ffi::c_void)
+    }
+
+    fn signal(self) {
+        let _ = unsafe { SetEvent(self.handle()) };
+    }
+}
+
+/// The command channel of each worker's runtime, keyed by its isolate, so a callback created in a
+/// worker can be handed to that worker's thread.
+static WORKER_EXECUTORS: OnceLock<Mutex<HashMap<usize, (Sender<WorkerCommand>, WakeEvent)>>> = OnceLock::new();
+
+fn worker_executors() -> &'static Mutex<HashMap<usize, (Sender<WorkerCommand>, WakeEvent)>> {
+    WORKER_EXECUTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `isolate` is a worker's (as opposed to the UI thread's).
+pub(crate) fn is_worker_isolate(isolate: usize) -> bool {
+    worker_executors().lock().contains_key(&isolate)
+}
+
+/// Runs `f` on the thread of the worker that owns `isolate` and waits for its result, the way
+/// [`crate::ui_dispatcher::run_on_ui_thread_sync`] does for the UI thread. `None` when the worker
+/// is gone.
+pub(crate) fn run_on_worker_sync<R: Send>(isolate: usize, f: impl FnOnce() -> R + Send) -> Option<R> {
+    let (tx, wake) = worker_executors().lock().get(&isolate).cloned()?;
+    crate::ui_dispatcher::run_job_sync(f, |job| {
+        let sent = tx.send(WorkerCommand::Run(job)).is_ok();
+        wake.signal();
+        sent
+    })
+}
+
+/// Queues `f` on the thread of the worker that owns `isolate` without waiting. `false` when the
+/// worker is gone.
+pub(crate) fn post_to_worker(isolate: usize, f: impl FnOnce() + Send + 'static) -> bool {
+    let Some((tx, wake)) = worker_executors().lock().get(&isolate).cloned() else {
+        return false;
+    };
+    let sent = tx.send(WorkerCommand::Run(Box::new(f))).is_ok();
+    wake.signal();
+    sent
 }
 
 #[derive(Debug)]
@@ -20,9 +81,9 @@ enum WorkerEvent {
     Exited,
 }
 
-#[derive(Debug)]
 struct WorkerHandle {
     tx: Sender<WorkerCommand>,
+    wake: WakeEvent,
     /// Wrapped in Arc<Mutex> so the WORKERS registry lock can be released before
     /// a blocking recv — otherwise poll_events_blocking would hold the global
     /// registry lock for the entire timeout duration, starving create/terminate.
@@ -119,54 +180,84 @@ pub fn create_worker(app_root: String, source: String, filename: String) -> Resu
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
     let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
     let evt_rx = Arc::new(Mutex::new(evt_rx));
+    let wake = WakeEvent::new();
+    let executor_tx = cmd_tx.clone();
+    // Events reach the creating thread's `Worker` without it having to poll: each batch queues a
+    // delivery there (one at a time).
+    let creator = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+    let delivery_pending = Arc::new(AtomicBool::new(false));
+    let notify_creator = move || {
+        if delivery_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = delivery_pending.clone();
+        let queued = crate::post_to_js_thread(creator as *mut v8::Isolate, move || {
+            pending.store(false, Ordering::Release);
+            crate::global_fns::deliver_worker_events(worker_id);
+        });
+        if !queued {
+            delivery_pending.store(false, Ordering::Release);
+        }
+    };
 
     let join = thread::Builder::new()
         .name(format!("ns-worker-{worker_id}"))
         .spawn(move || {
             let mut runtime = Runtime::new(app_root.as_str());
+            // `runtime` stays put on this thread's stack from here on.
+            runtime.register_delegate_isolate_ptr();
+            let isolate = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+            worker_executors().lock().insert(isolate, (executor_tx, wake));
 
             match worker_bootstrap_script(source.as_str(), filename.as_str()) {
                 Ok(script) => runtime.run_script(script.as_str(), filename.as_str()),
                 Err(err) => {
+                    worker_executors().lock().remove(&isolate);
                     let _ = evt_tx.send(WorkerEvent::Error(err));
                     let _ = evt_tx.send(WorkerEvent::Exited);
+                    notify_creator();
                     return;
                 }
             }
 
-            for result in runtime.drain_outbox_bytes() {
-                match result {
-                    Ok(bytes) => {
-                        let _ = evt_tx.send(WorkerEvent::Message(bytes));
+            let forward_outbox = |runtime: &mut Runtime| {
+                let mut sent = false;
+                for result in runtime.drain_outbox_bytes() {
+                    sent = true;
+                    let _ = evt_tx.send(match result {
+                        Ok(b) => WorkerEvent::Message(b),
+                        Err(e) => WorkerEvent::Error(e),
+                    });
+                }
+                if sent {
+                    notify_creator();
+                }
+            };
+            forward_outbox(&mut runtime);
+            // Commands, Windows messages (WinRT calls marshaled to this STA thread, async
+            // completions) and the worker's timers, until terminated.
+            'run: loop {
+                loop {
+                    match cmd_rx.try_recv() {
+                        Ok(WorkerCommand::PostMessage(bytes)) => runtime.dispatch_to_worker(&bytes),
+                        Ok(WorkerCommand::Run(job)) => job(),
+                        Ok(WorkerCommand::Terminate) | Err(TryRecvError::Disconnected) => break 'run,
+                        Err(TryRecvError::Empty) => break,
                     }
-                    Err(err) => {
-                        let _ = evt_tx.send(WorkerEvent::Error(err));
-                    }
+                    forward_outbox(&mut runtime);
+                }
+                crate::pump_messages();
+                crate::timers::pump();
+                forward_outbox(&mut runtime);
+                let timeout = if crate::timers::has_pending() { 10 } else { INFINITE };
+                unsafe {
+                    MsgWaitForMultipleObjectsEx(Some(&[wake.handle()]), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 }
             }
 
-            loop {
-                match cmd_rx.recv() {
-                    Ok(WorkerCommand::PostMessage(bytes)) => {
-                        runtime.dispatch_to_worker(&bytes);
-                        for result in runtime.drain_outbox_bytes() {
-                            match result {
-                                Ok(b) => {
-                                    let _ = evt_tx.send(WorkerEvent::Message(b));
-                                }
-                                Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::Error(e));
-                                }
-                            }
-                        }
-                    }
-                    Ok(WorkerCommand::Terminate) | Err(_) => {
-                        break;
-                    }
-                }
-            }
-
+            worker_executors().lock().remove(&isolate);
             let _ = evt_tx.send(WorkerEvent::Exited);
+            notify_creator();
         })
         .map_err(|e| format!("Failed to spawn worker thread: {e}"))?;
 
@@ -174,6 +265,7 @@ pub fn create_worker(app_root: String, source: String, filename: String) -> Resu
         worker_id,
         WorkerHandle {
             tx: cmd_tx,
+            wake,
             rx: evt_rx,
             join,
         },
@@ -188,10 +280,12 @@ pub fn post_message(worker_id: u64, payload_bytes: Vec<u8>) -> Result<(), String
         return Err(format!("Unknown worker id: {worker_id}"));
     };
 
-    worker
+    let sent = worker
         .tx
         .send(WorkerCommand::PostMessage(payload_bytes))
-        .map_err(|e| format!("Failed to send worker message: {e}"))
+        .map_err(|e| format!("Failed to send worker message: {e}"));
+    worker.wake.signal();
+    sent
 }
 
 fn collect_events(rx: &Receiver<WorkerEvent>) -> Vec<PolledWorkerEvent> {
@@ -266,6 +360,7 @@ pub fn terminate_worker(worker_id: u64) -> Result<(), String> {
     drop(workers_guard);
 
     let _ = worker.tx.send(WorkerCommand::Terminate);
+    worker.wake.signal();
     let _ = worker.join.join();
 
     Ok(())

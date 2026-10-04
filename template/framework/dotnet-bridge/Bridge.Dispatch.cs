@@ -115,7 +115,7 @@ public static partial class Bridge
                 var built = BuildArgs(args, parameters);
                 try
                 {
-                    var res = AwaitIfTask(m.Invoke(target, built));
+                    var res = (m.Invoke(target, built));
                     return Box(res);
                 }
                 catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
@@ -123,7 +123,7 @@ public static partial class Bridge
                     if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{m.Name} on UI thread");
                     try
                     {
-                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
                         return Box(res);
                     }
                     catch { /* retry failed — try next candidate */ }
@@ -133,7 +133,7 @@ public static partial class Bridge
                     if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{m.Name} on UI thread");
                     try
                     {
-                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
                         return Box(res);
                     }
                     catch { /* retry failed — try next candidate */ }
@@ -148,19 +148,19 @@ public static partial class Bridge
         try {
             try
             {
-                var res = AwaitIfTask(dispEntry.Invoke(target, builtArgs));
+                var res = (dispEntry.Invoke(target, builtArgs));
                 return Box(res);
             }
             catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
             {
                 if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{method} on UI thread");
-                var res = InvokeOnUIThread(() => AwaitIfTask(dispEntry.Invoke(target, builtArgs)));
+                var res = InvokeOnUIThread(() => (dispEntry.Invoke(target, builtArgs)));
                 return Box(res);
             }
             catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
             {
                 if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{method} on UI thread");
-                var res = InvokeOnUIThread(() => AwaitIfTask(dispEntry.Invoke(target, builtArgs)));
+                var res = InvokeOnUIThread(() => (dispEntry.Invoke(target, builtArgs)));
                 return Box(res);
             }
         }
@@ -263,34 +263,6 @@ public static partial class Bridge
         return el.Deserialize(targetType, s_coerceOpts);
     }
 
-    private static object? AwaitIfTask(object? value)
-    {
-        if (value is null) return null;
-
-        if (value is Task task)
-        {
-            task.GetAwaiter().GetResult();
-            return TaskResultCache.GetResult(task);
-        }
-
-        if (value is ValueTask vt)
-        {
-            vt.AsTask().GetAwaiter().GetResult();
-            return null;
-        }
-
-        var type = value.GetType();
-        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(ValueTask<>))
-        {
-            var innerTask = ValueTaskAsTaskCache.AsTask(type, value);
-            innerTask.GetAwaiter().GetResult();
-            if (innerTask.IsFaulted) throw innerTask.Exception!.InnerException ?? innerTask.Exception;
-            return TaskResultCache.GetResult(innerTask);
-        }
-
-        return value;
-    }
-
     private static DispatchResult Box(object? value)
     {
         if (value is null) return DispatchResult.Void;
@@ -320,6 +292,11 @@ public static partial class Bridge
             var ut = Enum.GetUnderlyingType(t);
             return DispatchResult.Primitive(Convert.ChangeType(value, ut), ut);
         }
+
+        // An instance of a JS subclass goes back to JS as the handle its JS object was created
+        // with, so the runtime hands out that same JS object (identity, fields, overrides).
+        if (TryGetJsBackedHandle(value, out var jsHandle))
+            return DispatchResult.Handle(jsHandle, t.FullName ?? t.Name);
 
 
 
@@ -361,6 +338,30 @@ public static partial class Bridge
         return t.GetMethod("GetAwaiter",
                    BindingFlags.Public | BindingFlags.Instance,
                    null, Type.EmptyTypes, null) is not null;
+    }
+
+    /// "interface", "abstract", "sealed", "class", "struct", "enum", "delegate" or "" (not found).
+    /// Lets JS decide between `new Interface({...})`, subclassing and plain construction.
+    public static string TypeKind(string typeName)
+    {
+        var t = ResolveType(null, typeName);
+        if (t is null) return "";
+        if (t.IsInterface) return "interface";
+        if (t.IsEnum) return "enum";
+        if (typeof(Delegate).IsAssignableFrom(t)) return "delegate";
+        if (t.IsValueType) return "struct";
+        if (t.IsAbstract && t.IsSealed) return "static";
+        if (t.IsAbstract) return "abstract";
+        if (t.IsSealed) return "sealed";
+        return "class";
+    }
+
+    /// `value instanceof SomeType` for a .NET object that was not constructed from JS.
+    public static bool IsInstanceOf(object? value, string typeName)
+    {
+        if (value is null) return false;
+        var t = ResolveType(null, typeName);
+        return t is not null && t.IsInstanceOfType(value);
     }
 
     internal static DispatchResult BuildMembersResult(Type t)

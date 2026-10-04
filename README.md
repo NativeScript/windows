@@ -74,6 +74,14 @@ Run .NET bridge tests:
 dotnet test dotnet-bridge-tests\DotNetBridgeTests.csproj
 ```
 
+Run the runtime test app (Jasmine-style specs inside a WinUI app built from the template, with C#
+fixtures and a plugin compiled in — the counterpart of the Android/iOS test-app suites). See
+[test-app/README.md](test-app/README.md):
+
+```powershell
+pwsh test-app/run.ps1
+```
+
 ## DevTools
 
 DevTools are part of the runtime story, not an optional afterthought. Use the

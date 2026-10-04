@@ -92,6 +92,10 @@ type FnBridgeFree = unsafe extern "C" fn(ptr: *mut u8);
 // back into V8.  Signature: (callback_id, args_ptr, args_len, &resp_ptr, &resp_len) -> void
 pub(crate) type FnJsCallback = unsafe extern "C" fn(i32, *const u8, i32, *mut *mut u8, *mut i32);
 type FnRegisterJsCallback = unsafe extern "C" fn(callback: FnJsCallback) -> i32;
+/// Called by the bridge (from the GC finalizer thread) when the managed delegate wrapping a JS
+/// function has been collected, so the runtime can drop its reference to the function.
+pub(crate) type FnReleaseJsCallback = unsafe extern "C" fn(i32);
+type FnRegisterJsCallbackRelease = unsafe extern "C" fn(release: FnReleaseJsCallback) -> i32;
 
 struct DotNetHost {
     _hostfxr: HMODULE,
@@ -99,6 +103,8 @@ struct DotNetHost {
     invoke_binary: FnBridgeInvokeBinary,
     free: FnBridgeFree,
     register_js_callback: FnRegisterJsCallback,
+    /// Absent in bridges published before JS functions could be passed as delegates.
+    register_js_callback_release: Option<FnRegisterJsCallbackRelease>,
 }
 
 // SAFETY: only ever accessed from the main JS/UI thread.
@@ -272,6 +278,8 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
     let free: FnBridgeFree = unsafe { std::mem::transmute(bind("Free")?) };
     let register_js_callback: FnRegisterJsCallback =
         unsafe { std::mem::transmute(bind("RegisterJsCallback")?) };
+    let register_js_callback_release: Option<FnRegisterJsCallbackRelease> =
+        bind("RegisterJsCallbackRelease").ok().map(|p| unsafe { std::mem::transmute(p) });
 
     Ok(DotNetHost {
         _hostfxr: hostfxr,
@@ -279,6 +287,7 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
         invoke_binary,
         free,
         register_js_callback,
+        register_js_callback_release,
     })
 }
 
@@ -450,6 +459,27 @@ pub(crate) fn init_js_callbacks(callback: FnJsCallback) {
         _ => return,
     };
     unsafe { (host.register_js_callback)(callback) };
+    if let Some(register_release) = host.register_js_callback_release {
+        unsafe { register_release(queue_js_callback_release) };
+    }
+}
+
+/// Callback ids whose managed delegate was garbage-collected, queued from the finalizer thread
+/// and dropped on the JS thread by [`take_released_js_callbacks`].
+static RELEASED_JS_CALLBACKS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn queue_js_callback_release(callback_id: i32) {
+    if let Ok(mut ids) = RELEASED_JS_CALLBACKS.lock() {
+        ids.push(callback_id);
+    }
+}
+
+/// Callback ids released since the last call. Called on the JS thread, which owns the functions.
+pub(crate) fn take_released_js_callbacks() -> Vec<i32> {
+    match RELEASED_JS_CALLBACKS.lock() {
+        Ok(mut ids) if !ids.is_empty() => std::mem::take(&mut *ids),
+        _ => Vec::new(),
+    }
 }
 
 /// Calls the managed bridge with a pre-built binary request packet and returns

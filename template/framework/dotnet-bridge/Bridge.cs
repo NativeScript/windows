@@ -123,8 +123,12 @@ public static partial class Bridge
                                 catch { continue; }
                             }
 
+                            // The app's own assembly (C# sources compiled into the app) contributes
+                            // its internal types too: they are reachable from JS (type resolution
+                            // finds non-public types), so their namespaces must be as well.
                             Type[] types;
-                            try { types = asm.GetExportedTypes(); }
+                            try { types = asm == Assembly.GetEntryAssembly() ? asm.GetTypes() : asm.GetExportedTypes(); }
+                            catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
                             catch { types = Array.Empty<Type>(); }
 
                             var assemblyName = asm.GetName().Name;
@@ -132,7 +136,7 @@ public static partial class Bridge
 
                             foreach (var t in types)
                             {
-                                if (string.IsNullOrEmpty(t.Namespace)) continue;
+                                if (string.IsNullOrEmpty(t.Namespace) || t.Name.StartsWith('<')) continue;
                                 map[t.Namespace] = assemblyName;
                                 var root = t.Namespace.Split('.')[0];
                                 if (!map.ContainsKey(root)) map[root] = assemblyName;

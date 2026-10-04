@@ -101,7 +101,7 @@ namespace __PROJECT_NAME__
             // Include panic log from previous or current run
             try
             {
-                var panicLog = Path.Combine(ApplicationData.Current.LocalFolder.Path, "nativescript-panic.log");
+                var panicLog = Path.Combine(RuntimeHost.LocalFolderPath, "nativescript-panic.log");
                 if (File.Exists(panicLog))
                 {
                     var content = File.ReadAllText(panicLog, Encoding.UTF8).Trim();
@@ -130,7 +130,7 @@ namespace __PROJECT_NAME__
 
         public static string CrashLogPath()
         {
-            try { return Path.Combine(ApplicationData.Current.LocalFolder.Path, "nativescript-crash.log"); }
+            try { return Path.Combine(RuntimeHost.LocalFolderPath, "nativescript-crash.log"); }
             catch { return null; }
         }
 
@@ -272,7 +272,7 @@ namespace __PROJECT_NAME__
         {
             try
             {
-                var logPath = Path.Combine(ApplicationData.Current.LocalFolder.Path, "nativescript-crash.log");
+                var logPath = Path.Combine(RuntimeHost.LocalFolderPath, "nativescript-crash.log");
                 File.AppendAllText(logPath, content, Encoding.UTF8);
             }
             catch { }

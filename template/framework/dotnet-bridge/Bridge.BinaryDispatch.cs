@@ -116,7 +116,8 @@ public static partial class Bridge
             for (int i = 0; i < memberCount; i++) memberNames[i] = r.ReadString16();
 
             var callbackId = r.ReadI32();
-            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId, interfaceNames, memberNames);
+            var ctorArgs = r.HasMore ? r.ReadArgs() : [];
+            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId, interfaceNames, memberNames, ctorArgs);
         }
 
         if (op == 0x0B) // get CLR-only property by raw IInspectable ptr (CLR reflection fallback)
@@ -176,7 +177,35 @@ public static partial class Bridge
             }
         }
 
+        // Overloads with the same parameter count (Describe(Animal) / Describe(Shape)): pick the
+        // first whose parameter types the arguments convert to.
+        var overloads = GetOverloads(type, method, args.Length, flags);
+        if (overloads.Length > 1)
+        {
+            foreach (var overload in overloads)
+            {
+                var ps = overload.GetParameters();
+                object?[] built;
+                try { built = BuildArgsBinExact(args, ps); }
+                catch { continue; }
+                if (!ArgsFit(built, ps)) continue;
+                return Box(overload.Invoke(target, built));
+            }
+        }
+
         var entry = GetCachedMethod(type, method, args.Length, flags);
+        if (entry.Invoke is null && target is not null && IsJsBacked(target))
+        {
+            // A JS subclass may call the protected members it inherits.
+            var protectedFlags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var inherited = type.GetMethods(protectedFlags)
+                .FirstOrDefault(m => m.Name == method && (m.IsFamily || m.IsFamilyOrAssembly) && m.GetParameters().Length == args.Length);
+            if (inherited is not null)
+            {
+                var built = BuildArgsBinExact(args, inherited.GetParameters());
+                return Box(inherited.Invoke(target, built));
+            }
+        }
         if (entry.Invoke is null)
         {
             var candidates = type.GetMethods(flags).Where(m => m.Name == method && !m.IsSpecialName);
@@ -186,7 +215,7 @@ public static partial class Bridge
                 var built = BuildArgsBin(args, parameters);
                 try
                 {
-                    var res = AwaitIfTask(m.Invoke(target, built));
+                    var res = (m.Invoke(target, built));
                     return Box(res);
                 }
                 catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
@@ -194,7 +223,7 @@ public static partial class Bridge
                     if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{m.Name} on UI thread");
                     try
                     {
-                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
                         return Box(res);
                     }
                     catch { /* retry failed — try next candidate */ }
@@ -204,7 +233,7 @@ public static partial class Bridge
                     if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{m.Name} on UI thread");
                     try
                     {
-                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
                         return Box(res);
                     }
                     catch { /* retry failed — try next candidate */ }
@@ -219,24 +248,32 @@ public static partial class Bridge
         try { 
             try
             {
-                var res = AwaitIfTask(entry.Invoke(target, builtArgs));
+                var res = (entry.Invoke(target, builtArgs));
                 return Box(res);
             }
             catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
             {
                 if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{method} on UI thread");
-                var res = InvokeOnUIThread(() => AwaitIfTask(entry.Invoke(target, builtArgs)));
+                var res = InvokeOnUIThread(() => (entry.Invoke(target, builtArgs)));
                 return Box(res);
             }
             catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
             {
                 if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{method} on UI thread");
-                var res = InvokeOnUIThread(() => AwaitIfTask(entry.Invoke(target, builtArgs)));
+                var res = InvokeOnUIThread(() => (entry.Invoke(target, builtArgs)));
                 return Box(res);
             }
         }
         finally { if (builtArgs.Length > 0) ReturnArgs(builtArgs); }
     }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<MethodKey, MethodInfo[]> s_overloadCache = new();
+
+    private static MethodInfo[] GetOverloads(Type type, string name, int argCount, BindingFlags flags)
+        => s_overloadCache.GetOrAdd(new MethodKey(type, name, argCount, flags), static k =>
+            k.Type.GetMethods(k.Flags)
+                .Where(m => m.Name == k.Name && !m.IsGenericMethodDefinition && m.GetParameters().Length == k.ArgCount)
+                .ToArray());
 
     private static object?[] BuildArgsBin(object?[] binArgs, ParameterInfo[] parameters)
     {
@@ -255,6 +292,16 @@ public static partial class Bridge
             result[i] = CoerceBin(binArgs[i], parameters[i].ParameterType);
         return result;
     }
+
+    // Plain JS objects <-> .NET structs/records: public fields count (Windows.Foundation.Size and most
+    // interop structs are fields), member names match case-insensitively.
+    internal static readonly System.Text.Json.JsonSerializerOptions s_jsJsonOptions = new()
+    {
+        IncludeFields = true,
+        PropertyNameCaseInsensitive = true,
+        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
+            | System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals,
+    };
 
     private static object? CoerceBin(object? value, Type targetType)
     {
@@ -319,8 +366,28 @@ public static partial class Bridge
                 throw;
             }
         }
+        if (value is JsJsonValue json)
+        {
+            if (targetType == typeof(string)) return json.Json;
+            var target = targetType == typeof(object) ? typeof(System.Text.Json.JsonElement) : targetType;
+            return System.Text.Json.JsonSerializer.Deserialize(json.Json, target, s_jsJsonOptions);
+        }
+        if (value is JsFunctionRef fn)
+        {
+            var delegateType = typeof(Delegate).IsAssignableFrom(targetType)
+                && targetType != typeof(Delegate) && targetType != typeof(MulticastDelegate)
+                    ? targetType
+                    : typeof(Action);
+            return MakeJsDelegate(delegateType, fn.Id);
+        }
         if (value.GetType() == targetType) return value;
-        try { return Convert.ChangeType(value, targetType); }
+        var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
+        if (underlying.IsEnum)
+        {
+            try { return Enum.ToObject(underlying, Convert.ToInt64(value)); }
+            catch { return value; }
+        }
+        try { return Convert.ChangeType(value, underlying); }
         catch { return value; }
     }
 

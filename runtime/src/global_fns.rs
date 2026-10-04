@@ -937,7 +937,11 @@ pub(crate) fn handle_resolve_module_path(
         // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`, so also
         // check the sealed bundle's table — otherwise a relative require() from a bundle-only file
         // would wrongly treat the referrer itself as the base directory instead of its parent.
-        let base = if parent.is_file() || crate::source_protect::contains(&parent.to_string_lossy())
+        // A referrer that doesn't exist but names a file (the `app/bundle.js` fallback the
+        // top-level `require` uses when the entry script is not a bundle) is a file too.
+        let base = if parent.is_file()
+            || crate::source_protect::contains(&parent.to_string_lossy())
+            || (!parent.exists() && parent.extension().is_some())
         {
             parent.parent().map(Path::to_path_buf).unwrap_or(parent)
         } else {
@@ -1073,6 +1077,46 @@ pub(crate) fn handle_worker_post_message(
     };
     if let Err(err) = crate::worker_threads::post_message(worker_id as u64, bytes) {
         throw_js_error(scope, err.as_str());
+    }
+}
+
+/// Runs on a worker's creating thread when the worker has queued messages: hands them to that
+/// `Worker` object (`__nsWorkerDeliver`, installed by the Worker shim).
+pub(crate) fn deliver_worker_events(worker_id: u64) {
+    let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    if isolate_ptr.is_null() {
+        return;
+    }
+    let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+    v8::scope!(scope, isolate);
+    let Some(ctx_global) = scope.get_slot::<v8::Global<v8::Context>>().cloned() else {
+        return;
+    };
+    let context = v8::Local::new(scope, &ctx_global);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(tc, scope);
+
+    let global = context.global(tc);
+    let Some(key) = v8::String::new(tc, "__nsWorkerDeliver") else {
+        return;
+    };
+    let Some(deliver) = global
+        .get(tc, key.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok())
+    else {
+        return;
+    };
+    let id: v8::Local<v8::Value> = v8::Number::new(tc, worker_id as f64).into();
+    let _ = deliver.call(tc, global.into(), &[id]);
+    if tc.has_caught() {
+        if let Some(ex) = tc.exception() {
+            let msg = ex.to_rust_string_lossy(tc);
+            crate::store_last_js_error(msg);
+        }
+        tc.reset();
+    }
+    if !crate::defer_microtask_drain() {
+        tc.perform_microtask_checkpoint();
     }
 }
 
@@ -2269,6 +2313,15 @@ const HELPER_SOURCE: &str = r#"
             if (typeof Function.prototype.extend !== 'function') {
                 Object.defineProperty(Function.prototype, 'extend', {
                     value: function (nameOrOverrides, maybeOverrides) {
+                        // A WinRT class (or a JS class deriving from one): an ES2015 subclass, so
+                        // instances get the composed-object construction of `class X extends Y`.
+                        if (globalThis.NSWinRT && typeof globalThis.NSWinRT.extendClass === 'function') {
+                            if (typeof this.__typeName__ === 'string')
+                                return globalThis.NSWinRT.extendClass(this, nameOrOverrides, maybeOverrides);
+                            // Object.extend({ interfaces: [...], ... }): a subclass of System.Object.
+                            if (this === Object && globalThis.System)
+                                return globalThis.NSWinRT.extendClass(globalThis.System.Object, nameOrOverrides, maybeOverrides);
+                        }
                         return makeManagedConstructor(this, nameOrOverrides, maybeOverrides);
                     },
                     writable: true,
@@ -2499,6 +2552,27 @@ const HELPER_SOURCE: &str = r#"
                 };
             }
 
+            // `return global.__native(this)` ends TypeScript subclass constructors written for
+            // Android/iOS; here `this` already is the native-backed object.
+            if (typeof globalThis.__native !== 'function') {
+                globalThis.__native = function (obj) { return obj; };
+            }
+
+            // @NativeClass / @NativeClass(): marks a class that extends a native (WinRT/.NET) class.
+            // Extending works without it; it exists so code written for iOS/Android, where the build
+            // transforms decorated classes, runs unchanged.
+            if (typeof globalThis.NativeClass !== 'function') {
+                Object.defineProperty(globalThis, 'NativeClass', {
+                    value: function NativeClass(target) {
+                        if (typeof target === 'function') return target;
+                        return function (cls) { return cls; };
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
+            }
+
             // @Interfaces([IFoo, IBar]) — attach WinRT interface list to a class.
             if (typeof globalThis.Interfaces !== 'function') {
                 Object.defineProperty(globalThis, 'Interfaces', {
@@ -2655,7 +2729,7 @@ const HELPER_SOURCE: &str = r#"
                         try {
                             var target = _wrapDotNetHandle(a[0]);
                             var method = a[1];
-                            var margs = a[2] || [];
+                            var margs = a.slice(2).map(_wrapDotNetHandle);
                             if (target && typeof method === 'string') {
                                 var fn = overrides[method];
                                 if (typeof fn === 'function') return fn.apply(target, Array.isArray(margs) ? margs : []);
@@ -3232,7 +3306,14 @@ const HELPER_SOURCE: &str = r#"
                         if (prop === 'toString') return function () {
                             return '[DotNetObject ' + typeName + ' #' + handle + ']';
                         };
-                        if (prop === 'then') return undefined;
+                        // A Task/ValueTask (awaitable) result is thenable, so `await obj.SomethingAsync()` works;
+                        // any other .NET object must not look like a promise.
+                        if (prop === 'then') {
+                            if (isTask !== true) return undefined;
+                            return function (onFulfilled, onRejected) {
+                                return globalThis.NSWinRT.dotnet.taskToPromise({ __handle: handle, __isTask: true }).then(onFulfilled, onRejected);
+                            };
+                        }
                         // Re-read info in case it was populated after construction.
                         var i = _typeInfoCache[typeName] || _emptyInfo;
                         // Write-only: has setter but no getter — reading it is an error.
@@ -3269,6 +3350,14 @@ const HELPER_SOURCE: &str = r#"
                 if (Array.isArray(value)) return value.map(_wrap);
                 if (typeof value === 'object' && typeof value.__handle === 'number') {
                     var typeName = value.__type || '';
+                    var jsSelf = _jsSelfByHandle && _deref(_jsSelfByHandle.get(value.__handle));
+                    if (jsSelf) return jsSelf;
+                    // A JS subclass instance whose JS object was collected: its dispatcher revives one.
+                    if (typeName.indexOf('NSWinRTDynamicProxies.') === 0) {
+                        try { _invoke({ handle: value.__handle, method: '__ns_js_self', args: [] }); } catch (_) {}
+                        jsSelf = _deref(_jsSelfByHandle.get(value.__handle));
+                        if (jsSelf) return jsSelf;
+                    }
                     var assembly = _resolveAssembly(typeName);
                     return _makeDotNetInstance(value.__handle, assembly, typeName, value.__isTask === true, value.__native_ptr);
                 }
@@ -3311,6 +3400,11 @@ const HELPER_SOURCE: &str = r#"
                                 var proxy = _makeNamespaceProxy(root);
                                 try { Object.defineProperty(globalThis, root, { value: proxy, writable: true, configurable: true, enumerable: true }); } catch (_) {}
                                 return proxy;
+                            },
+                            // A namespace root never blocks app code from using the name for its own value
+                            // (`var App = ...` in a classic script assigns through this accessor).
+                            set: function(value) {
+                                try { Object.defineProperty(globalThis, root, { value: value, writable: true, configurable: true, enumerable: true }); } catch (_) {}
                             }
                         });
                     } catch (_) {
@@ -3323,15 +3417,491 @@ const HELPER_SOURCE: &str = r#"
                 },
             };
 
+            // ── .NET types as JS classes ────────────────────────────────────────────────
+            // A .NET type proxy (System.Text.StringBuilder, MyApp.Native.Greeter) is a constructor with a
+            // stable `prototype`, so it can be extended the way Java and Objective-C classes are on Android
+            // and iOS:
+            //   class Cat extends MyApp.Animal { constructor(n) { super(n); } Speak() { return super.Speak(); } }
+            //   const Dog = MyApp.Animal.extend('Dog', { Speak() { return this.super.Speak(); } });
+            //   const calc = new MyApp.ICalculator({ Compute(a, b) { return a * b; } });
+            // Constructing a subclass creates the JS object first, then a managed subclass of the .NET type
+            // whose overridden virtuals (and implemented interface members) call back into that object.
+            // `super.X()` reaches the base implementation through the non-virtual `__ns_base_X` entry point
+            // the bridge emits for every overridden member. Native code handing the instance back to JS gets
+            // the same JS object.
+            var _nsProxyCache = Object.create(null);
+            var _namespaceExtras = { System: Object.create(null) };
+            var _typeKindCache = Object.create(null);
+            var _typeProtoCache = Object.create(null);
+            var _subclassInfoCache = new WeakMap();
+            var _jsSelfByHandle = new Map();
+
+            // ── Lifetime of JS subclass instances ───────────────────────────────────────
+            // An instance is a JS object plus the managed object it drives. The JS object holds the managed
+            // one through its handle; the managed object reaches the JS object only through its dispatcher,
+            // which holds it weakly. So once JS drops the JS object, its handle is released and the managed
+            // object goes as soon as .NET/native code drops it too (the bridge then unpins the dispatcher).
+            // When native code calls into an instance whose JS object was collected, a new JS object of the
+            // same class is made for it: fields its constructor set are gone, as on Android when a JS object
+            // used only from native code is collected. Subclasses of WinRT UI classes are kept strongly while
+            // they are in a live XAML tree.
+            var _canWeakRef = typeof WeakRef === 'function';
+            var _selfFinalizers = typeof FinalizationRegistry === 'function'
+                ? new FinalizationRegistry(function (handle) {
+                    if (!_deref(_jsSelfByHandle.get(handle))) _jsSelfByHandle.delete(handle);
+                    try { _invoke({ handle: handle, method: '__release', args: [] }); } catch (_) {}
+                })
+                : null;
+
+            function _weak(obj) { return _canWeakRef ? new WeakRef(obj) : obj; }
+            function _deref(ref) { return ref && _canWeakRef && ref instanceof WeakRef ? ref.deref() : ref; }
+
+            // Gives `self` the bridge identity in `raw` and registers it as the JS object of `entry`'s instance.
+            function _adopt(entry, self, raw) {
+                Object.defineProperty(self, '__handle', { value: raw.__handle });
+                Object.defineProperty(self, '__nsOverrides', { value: entry.overrides });
+                if (!entry.winrt) {
+                    Object.defineProperty(self, '__type', { value: raw.__type || entry.typeName });
+                    if (raw.__native_ptr !== undefined) Object.defineProperty(self, '__native_ptr', { value: raw.__native_ptr });
+                }
+                entry.ref = _weak(self);
+                _jsSelfByHandle.set(raw.__handle, _weak(self));
+                if (_selfFinalizers) _selfFinalizers.register(self, raw.__handle);
+                if (entry.winrt) {
+                    entry.strong = self;
+                    _attachedEntries.add(entry);
+                }
+                _sweepAttached();
+                return self;
+            }
+
+            // The JS object of `entry`'s instance, made anew when the previous one was collected.
+            function _selfFor(entry, raw) {
+                var self = _deref(entry.ref);
+                if (self) return self;
+                if (entry.constructing) throw new Error(entry.typeName + ' called into its JS subclass before the instance existed');
+                if (!raw || typeof raw.__handle !== 'number') throw new Error('The ' + entry.typeName + ' subclass instance is gone');
+                if (entry.winrt) {
+                    self = globalThis.__nsWrapWinRTPointer(raw.__native_ptr, entry.typeName);
+                    Object.setPrototypeOf(self, entry.proto);
+                } else {
+                    self = Object.create(entry.proto);
+                }
+                return _adopt(entry, self, raw);
+            }
+
+            // The dispatcher native code calls the instance's overridden and interface members through.
+            function _makeDispatcher(entry) {
+                return function (selfHandle, member) {
+                    var self = _selfFor(entry, selfHandle);
+                    if (member === '__ns_js_self') return undefined;
+                    _sweepAttached();
+                    var margs = Array.prototype.slice.call(arguments, 2).map(_wrap);
+                    return _dispatchToJs(self, entry.baseProto, entry.typeName, member, margs);
+                };
+            }
+
+            // Subclasses of WinRT classes held strongly (entry.strong) while in a live XAML tree, re-checked at
+            // most every two seconds when subclass instances are created or called into.
+            var _attachedEntries = new Set();
+            var _lastAttachedSweep = 0;
+            function _sweepAttached() {
+                var now = Date.now();
+                if (now - _lastAttachedSweep < 2000) return;
+                _lastAttachedSweep = now;
+                _attachedEntries.forEach(function (entry) {
+                    var self = _deref(entry.ref);
+                    if (!self) {
+                        _attachedEntries.delete(entry);
+                        return;
+                    }
+                    var attached = false;
+                    try { attached = self.XamlRoot != null; } catch (_) {}
+                    entry.strong = attached ? self : undefined;
+                });
+            }
+            var _baseCallPrefix = '__ns_base_';
+
+            function _has(list, name) {
+                return !!list && list.indexOf(name) >= 0;
+            }
+
+            function _typeKind(path) {
+                var kind = _typeKindCache[path];
+                if (kind !== undefined) return kind;
+                try {
+                    kind = _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'TypeKind', args: [path] }) || '';
+                } catch (_) {
+                    kind = '';
+                }
+                _typeKindCache[path] = kind;
+                return kind;
+            }
+
+            // Full name of a .NET type proxy, or of the .NET base of a JS class deriving from one.
+            function _dotnetTypeName(type) {
+                if (typeof type === 'string') return type;
+                if (!type || (typeof type !== 'function' && typeof type !== 'object')) return '';
+                var name = type.__dotnetType__;
+                return typeof name === 'string' ? name : '';
+            }
+
+            // The handle of an instance of a JS subclass (an own property); -1 for anything else, such as
+            // a class prototype further down the chain, without running any property trap.
+            function _ownHandle(o) {
+                if (!o || (typeof o !== 'object' && typeof o !== 'function')) return -1;
+                var d = Object.getOwnPropertyDescriptor(o, '__handle');
+                return d && typeof d.value === 'number' ? d.value : -1;
+            }
+
+            function _baseCallName(self, member) {
+                var overrides = self.__nsOverrides;
+                return overrides && overrides.has(member) ? _baseCallPrefix + member : member;
+            }
+
+            // A native member of `self` (an instance of a JS subclass), reached through the .NET type's
+            // prototype: properties are read through their getter, methods become functions. Members the JS
+            // class overrides resolve to the base implementation — only `super.X` gets this far for them.
+            function _baseMember(path, self, prop) {
+                if (prop === 'toString') return function () { return String(_invoke({ handle: self.__handle, method: 'ToString', args: [] })); };
+                if (prop === 'valueOf') return function () { return this; };
+                var info = _getTypeInfo(_resolveAssembly(path), path);
+                var overrides = self.__nsOverrides;
+                if (_has(info.properties, prop) || (overrides && overrides.has('get_' + prop))) {
+                    return _wrap(_invoke({ handle: self.__handle, method: _baseCallName(self, 'get_' + prop), args: [] }));
+                }
+                if (_has(info.writeonlyProperties, prop))
+                    throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + path + '\'');
+                if (_has(info.methods, prop) || (overrides && overrides.has(prop))) {
+                    var method = _baseCallName(self, prop);
+                    return function () {
+                        var args = Array.prototype.slice.call(arguments).map(_unwrap);
+                        return _wrap(_invoke({ handle: self.__handle, method: method, args: args }));
+                    };
+                }
+                return undefined;
+            }
+
+            // The `prototype` of a .NET type: the end of every JS subclass's prototype chain. Reads resolve
+            // native members against the receiving instance; writes go to native properties, and anything
+            // else becomes a plain JS field of the instance.
+            function _typePrototype(path) {
+                var cached = _typeProtoCache[path];
+                if (cached) return cached;
+                var proto = new Proxy(Object.create(null), {
+                    get: function (_, prop, receiver) {
+                        if (typeof prop === 'symbol') return undefined;
+                        if (_ownHandle(receiver) < 0) {
+                            // Read off the prototype itself — TypeScript's ES5 super call
+                            // `_super.prototype.Method.call(this, ...)`: a function that runs the base
+                            // implementation on whichever instance it is called with.
+                            var typeInfo = _getTypeInfo(_resolveAssembly(path), path);
+                            if (!_has(typeInfo.methods, prop)) return undefined;
+                            return function () {
+                                if (_ownHandle(this) < 0) throw new TypeError(path + '.prototype.' + prop + ' called on an object that is not a ' + path);
+                                return _baseMember(path, this, prop).apply(this, arguments);
+                            };
+                        }
+                        return _baseMember(path, receiver, prop);
+                    },
+                    set: function (_, prop, value, receiver) {
+                        if (typeof prop !== 'symbol' && _ownHandle(receiver) >= 0) {
+                            var info = _getTypeInfo(_resolveAssembly(path), path);
+                            if (_has(info.readonlyProperties, prop))
+                                throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + path + '\'');
+                            if (_has(info.properties, prop) || _has(info.writeonlyProperties, prop)) {
+                                _invoke({ handle: receiver.__handle, method: _baseCallName(receiver, 'set_' + prop), args: [_unwrap(value)] });
+                                return true;
+                            }
+                        }
+                        Object.defineProperty(receiver, prop, { value: value, writable: true, enumerable: true, configurable: true });
+                        return true;
+                    },
+                });
+                _typeProtoCache[path] = proto;
+                return proto;
+            }
+
+            // Members (literal CLR names: methods, get_X/set_X accessors) and interfaces a JS class adds on
+            // top of its .NET base, from every class between it and the base.
+            function _subclassInfo(proto, baseProto) {
+                var cached = _subclassInfoCache.get(proto);
+                if (cached) return cached;
+                var members = [];
+                var overrides = new Set();
+                var interfaces = [];
+                var seen = Object.create(null);
+                function addInterfaces(list) {
+                    if (!Array.isArray(list)) return;
+                    for (var i = 0; i < list.length; i++) {
+                        var name = _dotnetTypeName(list[i]) || (list[i] && (list[i].__typeName__ || list[i].name)) || '';
+                        if (name && interfaces.indexOf(name) < 0) interfaces.push(name);
+                    }
+                }
+                for (var p = proto; p && p !== baseProto; p = Object.getPrototypeOf(p)) {
+                    var keys = Object.getOwnPropertyNames(p);
+                    for (var i = 0; i < keys.length; i++) {
+                        var key = keys[i];
+                        if (key === 'constructor' || key === 'interfaces' || key === 'super' || key === 'init' || seen[key]) continue;
+                        seen[key] = true;
+                        var d = Object.getOwnPropertyDescriptor(p, key);
+                        if (typeof d.get === 'function') { members.push('get_' + key); overrides.add('get_' + key); }
+                        if (typeof d.set === 'function') { members.push('set_' + key); overrides.add('set_' + key); }
+                        if (typeof d.value === 'function') { members.push(key); overrides.add(key); }
+                    }
+                    if (Object.prototype.hasOwnProperty.call(p, 'interfaces')) addInterfaces(p.interfaces);
+                    var ctor = Object.prototype.hasOwnProperty.call(p, 'constructor') ? p.constructor : null;
+                    if (ctor && Object.prototype.hasOwnProperty.call(ctor, 'interfaces')) addInterfaces(ctor.interfaces);
+                }
+                var info = { members: members, overrides: overrides, interfaces: interfaces };
+                _subclassInfoCache.set(proto, info);
+                return info;
+            }
+
+            // The JS-defined member `key` of `self` (an own field, or a member of one of its JS classes).
+            function _jsMember(self, key, baseProto) {
+                for (var o = self; o && o !== baseProto; o = Object.getPrototypeOf(o)) {
+                    var d = Object.getOwnPropertyDescriptor(o, key);
+                    if (d) return d;
+                }
+                return null;
+            }
+
+            // Native code calling an overridden member (or an implemented interface member) of `self`.
+            function _dispatchToJs(self, baseProto, typeName, member, args) {
+                var accessor = /^(get|set)[_:](.+)$/.exec(member);
+                if (accessor) {
+                    var ad = _jsMember(self, accessor[2], baseProto);
+                    if (ad) {
+                        if (accessor[1] === 'get') {
+                            if (typeof ad.get === 'function') return ad.get.call(self);
+                            if ('value' in ad && typeof ad.value !== 'function') return ad.value;
+                        } else if (typeof ad.set === 'function') {
+                            ad.set.call(self, args[0]);
+                            return undefined;
+                        } else if ('value' in ad && ad.writable) {
+                            self[accessor[2]] = args[0];
+                            return undefined;
+                        }
+                    }
+                }
+                var md = _jsMember(self, member, baseProto);
+                if (md && typeof md.value === 'function') return md.value.apply(self, args);
+                throw new Error((self.constructor && self.constructor.name || typeName) + ' does not implement ' + member);
+            }
+
+            function _constructSubclass(path, args, proto) {
+                if (typeof globalThis.__nsDotNetCreateJsSubclass !== 'function')
+                    throw new Error('Extending .NET types is not available in this runtime');
+                var baseProto = _typePrototype(path);
+                var info = _subclassInfo(proto, baseProto);
+                var self = Object.create(proto);
+                // A virtual the base constructor calls reaches `self` before it has its handle.
+                var entry = { proto: proto, baseProto: baseProto, typeName: path, overrides: info.overrides, winrt: false, ref: self };
+                var raw = globalThis.__nsDotNetCreateJsSubclass('', path, info.interfaces, info.members, _makeDispatcher(entry), args.map(_unwrap));
+                if (!raw || typeof raw.__handle !== 'number') throw new Error('Could not create an instance of a subclass of ' + path);
+                return _adopt(entry, self, raw);
+            }
+
+            // `new SomeInterface({ ... })`: an object implementing the interface with the given members.
+            function _implementInterface(path, impl) {
+                var proto = Object.create(_typePrototype('System.Object'));
+                Object.defineProperties(proto, Object.getOwnPropertyDescriptors(impl));
+                Object.defineProperty(proto, 'interfaces', { value: [path] });
+                return _constructSubclass('System.Object', [], proto);
+            }
+
+            // `this.super` inside a class made by extend(): the parent class's members bound to `self`.
+            function _superOf(self, Cls) {
+                var parent = Object.getPrototypeOf(Cls.prototype);
+                return new Proxy(Object.create(null), {
+                    get: function (_, prop) {
+                        var value = Reflect.get(parent, prop, self);
+                        return typeof value === 'function' ? value.bind(self) : value;
+                    },
+                });
+            }
+
+            // Base.extend([name,] members): an ES2015 subclass of Base with the given members; `init`, when
+            // present, runs after construction with the constructor arguments.
+            function _extendClass(Base, nameOrMembers, maybeMembers) {
+                var hasName = typeof nameOrMembers === 'string';
+                var members = (hasName ? maybeMembers : nameOrMembers) || {};
+                var Extended = class extends Base {
+                    constructor() {
+                        super(...arguments);
+                        if (typeof members.init === 'function') members.init.apply(this, arguments);
+                    }
+                };
+                var descriptors = Object.getOwnPropertyDescriptors(members);
+                delete descriptors.init;
+                if (descriptors.interfaces) {
+                    Object.defineProperty(Extended.prototype, 'interfaces', { value: members.interfaces });
+                    delete descriptors.interfaces;
+                }
+                Object.defineProperties(Extended.prototype, descriptors);
+                Object.defineProperty(Extended.prototype, 'super', {
+                    get: function () { return _superOf(this, Extended); },
+                });
+                if (hasName) Object.defineProperty(Extended, 'name', { value: nameOrMembers.split('.').pop() });
+                return Extended;
+            }
+
+            // `_super.call(this, ...)` / `_super.apply(this, args)` in TypeScript's ES5 output (what the
+            // @NativeClass transform emits): construct the subclass instance `thisArg` was created for.
+            function _es5SuperCall(path, thisArg, args) {
+                var proto = thisArg && Object.getPrototypeOf(thisArg);
+                if (!proto || !Object.prototype.isPrototypeOf.call(_typePrototype(path), proto))
+                    throw new TypeError('Class constructor ' + path + ' cannot be invoked without \'new\'');
+                return _constructSubclass(path, args, proto);
+            }
+
+            function _hasInstance(path, value) {
+                if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+                if (Object.prototype.isPrototypeOf.call(_typePrototype(path), value)) return true;
+                if (typeof value.__handle !== 'number') return false;
+                try {
+                    return _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'IsInstanceOf', args: [{ __handle: value.__handle }, path] }) === true;
+                } catch (_) {
+                    return false;
+                }
+            }
+
+            // ── WinRT classes as JS base classes ────────────────────────────────────────
+            // `class FixedPanel extends Microsoft.UI.Xaml.Controls.Panel { MeasureOverride(size) { ... } }`:
+            // the WinRT constructor hands `super(...)` here. The instance is a composed object created by
+            // the .NET bridge from the C#/WinRT projection of the class (the way a C# subclass is), so XAML
+            // calling an overridable member (MeasureOverride, ArrangeOverride, OnApplyTemplate, ...) lands in
+            // the JS override. The JS object is the ordinary WinRT wrapper of that object, with the subclass
+            // prototype spliced in front of the class's native members.
+            var _linkedWinRTPrototypes = new WeakSet();
+
+            // The WinRT class a JS class derives from: the nearest constructor with its own __typeName__.
+            function _winrtBaseOf(ctor) {
+                for (var c = ctor; c; c = Object.getPrototypeOf(c)) {
+                    if (Object.prototype.hasOwnProperty.call(c, '__typeName__')) return c;
+                }
+                return null;
+            }
+
+            // `super.X(...)` for a member a JS subclass of a WinRT class overrides: the base implementation,
+            // through the bridge (the native member would dispatch back into the override).
+            function _winrtBaseCall(handle, prop) {
+                return function () {
+                    var args = Array.prototype.slice.call(arguments).map(_unwrap);
+                    return _wrap(_invoke({ handle: handle, method: _baseCallPrefix + prop, args: args }));
+                };
+            }
+
+            // Puts a layer under the JS subclass prototypes that resolves the class's native members and
+            // sends `super.X()` for overridden members to the base implementation. On the classic engine the
+            // class's `prototype` is separate from its instances' native prototype, so the layer goes under the
+            // class's `prototype` once; on the napi engines they're the same object, so it goes under the
+            // subclass prototype that sits directly on it.
+            function _linkWinRTSubclassPrototype(base, nativeProto, proto) {
+                if (!base || !nativeProto) return;
+                var target = base.prototype;
+                if (target === nativeProto) {
+                    target = proto;
+                    while (target && Object.getPrototypeOf(target) !== nativeProto) target = Object.getPrototypeOf(target);
+                }
+                if (!target || _linkedWinRTPrototypes.has(target)) return;
+                _linkedWinRTPrototypes.add(target);
+                var layer = new Proxy(Object.create(nativeProto), {
+                    get: function (_, prop, receiver) {
+                        var handle = _ownHandle(receiver);
+                        if (typeof prop !== 'string') return Reflect.get(nativeProto, prop, receiver);
+                        if (handle >= 0) {
+                            if (receiver.__nsOverrides && receiver.__nsOverrides.has(prop)) return _winrtBaseCall(handle, prop);
+                            return Reflect.get(nativeProto, prop, receiver);
+                        }
+                        // Read off a prototype — TypeScript's ES5 `_super.prototype.X.call(this, ...)`: decide
+                        // between the base implementation and the native member when it's called.
+                        var native = Reflect.get(nativeProto, prop, receiver);
+                        if (typeof native !== 'function') return native;
+                        return function () {
+                            var h = _ownHandle(this);
+                            if (h >= 0 && this.__nsOverrides && this.__nsOverrides.has(prop))
+                                return _winrtBaseCall(h, prop).apply(this, arguments);
+                            return native.apply(this, arguments);
+                        };
+                    },
+                    has: function (_, prop) { return prop in nativeProto; },
+                });
+                Object.setPrototypeOf(target, layer);
+            }
+
+            // napi engines: the class `prototype` is the native prototype itself, so TypeScript's ES5
+            // `_super.prototype.X.call(this, ...)` reaches the native member directly. Wrap each native member a
+            // subclass overrides (once) so that, called on a JS subclass instance, it runs the base
+            // implementation instead of dispatching back into the override.
+            function _guardNativeMembers(nativeProto, overrides) {
+                overrides.forEach(function (name) {
+                    for (var p = nativeProto; p; p = Object.getPrototypeOf(p)) {
+                        var d = Object.getOwnPropertyDescriptor(p, name);
+                        if (!d) continue;
+                        if (typeof d.value === 'function' && !d.value.__nsGuarded && d.writable) {
+                            var native = d.value;
+                            var guarded = function () {
+                                var h = _ownHandle(this);
+                                if (h >= 0 && this.__nsOverrides && this.__nsOverrides.has(name))
+                                    return _winrtBaseCall(h, name).apply(this, arguments);
+                                return native.apply(this, arguments);
+                            };
+                            Object.defineProperty(guarded, '__nsGuarded', { value: true });
+                            Object.defineProperty(p, name, { value: guarded, writable: true, configurable: true, enumerable: d.enumerable });
+                        }
+                        return;
+                    }
+                });
+            }
+
+            // Called by the WinRT class constructors for `super(...)` from a JS subclass (newTarget) or
+            // TypeScript's ES5 `_super.call(this, ...)` (es5This). Returns undefined when this isn't a subclass
+            // construction or the .NET bridge isn't available; the constructor then builds a plain instance.
+            globalThis.__nsConstructWinRTSubclass = function (typeName, newTarget, args, es5This) {
+                var proto;
+                var base;
+                if (newTarget) {
+                    proto = newTarget.prototype;
+                    base = _winrtBaseOf(Object.getPrototypeOf(newTarget));
+                } else {
+                    proto = es5This && Object.getPrototypeOf(es5This);
+                    base = proto && proto.constructor ? _winrtBaseOf(Object.getPrototypeOf(proto.constructor)) : null;
+                    if (!base || base.__typeName__ !== typeName || Object.prototype.hasOwnProperty.call(proto.constructor, '__typeName__'))
+                        return undefined;
+                }
+                if (typeof globalThis.__nsDotNetCreateJsSubclass !== 'function' || typeof globalThis.__nsWrapWinRTPointer !== 'function')
+                    return undefined;
+                var baseProto = base ? base.prototype : null;
+                var info = _subclassInfo(proto, baseProto);
+                var entry = { proto: proto, baseProto: baseProto, typeName: typeName, overrides: info.overrides, winrt: true, constructing: true };
+                var raw = globalThis.__nsDotNetCreateJsSubclass('', typeName, info.interfaces, info.members, _makeDispatcher(entry), (args || []).map(_unwrap));
+                entry.constructing = false;
+                if (!raw || raw.__native_ptr === undefined || raw.__native_ptr === null)
+                    throw new Error('Could not create a WinRT object for a subclass of ' + typeName);
+                var self = globalThis.__nsWrapWinRTPointer(raw.__native_ptr, typeName);
+                var nativeProto = Object.getPrototypeOf(self);
+                _linkWinRTSubclassPrototype(base, nativeProto, proto);
+                if (base && base.prototype === nativeProto) _guardNativeMembers(nativeProto, info.overrides);
+                Object.setPrototypeOf(self, proto);
+                return _adopt(entry, self, raw);
+            };
+
+            globalThis.NSWinRT.extendClass = _extendClass;
+
             // System.Diagnostics.Stopwatch.StartNew()    →  static method call
             // System.Environment.MachineName             →  static property get
             // new System.Text.StringBuilder(64)          →  constructor
             // sw.Stop()                                  →  instance method
             // sw.Elapsed                                 →  instance property
             function _makeNamespaceProxy(path) {
+                var cached = _nsProxyCache[path];
+                if (cached) return cached;
                 function _node() {}
-                return new Proxy(_node, {
+                var proxy = new Proxy(_node, {
                     get: function (_, prop) {
+                        if (prop === Symbol.hasInstance) return function (value) { return _hasInstance(path, value); };
                         if (typeof prop === 'symbol') return undefined;
                         // Prevent string-coercion methods from descending into sub-proxies.
                         // V8's console.log / JSON.stringify call toString/valueOf on unknown objects;
@@ -3339,6 +3909,12 @@ const HELPER_SOURCE: &str = r#"
                         // type name, producing a spurious "Type not found" bridge error.
                         if (prop === 'toString' || prop === 'valueOf')
                             return function() { return '[.NET ' + path + ']'; };
+                        var extras = _namespaceExtras[path];
+                        if (extras && Object.prototype.hasOwnProperty.call(extras, prop)) return extras[prop];
+                        if (prop === '__dotnetType__') return path;
+                        if (prop === 'prototype') return _typePrototype(path);
+                        // Not a WinRT class: TypeScript's __extends must take the standard path.
+                        if (prop === '__nsWinRTClass__' || prop === 'then') return undefined;
                         var assembly = _resolveAssembly(path);
                         var info = _getTypeInfo(assembly, path);
                         // Write-only static property — reading it is an error.
@@ -3354,6 +3930,9 @@ const HELPER_SOURCE: &str = r#"
                                 return _wrap(_invoke({ assembly: assembly, typeName: path, method: prop, args: args }));
                             };
                         }
+                        if (prop === 'extend') return function (nameOrMembers, maybeMembers) { return _extendClass(this, nameOrMembers, maybeMembers); };
+                        if (prop === 'call') return function (thisArg) { return _es5SuperCall(path, thisArg, Array.prototype.slice.call(arguments, 1)); };
+                        if (prop === 'apply') return function (thisArg, args) { return _es5SuperCall(path, thisArg, args ? Array.prototype.slice.call(args) : []); };
                         // Namespace / sub-type: keep descending.
                         return _makeNamespaceProxy(path + '.' + prop);
                     },
@@ -3381,15 +3960,50 @@ const HELPER_SOURCE: &str = r#"
                         var assembly = _resolveAssembly(typeName);
                         return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: args.map(_unwrap) }));
                     },
-                    construct: function (_, args) {
+                    construct: function (_, args, newTarget) {
+                        // `super(...)` from a JS subclass.
+                        if (newTarget && newTarget !== proxy) return _constructSubclass(path, args, newTarget.prototype);
+                        if (args.length === 1 && args[0] && typeof args[0] === 'object' && typeof args[0].__handle !== 'number'
+                            && _typeKind(path) === 'interface')
+                            return _implementInterface(path, args[0]);
                         var assembly = _resolveAssembly(path);
                         return _wrap(_invoke({ assembly: assembly, typeName: path, method: '.ctor', args: args.map(_unwrap) }));
                     },
                 });
+                _nsProxyCache[path] = proxy;
+                return proxy;
             }
-            globalThis.System         = _makeNamespaceProxy('System');
+            // `System` stays the .NET namespace when app code assigns it: @nativescript/core sets
+            // `global.System = { import() }` (a SystemJS shim). Assigned members are kept and take
+            // precedence (`System.import(...)` keeps working); everything else is .NET.
+            (function () {
+                var systemProxy = _makeNamespaceProxy('System');
+                Object.defineProperty(globalThis, 'System', {
+                    configurable: true,
+                    enumerable: true,
+                    get: function () { return systemProxy; },
+                    set: function (value) {
+                        if (value && (typeof value === 'object' || typeof value === 'function'))
+                            Object.keys(value).forEach(function (k) { _namespaceExtras.System[k] = value[k]; });
+                    },
+                });
+            })();
             globalThis.Microsoft      = _makeNamespaceProxy('Microsoft');
             globalThis.NativeScript   = _makeNamespaceProxy('NativeScript');
+
+            // Every other root namespace of the app's assemblies (C# sources compiled into the app,
+            // plugin and NuGet assemblies) is a lazy global too, so `new MyCompany.Native.Foo()` works
+            // with no registration step, the way Java packages and Objective-C classes are globals on
+            // Android and iOS. WinRT owns Windows/Microsoft/NativeScript; the rest are implementation
+            // namespaces of the toolchain that no app reaches for.
+            (function () {
+                var reserved = { Windows: 1, Microsoft: 1, NativeScript: 1, System: 1, NativeScriptBridge: 1, NSWinRTDynamicProxies: 1,
+                    WinRT: 1, ABI: 1, XamlGeneratedNamespace: 1, FxResources: 1, Internal: 1, Interop: 1, MS: 1, Mono: 1 };
+                for (var ns in _namespaceAssemblyMap) {
+                    if (ns.indexOf('.') !== -1 || reserved[ns] === 1 || !/^[A-Za-z_$][\w$]*$/.test(ns)) continue;
+                    globalThis.NSWinRT.dotnet.registerNamespace(ns);
+                }
+            })();
 
             // Creates a typed .NET BCL delegate (not a WinRT COM delegate).
             // Use this when the API expects a managed System.Action,
@@ -3397,11 +4011,10 @@ const HELPER_SOURCE: &str = r#"
             // For WinRT delegate types use NSWinRT.asDelegate instead.
             if (typeof globalThis.__nsDotNetAwaitTask === 'function') {
                 globalThis.NSWinRT.dotnet.taskToPromise = function (obj) {
-                    var h = obj && typeof obj.__handle === 'number' ? obj.__handle
-                          : typeof obj === 'number' ? obj : -1;
+                    var h = obj && typeof obj.__handle === 'number' && obj.__isTask === true ? obj.__handle : -1;
                     if (h < 0) return Promise.resolve(obj);
                     return new Promise(function (resolve, reject) {
-                        globalThis.__nsDotNetAwaitTask(h, resolve, reject);
+                        globalThis.__nsDotNetAwaitTask(h, function (value) { resolve(_wrap(value)); }, reject);
                     });
                 };
             }
@@ -3914,6 +4527,7 @@ pub(crate) fn handle_dotnet_invoke_binary(
         }
     }
 
+    release_collected_js_callbacks();
     match crate::dotnet::call_dotnet_binary(&req) {
         Ok(response) => match bin_read_response(scope, &response) {
             Ok(v8_val) => retval.set(v8_val),
@@ -3936,7 +4550,24 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     _resp_len: *mut i32,
 ) {
     let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
-    if isolate_ptr.is_null() {
+    let owner = crate::dotnet_callback_owner(callback_id);
+    if isolate_ptr.is_null() || owner.is_some_and(|o| o != isolate_ptr) {
+        // A managed delegate, event, Task continuation or overridden member running on a thread
+        // other than the one its JS function belongs to (the UI thread or a worker): hand the call
+        // to that thread and wait for it, so the callback runs and its result reaches the managed
+        // caller (see `run_on_js_thread_sync`).
+        let (args, resp, resp_len) = (args_ptr as usize, _resp_ptr as usize, _resp_len as usize);
+        let call = move || {
+            invoke_dotnet_js_callback(callback_id, args as *const u8, args_len, resp as *mut *mut u8, resp_len as *mut i32)
+        };
+        let delivered = match owner {
+            Some(owner) => crate::run_on_js_thread_sync(owner, call),
+            None if !crate::ui_dispatcher::is_ui_thread() => crate::ui_dispatcher::run_on_ui_thread_sync(call),
+            None => None,
+        };
+        if delivered.is_none() {
+            write_callback_response(&[0x0F, 0, 0, 0, 0][..], _resp_ptr, _resp_len);
+        }
         return;
     }
 
@@ -3950,6 +4581,7 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     let scope = &mut v8::ContextScope::new(scope, context);
     v8::tc_scope!(tc, scope);
 
+    release_collected_js_callbacks();
     let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| m.borrow().get(&callback_id).cloned());
     let Some(func_global) = func_global else {
         return;
@@ -3965,61 +4597,36 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     let js_args = parse_dotnet_callback_args(tc, args_slice);
 
     let result_val = func.call(tc, recv, &js_args);
-    if tc.has_caught() {
-        if let Some(ex) = tc.exception() {
-            let msg = ex.to_rust_string_lossy(tc);
-            crate::store_last_js_error(msg);
-        }
-        tc.reset();
-    }
     // Serialize the returned value (if any) into the binary response format
     // and return it to managed via resp_ptr/resp_len. Managed will call
     // Bridge.Free (Marshal.FreeHGlobal) to release this memory, so allocate
     // with the Windows LocalAlloc/LMEM_FIXED allocator for compatibility.
     let mut out_buf: Vec<u8> = Vec::new();
-    match result_val {
-        Some(rv) => {
-            // Convert the returned V8 value into a single tagged binary value.
-            bin_write_v8_value(&mut out_buf, tc, rv);
-        }
-        None => {
-            // No return value: null tag.
-            out_buf.push(0x00u8);
-        }
-    }
-
-    if out_buf.is_empty() {
-        // No response: leave resp pointers null / zero.
-        if !_resp_ptr.is_null() {
-            *_resp_ptr = std::ptr::null_mut();
-        }
-        if !_resp_len.is_null() {
-            *_resp_len = 0;
-        }
+    if tc.has_caught() {
+        let msg = tc
+            .exception()
+            .map(|ex| ex.to_rust_string_lossy(tc))
+            .unwrap_or_else(|| "JavaScript exception".to_string());
+        crate::store_last_js_error(msg.clone());
+        tc.reset();
+        // 0x0F: the callback threw. A managed caller that expects a result gets a JsException;
+        // a void delegate/event ignores it (the error is reported like any uncaught JS error).
+        out_buf.push(0x0F);
+        bin_write_str32(&mut out_buf, msg.as_bytes());
     } else {
-        // Allocate memory using LocalAlloc so managed Marshal.FreeHGlobal can free it.
-        let size = out_buf.len();
-        unsafe {
-            let p = LocalAlloc(LMEM_FIXED, size);
-            if p.is_null() {
-                if !_resp_ptr.is_null() {
-                    *_resp_ptr = std::ptr::null_mut();
-                }
-                if !_resp_len.is_null() {
-                    *_resp_len = 0;
-                }
-            } else {
-                let dest = p as *mut u8;
-                std::ptr::copy_nonoverlapping(out_buf.as_ptr(), dest, size);
-                if !_resp_ptr.is_null() {
-                    *_resp_ptr = dest;
-                }
-                if !_resp_len.is_null() {
-                    *_resp_len = size as i32;
-                }
+        match result_val {
+            Some(rv) => {
+                // Convert the returned V8 value into a single tagged binary value.
+                bin_write_v8_value(&mut out_buf, tc, rv);
+            }
+            None => {
+                // No return value: null tag.
+                out_buf.push(0x00u8);
             }
         }
     }
+
+    write_callback_response(&out_buf, _resp_ptr, _resp_len);
     // If this callback was registered as a one-shot, remove it now to avoid leaks.
     crate::DOTNET_ONESHOT_JS_CALLBACKS.with(|s| {
         let mut set = s.borrow_mut();
@@ -4028,6 +4635,7 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
             crate::DOTNET_JS_CALLBACKS.with(|m| {
                 m.borrow_mut().remove(&callback_id);
             });
+            crate::forget_dotnet_callback_owner(callback_id);
             set.remove(&callback_id);
         }
     });
@@ -4037,6 +4645,74 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     if !crate::defer_microtask_drain() {
         tc.perform_microtask_checkpoint();
     }
+}
+
+/// Hands a callback's binary response to the managed caller through `resp_ptr`/`resp_len`. The
+/// buffer comes from LocalAlloc because managed code frees it with Marshal.FreeHGlobal.
+unsafe fn write_callback_response(bytes: &[u8], resp_ptr: *mut *mut u8, resp_len: *mut i32) {
+    let mut dest: *mut u8 = std::ptr::null_mut();
+    if !bytes.is_empty() {
+        let p = LocalAlloc(LMEM_FIXED, bytes.len());
+        if !p.is_null() {
+            dest = p as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
+        }
+    }
+    if !resp_ptr.is_null() {
+        *resp_ptr = dest;
+    }
+    if !resp_len.is_null() {
+        *resp_len = if dest.is_null() { 0 } else { bytes.len() as i32 };
+    }
+}
+
+/// Drops the JS functions whose managed delegates the .NET GC has collected. The release queue is
+/// process-wide; a function that belongs to another JS thread (a worker's) is dropped there.
+pub(crate) fn release_collected_js_callbacks() {
+    let released = crate::dotnet::take_released_js_callbacks();
+    if released.is_empty() {
+        return;
+    }
+    let current = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    let mut elsewhere: HashMap<usize, Vec<i32>> = HashMap::new();
+    crate::DOTNET_JS_CALLBACKS.with(|m| {
+        let mut m = m.borrow_mut();
+        for id in released {
+            match crate::dotnet_callback_owner(id) {
+                Some(owner) if owner != current => elsewhere.entry(owner as usize).or_default().push(id),
+                _ => {
+                    m.remove(&id);
+                    crate::forget_dotnet_callback_owner(id);
+                }
+            }
+        }
+    });
+    for (owner, ids) in elsewhere {
+        let owned = ids.clone();
+        let queued = crate::post_to_js_thread(owner as *mut v8::Isolate, move || {
+            crate::DOTNET_JS_CALLBACKS.with(|m| {
+                let mut m = m.borrow_mut();
+                for id in ids {
+                    m.remove(&id);
+                    crate::forget_dotnet_callback_owner(id);
+                }
+            });
+        });
+        if !queued {
+            // That runtime is gone and took its functions with it.
+            owned.into_iter().for_each(crate::forget_dotnet_callback_owner);
+        }
+    }
+}
+
+/// Registers `func` as a callback the bridge can invoke and returns its id.
+pub(crate) fn register_dotnet_js_callback(scope: &mut v8::PinScope<'_, '_>, func: v8::Local<v8::Function>) -> i32 {
+    let cb_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::DOTNET_JS_CALLBACKS.with(|m| {
+        m.borrow_mut().insert(cb_id, v8::Global::new(scope, func));
+    });
+    crate::record_dotnet_callback_owner(cb_id);
+    cb_id
 }
 
 fn parse_dotnet_callback_args<'s>(
@@ -4096,6 +4772,7 @@ pub(crate) fn handle_dotnet_create_delegate(
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         m.borrow_mut().insert(cb_id, v8::Global::new(scope, func));
     });
+    crate::record_dotnet_callback_owner(cb_id);
 
     // opcode 0x09 | type_name (str16) | callback_id (i32)
     let mut req: Vec<u8> = Vec::with_capacity(32);
@@ -4183,6 +4860,7 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         m.borrow_mut().insert(cb_id, v8::Global::new(scope, cb_fn));
     });
+    crate::record_dotnet_callback_owner(cb_id);
 
     let mut req: Vec<u8> = Vec::with_capacity(64);
     req.push(0x0A);
@@ -4197,7 +4875,18 @@ pub(crate) fn handle_dotnet_create_js_subclass(
         bin_write_str16(&mut req, name.as_bytes());
     }
     req.extend_from_slice(&cb_id.to_le_bytes());
+    // Constructor arguments (optional 6th argument, an array): forwarded to the matching base
+    // constructor, as `super(...)` arguments are on Android/iOS.
+    if let Ok(ctor_args) = v8::Local::<v8::Array>::try_from(args.get(5)) {
+        let count = ctor_args.length().min(255);
+        req.push(count as u8);
+        for i in 0..count {
+            let value = ctor_args.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
+            bin_write_v8_arg(&mut req, scope, value);
+        }
+    }
 
+    release_collected_js_callbacks();
     match crate::dotnet::call_dotnet_binary(&req) {
         Ok(response) => match bin_read_response(scope, &response) {
             Ok(v) => retval.set(v),
@@ -4256,6 +4945,8 @@ pub(crate) fn handle_dotnet_await_task(
         map.insert(resolve_id, v8::Global::new(scope, resolve_fn));
         map.insert(reject_id, v8::Global::new(scope, reject_fn));
     });
+    crate::record_dotnet_callback_owner(resolve_id);
+    crate::record_dotnet_callback_owner(reject_id);
 
     // Binary instance call: 0x01 | handle(i32) | "__dotnet_await__"(str16) | 2 | i32 resolveId | i32 rejectId
     let mut req: Vec<u8> = Vec::with_capacity(32);
@@ -4274,6 +4965,8 @@ pub(crate) fn handle_dotnet_await_task(
             map.remove(&resolve_id);
             map.remove(&reject_id);
         });
+        crate::forget_dotnet_callback_owner(resolve_id);
+        crate::forget_dotnet_callback_owner(reject_id);
         throw_js_error(scope, &e);
     }
 }
@@ -4307,6 +5000,24 @@ fn bin_write_v8_arg(
         buf.push(0x04);
         buf.extend_from_slice(&n.value().to_bits().to_le_bytes());
         return;
+    }
+
+    // A JS function where a .NET method expects a delegate (Func<>, Action<>, EventHandler<T>,
+    // ...): sent as a callback id the bridge wraps in a delegate of the parameter's type, the way a
+    // JS function passed for a Java interface or an Objective-C block becomes one on Android/iOS.
+    // Constructors of JS-extended .NET classes and namespace proxies carry a handle and are not
+    // callbacks.
+    if let Ok(func) = v8::Local::<v8::Function>::try_from(arg) {
+        let has_handle = v8::String::new(scope, "__handle")
+            .and_then(|k| func.get(scope, k.into()))
+            .map(|v| v.is_number())
+            .unwrap_or(false);
+        if !has_handle {
+            let cb_id = register_dotnet_js_callback(scope, func);
+            buf.push(0x0C);
+            buf.extend_from_slice(&cb_id.to_le_bytes());
+            return;
+        }
     }
 
     if arg.is_string() {
@@ -4360,6 +5071,12 @@ fn bin_write_v8_arg(
             }
         }
 
+        if let Some(json) = plain_object_json(scope, arg) {
+            buf.push(0x0D);
+            bin_write_str32(buf, json.as_bytes());
+            return;
+        }
+
         // Fallback: stringify object
         if let Some(sv) = arg.to_string(scope) {
             let bytes = sv.to_rust_string_lossy(scope).into_bytes();
@@ -4373,6 +5090,21 @@ fn bin_write_v8_arg(
     buf.push(0x00);
 }
 
+
+/// A plain JS object (`{ Width: 120, Height: 40 }`) as JSON, for a .NET struct/record parameter or
+/// return value (tag 0x0D): the bridge deserializes it into the expected type. Class instances,
+/// arrays and functions are not plain objects.
+fn plain_object_json(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
+    if !value.is_object() || value.is_array() || value.is_function() || value.is_proxy() {
+        return None;
+    }
+    let obj = value.to_object(scope)?;
+    if obj.get_constructor_name().to_rust_string_lossy(scope) != "Object" {
+        return None;
+    }
+    let json = v8::json::stringify(scope, value)?;
+    Some(json.to_rust_string_lossy(scope))
+}
 
 fn bin_write_v8_value(
     buf: &mut Vec<u8>,
@@ -4459,6 +5191,11 @@ fn bin_write_v8_value(
                     }
                 }
             }
+            if let Some(json) = plain_object_json(scope, arg) {
+                buf.push(0x0D);
+                bin_write_str32(buf, &json.into_bytes());
+                return;
+            }
             // fallback: stringify
             if let Some(sv) = arg.to_string(scope) {
                 let bytes = sv.to_rust_string_lossy(scope).into_bytes();
@@ -4520,6 +5257,17 @@ fn bin_read_value<'s>(
             Ok(v8::String::new(scope, s)
                 .map(Into::into)
                 .unwrap_or_else(|| v8::null(scope).into()))
+        }
+
+        0x0D => {
+            // struct/record as JSON: u32 len + utf8 -> plain object
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "json len")?)
+                as usize;
+            *pos += 4;
+            let text = std::str::from_utf8(&bytes[*pos..*pos + len]).map_err(|_| "utf8")?;
+            *pos += len;
+            let json = v8::String::new(scope, text).ok_or("v8 str")?;
+            Ok(v8::json::parse(scope, json).unwrap_or_else(|| v8::null(scope).into()))
         }
 
         0x06 | 0x0C => {
@@ -5062,6 +5810,7 @@ pub(crate) fn init_async_helpers(
         handle_dotnet_create_js_subclass
     );
     register!("__nsDotNetAwaitTask", handle_dotnet_await_task);
+    register!("__nsWrapWinRTPointer", crate::handle_wrap_winrt_pointer);
     register!("__nsRunOnUIThread", handle_run_on_ui_thread);
     register!("__nsWin32Call", handle_win32_call);
     register!("__nsWin32CallRaw", handle_win32_call_raw);

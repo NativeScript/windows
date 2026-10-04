@@ -54,6 +54,9 @@ pub(crate) struct NapiDelegateData {
     /// For a delegate whose Invoke the shared vtable can't implement (see [`delegate_invoke`]):
     /// the typed Invoke and the delegate's own vtable, which points at it.
     typed: Option<(delegate_invoke::TypedInvoke, Box<NapiDelegateVtbl>)>,
+    /// The JS thread the function belongs to (where it was created). An invocation on another
+    /// thread is handed to it when it is the UI thread (see `napi_delegate_invoke_args`).
+    owner_thread: std::thread::ThreadId,
 }
 
 impl Drop for NapiDelegateData {
@@ -87,6 +90,12 @@ pub fn make_napi_delegate(
     signature: DelegateSignature,
 ) -> Option<*mut c_void> {
     make_napi_delegate_typed(env, func, guid, signature, Vec::new())
+}
+
+/// [`make_napi_delegate`] for a delegate whose Invoke returns nothing and takes `params`: for
+/// embedders and tests outside this crate, which can't name [`DelegateSignature`].
+pub fn make_napi_void_delegate(env: &Env, func: &JsFunction, guid: GUID, params: Vec<NativeType>) -> Option<*mut c_void> {
+    make_napi_delegate(env, func, guid, DelegateSignature::new(params, DelegateReturn::Void))
 }
 
 /// The sealed-class declarations of a delegate's Invoke parameters, aligned with the
@@ -150,6 +159,7 @@ pub(crate) fn make_napi_delegate_typed(
         signature,
         param_classes,
         typed,
+        owner_thread: std::thread::current().id(),
     });
     let delegate = Box::new(NapiDelegate {
         vtable,
@@ -205,7 +215,17 @@ unsafe extern "system" fn napi_delegate_release(this: *mut NapiDelegate) -> u32 
     if prev == 1 {
         std::sync::atomic::fence(Ordering::Acquire);
         let b = Box::from_raw(this);
-        drop(Box::from_raw(b.data));
+        let data = Box::from_raw(b.data);
+        // Deleting the function reference is a napi call: a final release on a background thread
+        // (the component that invoked the delegate there) does it on the JS thread.
+        if std::thread::current().id() != data.owner_thread && crate::ui_dispatcher::is_ui_thread_id(data.owner_thread) {
+            struct SendData(Box<NapiDelegateData>);
+            unsafe impl Send for SendData {}
+            let data = SendData(data);
+            crate::ui_dispatcher::post_to_ui_thread(move || drop(data));
+        } else {
+            drop(data);
+        }
     }
     prev - 1
 }
@@ -274,6 +294,38 @@ fn napi_delegate_invoke_inner(
         }
         &*data_ptr
     };
+    let args = args(&data.signature);
+    napi_delegate_invoke_args(this, data, args, result_slot)
+}
+
+fn napi_delegate_invoke_args(
+    this: *mut NapiDelegate,
+    data: &NapiDelegateData,
+    args: Vec<DelegateArg>,
+    result_slot: *mut c_void,
+) -> HRESULT {
+    const E_FAIL: HRESULT = HRESULT(0x80004005u32 as i32);
+    const RPC_E_WRONG_THREAD: HRESULT = HRESULT(0x8001010Eu32 as i32);
+    if std::thread::current().id() != data.owner_thread {
+        // Invoked on a background thread (a component that calls its handlers without marshaling
+        // them back to the registering apartment): napi may only be used on the JS thread, so run
+        // the call there and wait for it — the arguments stay valid and the result is written
+        // before Invoke returns (see `ui_dispatcher::run_on_ui_thread_sync`). Only the UI thread
+        // can be handed work; any other JS thread's functions stay undeliverable.
+        if !crate::ui_dispatcher::is_ui_thread_id(data.owner_thread) {
+            return RPC_E_WRONG_THREAD;
+        }
+        struct SendPtr(*mut NapiDelegate, *mut c_void);
+        unsafe impl Send for SendPtr {}
+        let ptrs = SendPtr(this, result_slot);
+        return crate::ui_dispatcher::run_on_ui_thread_sync(move || {
+            let ptrs = ptrs;
+            // SAFETY: the caller holds a reference on the delegate for the duration of Invoke.
+            let data = unsafe { &*(*ptrs.0).data };
+            napi_delegate_invoke_args(ptrs.0, data, args, ptrs.1)
+        })
+        .unwrap_or(RPC_E_WRONG_THREAD);
+    }
     let env = data.env;
     if env.is_null() {
         return E_FAIL;
@@ -294,7 +346,6 @@ fn napi_delegate_invoke_inner(
                 return E_FAIL;
             }
 
-            let args = args(&data.signature);
             let mut js_args: Vec<sys::napi_value> = Vec::with_capacity(args.len());
             for (i, arg) in args.iter().enumerate() {
                 let val = match *arg {

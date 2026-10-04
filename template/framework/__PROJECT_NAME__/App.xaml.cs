@@ -57,7 +57,7 @@ namespace __PROJECT_NAME__
             try
             {
                 var panicLogPath = System.IO.Path.Combine(
-                    ApplicationData.Current.LocalFolder.Path, "nativescript-panic.log");
+                    RuntimeHost.LocalFolderPath, "nativescript-panic.log");
                 if (System.IO.File.Exists(panicLogPath))
                 {
                     var content = System.IO.File.ReadAllText(panicLogPath);
@@ -121,7 +121,8 @@ namespace __PROJECT_NAME__
         {
             StopPump();
             _runtimeHost.NotifyAppEvent((int)AppEventKind.Exit, null);
-            ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty;
+            try { ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty; }
+            catch (InvalidOperationException) { } // unpackaged: no ApplicationData
             _runtimeHost.Dispose();
         }
 
