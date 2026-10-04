@@ -1,5 +1,7 @@
+use crate::transfer::Message;
 use crate::Runtime;
 use parking_lot::{Mutex, RwLock};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -11,7 +13,7 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
 use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT};
 
 enum WorkerCommand {
-    PostMessage(Vec<u8>),
+    PostMessage(Message),
     /// Work handed to the worker's thread from another thread: a callback created in the worker
     /// (see [`run_on_worker_sync`]) or the release of one.
     Run(Box<dyn FnOnce() + Send>),
@@ -74,9 +76,8 @@ pub(crate) fn post_to_worker(isolate: usize, f: impl FnOnce() + Send + 'static) 
     sent
 }
 
-#[derive(Debug)]
 enum WorkerEvent {
-    Message(Vec<u8>),
+    Message(Message),
     Error(String),
     Exited,
 }
@@ -91,11 +92,22 @@ struct WorkerHandle {
     join: thread::JoinHandle<()>,
 }
 
-#[derive(Debug)]
 pub enum PolledWorkerEvent {
-    Message(Vec<u8>),
+    Message(Message),
     Error(String),
     Exited,
+}
+
+thread_local! {
+    static OUTGOING: RefCell<Vec<Message>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn queue_outgoing(message: Message) {
+    OUTGOING.with(|outgoing| outgoing.borrow_mut().push(message));
+}
+
+fn take_outgoing() -> Vec<Message> {
+    OUTGOING.with(|outgoing| std::mem::take(&mut *outgoing.borrow_mut()))
 }
 
 static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
@@ -118,10 +130,10 @@ fn worker_bootstrap_script(source: &str, filename: &str) -> Result<String, Strin
                 const __workerFilename = {filename};
                 const __listeners = [];
 
-                globalThis.__nsWorkerOutbox = [];
+                const __queueMessage = globalThis.__nsWorkerQueueMessage;
                 globalThis.self = globalThis;
-                globalThis.postMessage = function (data) {{
-                    globalThis.__nsWorkerOutbox.push(data);
+                globalThis.postMessage = function (data, transfer) {{
+                    __queueMessage(data, transfer);
                 }};
 
                 globalThis.addEventListener = function (type, listener) {{
@@ -220,41 +232,46 @@ pub fn create_worker(app_root: String, source: String, filename: String) -> Resu
                 }
             }
 
-            let forward_outbox = |runtime: &mut Runtime| {
+            let forward_outbox = || {
                 let mut sent = false;
-                for result in runtime.drain_outbox_bytes() {
+                for message in take_outgoing() {
                     sent = true;
-                    let _ = evt_tx.send(match result {
-                        Ok(b) => WorkerEvent::Message(b),
-                        Err(e) => WorkerEvent::Error(e),
-                    });
+                    let _ = evt_tx.send(WorkerEvent::Message(message));
                 }
                 if sent {
                     notify_creator();
                 }
             };
-            forward_outbox(&mut runtime);
+            forward_outbox();
             // Commands, Windows messages (WinRT calls marshaled to this STA thread, async
             // completions) and the worker's timers, until terminated.
             'run: loop {
                 loop {
                     match cmd_rx.try_recv() {
-                        Ok(WorkerCommand::PostMessage(bytes)) => runtime.dispatch_to_worker(&bytes),
+                        Ok(WorkerCommand::PostMessage(message)) => runtime.dispatch_to_worker(message),
                         Ok(WorkerCommand::Run(job)) => job(),
                         Ok(WorkerCommand::Terminate) | Err(TryRecvError::Disconnected) => break 'run,
                         Err(TryRecvError::Empty) => break,
                     }
-                    forward_outbox(&mut runtime);
+                    forward_outbox();
                 }
                 crate::pump_messages();
                 crate::timers::pump();
-                forward_outbox(&mut runtime);
-                let timeout = if crate::timers::has_pending() { 10 } else { INFINITE };
+                if crate::animation_frames::worker_frame_wait() == Some(Duration::ZERO) {
+                    crate::animation_frames::pump();
+                }
+                forward_outbox();
+                let mut timeout = if crate::timers::has_pending() { 10 } else { INFINITE };
+                if let Some(wait) = crate::animation_frames::worker_frame_wait() {
+                    timeout = timeout.min(wait.as_millis().max(1) as u32);
+                }
                 unsafe {
                     MsgWaitForMultipleObjectsEx(Some(&[wake.handle()]), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 }
             }
 
+            // Its addons' cleanup hooks, while its isolate is alive.
+            crate::node_api::teardown_thread();
             worker_executors().lock().remove(&isolate);
             let _ = evt_tx.send(WorkerEvent::Exited);
             notify_creator();
@@ -274,7 +291,7 @@ pub fn create_worker(app_root: String, source: String, filename: String) -> Resu
     Ok(worker_id)
 }
 
-pub fn post_message(worker_id: u64, payload_bytes: Vec<u8>) -> Result<(), String> {
+pub fn post_message(worker_id: u64, message: Message) -> Result<(), String> {
     let workers = workers().read();
     let Some(worker) = workers.get(&worker_id) else {
         return Err(format!("Unknown worker id: {worker_id}"));
@@ -282,7 +299,7 @@ pub fn post_message(worker_id: u64, payload_bytes: Vec<u8>) -> Result<(), String
 
     let sent = worker
         .tx
-        .send(WorkerCommand::PostMessage(payload_bytes))
+        .send(WorkerCommand::PostMessage(message))
         .map_err(|e| format!("Failed to send worker message: {e}"));
     worker.wake.signal();
     sent
@@ -292,7 +309,7 @@ fn collect_events(rx: &Receiver<WorkerEvent>) -> Vec<PolledWorkerEvent> {
     let mut events = Vec::new();
     loop {
         match rx.try_recv() {
-            Ok(WorkerEvent::Message(bytes)) => events.push(PolledWorkerEvent::Message(bytes)),
+            Ok(WorkerEvent::Message(message)) => events.push(PolledWorkerEvent::Message(message)),
             Ok(WorkerEvent::Error(err)) => events.push(PolledWorkerEvent::Error(err)),
             Ok(WorkerEvent::Exited) => {
                 events.push(PolledWorkerEvent::Exited);
@@ -340,7 +357,7 @@ pub fn poll_events_blocking(
     let mut events = Vec::new();
 
     match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-        Ok(WorkerEvent::Message(bytes)) => events.push(PolledWorkerEvent::Message(bytes)),
+        Ok(WorkerEvent::Message(message)) => events.push(PolledWorkerEvent::Message(message)),
         Ok(WorkerEvent::Error(err)) => events.push(PolledWorkerEvent::Error(err)),
         Ok(WorkerEvent::Exited) => events.push(PolledWorkerEvent::Exited),
         Err(_) => return Ok(events),

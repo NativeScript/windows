@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::type_description::build_runtime_type_descriptor;
 use crate::dotnet::{bin_write_str16, bin_write_str32};
-use crate::{normalize_js_path, proxy_manifests, throw_js_error, try_resolve_with_known_extensions, Runtime, ASYNC_PUMP_HOOK};
+use crate::{normalize_js_path, proxy_manifests, throw_js_error, try_resolve_with_known_extensions, ASYNC_PUMP_HOOK};
 use std::cell::RefCell;
 use std::ffi::c_void;
 
@@ -209,23 +209,29 @@ fn default_auto_capture_path() -> PathBuf {
     PathBuf::from("sbg_output").join("sbg_metadata.json")
 }
 
+/// Delivered as a `messageerror`.
+fn worker_error<'s>(scope: &mut v8::PinScope<'s, '_>, error: &str) -> Option<v8::Local<'s, v8::Value>> {
+    let obj = v8::Object::new(scope);
+    if let Some(key) = v8::String::new(scope, "__workerError") {
+        if let Some(val) = v8::String::new(scope, error) {
+            obj.set(scope, key.into(), val.into());
+        }
+    }
+    Some(obj.into())
+}
+
 fn polled_event_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: crate::worker_threads::PolledWorkerEvent,
 ) -> Option<v8::Local<'s, v8::Value>> {
     match event {
-        crate::worker_threads::PolledWorkerEvent::Message(bytes) => {
-            Runtime::deserialize_value(scope, &bytes)
-        }
-        crate::worker_threads::PolledWorkerEvent::Error(error) => {
-            let obj = v8::Object::new(scope);
-            if let Some(key) = v8::String::new(scope, "__workerError") {
-                if let Some(val) = v8::String::new(scope, error.as_str()) {
-                    obj.set(scope, key.into(), val.into());
-                }
+        crate::worker_threads::PolledWorkerEvent::Message(message) => {
+            match crate::transfer::deserialize(scope, message) {
+                Ok(value) => Some(value),
+                Err(error) => worker_error(scope, &error),
             }
-            Some(obj.into())
         }
+        crate::worker_threads::PolledWorkerEvent::Error(error) => worker_error(scope, &error),
         crate::worker_threads::PolledWorkerEvent::Exited => {
             let obj = v8::Object::new(scope);
             if let Some(key) = v8::String::new(scope, "__workerExit") {
@@ -919,6 +925,11 @@ pub(crate) fn handle_resolve_module_path(
         throw_js_error(scope, "__nsResolveModulePath: module specifier is empty");
         return;
     }
+    // The app directory, as NativeScript's webpack worker loader names worker chunks.
+    let specifier = match specifier.strip_prefix("~/") {
+        Some(rest) => rest.to_string(),
+        None => specifier,
+    };
     let parent_path = if args.length() >= 2 {
         value_to_string(scope, args.get(1))
     } else {
@@ -1061,7 +1072,7 @@ pub(crate) fn handle_worker_post_message(
     if args.length() < 2 {
         throw_js_error(
             scope,
-            "__nsWorkerPostMessage(workerId, value) expects 2 arguments",
+            "__nsWorkerPostMessage(workerId, value, transfer?) expects 2 arguments",
         );
         return;
     }
@@ -1070,13 +1081,35 @@ pub(crate) fn handle_worker_post_message(
         throw_js_error(scope, "Invalid worker id");
         return;
     }
-    let value = args.get(1);
-    let Some(bytes) = Runtime::serialize_value(scope, value) else {
-        throw_js_error(scope, "DataCloneError: value could not be cloned.");
+    // On failure the exception is pending.
+    let Some(message) = crate::transfer::serialize(scope, args.get(1), args.get(2)) else {
         return;
     };
-    if let Err(err) = crate::worker_threads::post_message(worker_id as u64, bytes) {
+    if let Err(err) = crate::worker_threads::post_message(worker_id as u64, message) {
         throw_js_error(scope, err.as_str());
+    }
+}
+
+/// A dispatcher the runtime made itself only runs when its host pumps messages: there a worker's
+/// replies only arrive by polling.
+pub(crate) fn handle_worker_pushes_messages(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let isolate = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+    let xaml_host = crate::ui_dispatcher::is_initialized() && !crate::ui_dispatcher::needs_win32_pump();
+    retval.set_bool(crate::worker_threads::is_worker_isolate(isolate) || xaml_host);
+}
+
+/// Cloned and transferred now, as on the web; sent once the current job is done.
+pub(crate) fn handle_worker_queue_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    if let Some(message) = crate::transfer::serialize(scope, args.get(0), args.get(1)) {
+        crate::worker_threads::queue_outgoing(message);
     }
 }
 
@@ -5788,6 +5821,8 @@ pub(crate) fn init_async_helpers(
     register!("__nsDescribeWinRTType", handle_describe_winrt_type);
     register!("__nsWorkerCreateThreaded", handle_worker_create_threaded);
     register!("__nsWorkerPostMessage", handle_worker_post_message);
+    register!("__nsWorkerQueueMessage", handle_worker_queue_message);
+    register!("__nsWorkerPushesMessages", handle_worker_pushes_messages);
     register!("__nsWorkerPollMessages", handle_worker_poll_messages);
     register!("__nsWorkerTerminate", handle_worker_terminate);
     register!(
@@ -5879,6 +5914,7 @@ pub(crate) fn init_async_helpers(
     }
 
     crate::message_port::install_message_port_runtime(scope);
+    crate::transfer::install_transfer_runtime(scope);
     crate::worker_support::install_worker_runtime(scope);
     crate::hmr_support::install_hmr_support(scope);
     crate::livesync::install_livesync_support(scope);

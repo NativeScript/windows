@@ -160,11 +160,19 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
                 return delivered;
             }
 
-            this.postMessage = function (data) {
+            // Replies arrive through __nsWorkerDeliver where this thread has a dispatcher; without one
+            // (console hosts, tests) postMessage waits a little for them.
+            var pushesMessages = typeof globalThis.__nsWorkerPushesMessages === 'function' &&
+                globalThis.__nsWorkerPushesMessages();
+
+            this.postMessage = function (data, transfer) {
                 if (terminated) { return; }
 
                 if (canUseThreadedHost && workerId >= 0) {
-                    globalThis.__nsWorkerPostMessage(workerId, data);
+                    globalThis.__nsWorkerPostMessage(workerId, data, transfer);
+                    if (pushesMessages) {
+                        return;
+                    }
 
                     for (var attempt = 0; attempt < 100; attempt++) {
                         var blockingMessages = globalThis.__nsWorkerPollMessagesBlocking(workerId, 5);

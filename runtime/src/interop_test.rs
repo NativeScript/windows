@@ -1232,6 +1232,81 @@ fn worker_multiple_sequential_roundtrips() {
 }
 
 #[test]
+fn worker_transfer_list_moves_buffers_and_registered_objects() {
+    run_js_assert(
+        "worker_transfer_list_moves_buffers_and_registered_objects",
+        r#"
+            return new Promise((resolve, reject) => {
+                const worker = new Worker(`
+                    class Box { constructor(value) { this.value = value; } }
+                    __nsRegisterTransferable('Box', { test: (v) => v instanceof Box, detach: (box) => box.value, attach: (value) => new Box(value) });
+                    self.onmessage = (event) => {
+                        const { box, buffer } = event.data;
+                        const back = new Box('from the worker');
+                        self.postMessage({ isBox: box instanceof Box, value: box.value, bytes: new Uint8Array(buffer)[3], back }, [back]);
+                    };
+                `, { eval: true });
+
+                class Box { constructor(value) { this.value = value; this.sent = false; } }
+                __nsRegisterTransferable('Box', {
+                    test: (v) => v instanceof Box,
+                    detach: (box) => { box.sent = true; return box.value; },
+                    attach: (value) => new Box(value),
+                });
+                const box = new Box(7);
+                const buffer = new Uint8Array([0, 1, 2, 3]).buffer;
+
+                worker.onmessage = (event) => {
+                    worker.terminate();
+                    const { isBox, value, bytes, back } = event.data;
+                    if (!isBox || value !== 7 || bytes !== 3) {
+                        reject(new Error(`received ${JSON.stringify({ isBox, value, bytes })}`));
+                    } else if (!box.sent || buffer.byteLength !== 0) {
+                        reject(new Error('the sender kept what it transferred'));
+                    } else if (!(back instanceof Box) || back.value !== 'from the worker') {
+                        reject(new Error('the worker\'s Box did not come back as one'));
+                    } else {
+                        resolve();
+                    }
+                };
+                worker.postMessage({ box, buffer }, [box, buffer]);
+            });
+        "#,
+    );
+}
+
+#[test]
+fn worker_transfer_list_rejects_what_it_cannot_take() {
+    run_js_assert(
+        "worker_transfer_list_rejects_what_it_cannot_take",
+        r#"
+            const worker = new Worker("self.onmessage = function () {};", { eval: true });
+            const nameOf = (fn) => {
+                try {
+                    fn();
+                } catch (e) {
+                    return e.name;
+                }
+                return 'no error';
+            };
+            const buffer = new ArrayBuffer(4);
+            const results = [
+                nameOf(() => worker.postMessage({}, [{}])),
+                nameOf(() => worker.postMessage(buffer, [buffer, buffer])),
+                nameOf(() => worker.postMessage(1, 'not a list')),
+            ];
+            worker.terminate();
+            if (results[0] !== 'DataCloneError' || results[1] !== 'DataCloneError' || results[2] !== 'TypeError') {
+                throw new Error(`got ${results.join(', ')}`);
+            }
+            if (buffer.byteLength !== 4) {
+                throw new Error('a failed transfer took the buffer');
+            }
+        "#,
+    );
+}
+
+#[test]
 fn worker_complex_object_roundtrip() {
     run_js_assert(
         "worker_complex_object_roundtrip",

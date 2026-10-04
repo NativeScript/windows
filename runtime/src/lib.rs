@@ -61,6 +61,8 @@ pub(crate) mod win32_known_fns;
 mod websocket;
 mod winhttp;
 #[cfg(feature = "classic")]
+mod transfer;
+#[cfg(feature = "classic")]
 mod worker_support;
 #[cfg(feature = "classic")]
 mod worker_threads;
@@ -9474,129 +9476,18 @@ impl Drop for Runtime {
 }
 
 #[cfg(feature = "classic")]
-struct WorkerValueSerializer;
-
-#[cfg(feature = "classic")]
-impl v8::ValueSerializerImpl for WorkerValueSerializer {
-    fn throw_data_clone_error<'s>(
-        &self,
-        scope: &mut v8::PinScope<'s, '_>,
-        message: v8::Local<'s, v8::String>,
-    ) {
-        let error = v8::Exception::error(scope, message);
-        scope.throw_exception(error);
-    }
-}
-
-#[cfg(feature = "classic")]
-struct WorkerValueDeserializer;
-
-#[cfg(feature = "classic")]
-impl v8::ValueDeserializerImpl for WorkerValueDeserializer {}
-
-#[cfg(feature = "classic")]
 impl Runtime {
-    /// Serialize a single V8 value to structured-clone bytes using V8's own
-    /// `ValueSerializer`.  Returns `None` if the value is not cloneable (e.g.
-    /// a function or a circular object); in that case an exception has already
-    /// been thrown into `scope`.
-    #[cfg(feature = "classic")]
-    pub fn serialize_value<'s, 'v>(
-        scope: &mut v8::PinScope<'s, '_>,
-        value: v8::Local<'v, v8::Value>,
-    ) -> Option<Vec<u8>> {
-        use v8::ValueSerializerHelper;
-        let context = scope.get_current_context();
-        let ser = v8::ValueSerializer::new(scope, Box::new(WorkerValueSerializer));
-        ser.write_header();
-        if ser.write_value(context, value).unwrap_or(false) {
-            Some(ser.release())
-        } else {
-            None
-        }
-    }
-
-    /// Deserialize structured-clone bytes produced by `serialize_value` back
-    /// into a V8 value in the current context.
-    #[cfg(feature = "classic")]
-    pub fn deserialize_value<'s>(
-        scope: &mut v8::PinScope<'s, '_>,
-        bytes: &[u8],
-    ) -> Option<v8::Local<'s, v8::Value>> {
-        use v8::ValueDeserializerHelper;
-        let context = scope.get_current_context();
-        let de = v8::ValueDeserializer::new(scope, Box::new(WorkerValueDeserializer), bytes);
-        if !de.read_header(context).unwrap_or(false) {
-            return None;
-        }
-        de.read_value(context)
-    }
-
-    /// Drain `globalThis.__nsWorkerOutbox`, serialize every item with V8's
-    /// structured-clone algorithm, and return the resulting byte blobs.
-    #[cfg(feature = "classic")]
-    pub fn drain_outbox_bytes(&mut self) -> Vec<Result<Vec<u8>, String>> {
+    pub fn dispatch_to_worker(&mut self, message: crate::transfer::Message) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
         v8::tc_scope!(tc, scope);
 
-        let script_src =
-            "(function(){var o=globalThis.__nsWorkerOutbox||[];return o.splice(0);})()";
-        let Some(src) = v8::String::new(tc, script_src) else {
-            return Vec::new();
-        };
-        let Some(script) = v8::Script::compile(tc, src, None) else {
-            return Vec::new();
-        };
-        let Some(result) = script.run(tc) else {
-            return Vec::new();
-        };
-        let Ok(array) = v8::Local::<v8::Array>::try_from(result) else {
-            return Vec::new();
-        };
-
-        let len = array.length();
-        let mut out = Vec::with_capacity(len as usize);
-
-        for i in 0..len {
-            let Some(item) = array.get_index(tc, i) else {
-                continue;
-            };
-            match Self::serialize_value(tc, item) {
-                Some(bytes) => out.push(Ok(bytes)),
-                None => {
-                    let msg = if tc.has_caught() {
-                        let s = tc
-                            .message()
-                            .and_then(|m| Some(m.get(tc).to_rust_string_lossy(tc)))
-                            .unwrap_or_else(|| "DataCloneError".to_string());
-                        tc.reset();
-                        s
-                    } else {
-                        "DataCloneError: value could not be cloned".to_string()
-                    };
-                    out.push(Err(msg));
-                }
-            }
-        }
-
-        out
-    }
-
-    /// Deserialize `payload_bytes` and deliver them to the worker's
-    /// `__nsDispatchToWorker` JS function.
-    #[cfg(feature = "classic")]
-    pub fn dispatch_to_worker(&mut self, payload_bytes: &[u8]) {
-        v8::scope!(scope, &mut self.isolate);
-        let context = v8::Local::new(scope, &self.global_context);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        v8::tc_scope!(tc, scope);
-
-        let data_value = match Self::deserialize_value(tc, payload_bytes) {
-            Some(v) => v,
-            None => {
-                eprintln!("[NativeScript] Worker dispatch: failed to deserialize message");
+        let data_value = match crate::transfer::deserialize(tc, message) {
+            Ok(value) => value,
+            Err(error) => {
+                tc.reset();
+                eprintln!("[NativeScript] Worker dispatch: {error}");
                 return;
             }
         };

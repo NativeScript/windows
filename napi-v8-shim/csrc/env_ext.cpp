@@ -14,6 +14,9 @@ static_assert(sizeof(v8::Local<v8::Context>) == sizeof(void*), "v8::Local must b
 // From node_api_types.h, which the vendored headers don't carry.
 typedef napi_value (*napi_addon_register_func)(napi_env env, napi_value exports);
 
+// v8-api.cpp.
+void ns_napi_finalize_external_arraybuffers(napi_env env);
+
 extern "C" {
 
 // `context` is a `v8::Local<v8::Context>` (as its underlying pointer) of the isolate current on
@@ -53,7 +56,8 @@ bool ns_napi_has_pending_finalizers(napi_env env) {
     return !env->pending_finalizers.empty();
 }
 
-// Tears the env down: finalizes remaining references (running their finalizers) and frees it.
+// Tears the env down: finalizes remaining references and external ArrayBuffers (running their
+// finalizers) and frees it.
 void ns_napi_env_teardown(napi_env env) {
     v8::Isolate* isolate = env->isolate;
     v8::HandleScope handle_scope(isolate);
@@ -61,6 +65,7 @@ void ns_napi_env_teardown(napi_env env) {
     // frees before this scope exits.
     v8::Local<v8::Context> context = v8::Local<v8::Context>::New(isolate, env->context());
     v8::Context::Scope context_scope(context);
+    ns_napi_finalize_external_arraybuffers(env);
     env->DeleteMe();
 }
 

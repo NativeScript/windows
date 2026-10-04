@@ -6,10 +6,12 @@
 //! and exported from `nativescript.dll`, so an addon built for Node (napi-rs, node-addon-api, …)
 //! resolves every symbol it imports.
 //!
-//! Anything that must run on the JS thread goes through one job queue. Other threads push jobs and
-//! wake the UI thread with a `DispatcherQueue` work item; `runtime_pump_timers` drains it too, so a
-//! host without a dispatcher still makes progress. Each job runs in its own V8 scope and ends with
-//! a microtask checkpoint, like a timer task.
+//! Anything that must run on a JS thread goes through that thread's job queue: an env belongs to the
+//! thread (the UI thread's or a worker's runtime) that loaded the addon. Other threads push jobs and
+//! wake the UI thread with a `DispatcherQueue` work item, or a worker through its command channel;
+//! `runtime_pump_timers` drains the UI thread's too, so a host without a dispatcher still makes
+//! progress. Each job runs in its own V8 scope and ends with a microtask checkpoint, like a timer
+//! task.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -128,42 +130,77 @@ enum Job {
 // Jobs only carry `Arc<Tsfn>` (Send+Sync below) and pointers used on the JS thread.
 unsafe impl Send for Job {}
 
-static QUEUE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
-static WAKE_QUEUED: AtomicBool = AtomicBool::new(false);
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<Job>,
+    wake_queued: bool,
+}
+
+static QUEUES: Mutex<Option<HashMap<usize, Queue>>> = Mutex::new(None);
 /// Set by [`teardown`]: the runtime is going away, so late work (a cleanup hook releasing a
 /// threadsafe function, a dispatcher item that runs during shutdown) must not touch V8.
 static SHUT_DOWN: AtomicBool = AtomicBool::new(false);
 
-fn push(job: Job) {
+fn with_queues<R>(f: impl FnOnce(&mut HashMap<usize, Queue>) -> R) -> R {
+    let mut guard = QUEUES.lock().unwrap();
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// The isolate of this thread's runtime: what an env made here belongs to.
+fn current_owner() -> usize {
+    DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize
+}
+
+fn push(owner: usize, job: Job) {
     if SHUT_DOWN.load(Ordering::Acquire) {
         return;
     }
-    QUEUE.lock().unwrap().push_back(job);
-    wake();
+    let wake = with_queues(|queues| {
+        let queue = queues.entry(owner).or_default();
+        queue.jobs.push_back(job);
+        !std::mem::replace(&mut queue.wake_queued, true)
+    });
+    if wake {
+        wake_owner(owner);
+    }
 }
 
-fn wake() {
-    if SHUT_DOWN.load(Ordering::Acquire) || WAKE_QUEUED.swap(true, Ordering::AcqRel) {
+fn wake_owner(owner: usize) {
+    let drain = || {
+        let _ = std::panic::catch_unwind(drain);
+    };
+    if crate::worker_threads::is_worker_isolate(owner) {
+        if !crate::worker_threads::post_to_worker(owner, drain) {
+            // The worker is gone, and its env with it.
+            with_queues(|queues| queues.remove(&owner));
+        }
         return;
     }
     // A dispatcher work item runs between frames, never inside a XAML callout. Hosts without one
     // (console apps, tests) drain from their pump loop instead.
-    if !crate::ui_dispatcher::enqueue_on_ui_thread(|| {
-        let _ = std::panic::catch_unwind(drain);
-    }) {
-        WAKE_QUEUED.store(false, Ordering::Release);
+    if !crate::ui_dispatcher::enqueue_on_ui_thread(drain) {
+        with_queues(|queues| {
+            if let Some(queue) = queues.get_mut(&owner) {
+                queue.wake_queued = false;
+            }
+        });
     }
 }
 
-/// Runs every queued JS-thread job and every env's deferred finalizers. Called from the dispatcher
-/// wake-up and from `runtime_pump_timers`; a no-op when there is nothing to do.
+/// Runs this thread's queued jobs and its envs' deferred finalizers. Called from the dispatcher
+/// (or worker) wake-up and from `runtime_pump_timers`; a no-op when there is nothing to do.
 pub fn drain() {
-    WAKE_QUEUED.store(false, Ordering::Release);
-    if SHUT_DOWN.load(Ordering::Acquire) {
+    let owner = current_owner();
+    if SHUT_DOWN.load(Ordering::Acquire) || owner == 0 {
         return;
     }
+    with_queues(|queues| {
+        if let Some(queue) = queues.get_mut(&owner) {
+            queue.wake_queued = false;
+        }
+    });
     loop {
-        let job = QUEUE.lock().unwrap().pop_front();
+        let job = with_queues(|queues| queues.get_mut(&owner).and_then(|queue| queue.jobs.pop_front()));
         let Some(job) = job else { break };
         match job {
             Job::Tsfn(tsfn) => in_js_scope(|| unsafe { tsfn.dispatch() }),
@@ -204,7 +241,18 @@ pub fn teardown() {
     // Deliver what is already queued while everything is still alive, then stop accepting work.
     drain();
     SHUT_DOWN.store(true, Ordering::Release);
-    QUEUE.lock().unwrap().clear();
+    with_queues(|queues| queues.clear());
+    for &env in envs.iter().rev() {
+        run_cleanup_hooks(env);
+        in_js_scope(|| unsafe { napi_v8_shim::ns_napi_env_teardown(env) });
+    }
+}
+
+/// A worker's [`teardown`], before its isolate goes: the other runtimes keep theirs.
+pub(crate) fn teardown_thread() {
+    let envs: Vec<napi_env> = ENVS.with(|e| std::mem::take(&mut *e.borrow_mut()));
+    drain();
+    with_queues(|queues| queues.remove(&current_owner()));
     for &env in envs.iter().rev() {
         run_cleanup_hooks(env);
         in_js_scope(|| unsafe { napi_v8_shim::ns_napi_env_teardown(env) });
@@ -330,6 +378,7 @@ struct TsfnState {
 
 struct Tsfn {
     env: napi_env,
+    owner: usize,
     func: napi_ref,
     context: *mut c_void,
     call_js: napi_threadsafe_function_call_js,
@@ -435,7 +484,7 @@ impl Tsfn {
     fn queue_finalize(self: &Arc<Self>, state: &mut TsfnState) {
         if !state.finalize_queued {
             state.finalize_queued = true;
-            push(Job::Tsfn(self.clone()));
+            push(self.owner, Job::Tsfn(self.clone()));
         }
     }
 }
@@ -463,6 +512,7 @@ pub unsafe extern "C" fn napi_create_threadsafe_function(
     }
     let tsfn = Arc::new(Tsfn {
         env,
+        owner: current_owner(),
         func: reference,
         context,
         call_js: call_js_cb,
@@ -501,7 +551,7 @@ pub unsafe extern "C" fn napi_call_threadsafe_function(func: *mut c_void, data: 
     }
     state.queue.push_back(data);
     drop(state);
-    push(Job::Tsfn(Tsfn::arc(func)));
+    push(tsfn.owner, Job::Tsfn(Tsfn::arc(func)));
     NAPI_OK
 }
 
@@ -570,6 +620,7 @@ const WORK_CANCELLED: u8 = 3;
 
 struct AsyncWork {
     env: napi_env,
+    owner: usize,
     execute: napi_async_execute_callback,
     complete: napi_async_complete_callback,
     data: *mut c_void,
@@ -612,6 +663,7 @@ pub unsafe extern "C" fn napi_create_async_work(
     }
     *result = Box::into_raw(Box::new(AsyncWork {
         env,
+        owner: current_owner(),
         execute,
         complete,
         data,
@@ -643,6 +695,7 @@ pub unsafe extern "C" fn napi_queue_async_work(_env: napi_env, work: *mut c_void
         return NAPI_GENERIC_FAILURE;
     }
     let address = work as usize;
+    let owner = entry.owner;
     let task: Task = Box::new(move || {
         let work = unsafe { &*(address as *const AsyncWork) };
         if work
@@ -654,7 +707,7 @@ pub unsafe extern "C" fn napi_queue_async_work(_env: napi_env, work: *mut c_void
                 unsafe { execute(work.env, work.data) };
             }
         }
-        push(Job::AsyncComplete(address));
+        push(owner, Job::AsyncComplete(address));
     });
     match pool().lock() {
         Ok(tx) if tx.send(task).is_ok() => NAPI_OK,

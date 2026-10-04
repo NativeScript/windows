@@ -5,15 +5,34 @@
 //! once per compositor frame from `CompositionTarget.Rendering`, outside the render walk) then
 //! runs the queued callbacks once and drains microtasks, which is where rendering work such as
 //! canvas presents happens. Nothing waits for vsync on the UI thread, and a continuous rAF loop
-//! gives the dispatcher back between frames.
+//! gives the dispatcher back between frames. A worker's frames follow the UI thread's: each pump
+//! there hands a frame to every worker that asked for one. The compositor stops raising frames
+//! while nothing on screen changes, so a worker not handed one in time takes its own.
 
 use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use crate::DELEGATE_ISOLATE_PTR;
 
 thread_local! {
     static REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static LAST_FRAME: Cell<Option<Instant>> = const { Cell::new(None) };
 }
+
+#[cfg(feature = "classic")]
+const WORKER_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
+#[cfg(feature = "classic")]
+pub(crate) fn worker_frame_wait() -> Option<Duration> {
+    if !REQUESTED.with(|r| r.get()) {
+        return None;
+    }
+    let last = LAST_FRAME.with(|l| l.get());
+    Some(last.map_or(Duration::ZERO, |last| WORKER_FRAME_INTERVAL.saturating_sub(last.elapsed())))
+}
+
+#[cfg(feature = "classic")]
+static WORKERS_REQUESTED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 /// `__nsRequestFrame()`: run animation callbacks at the next pump.
 pub(crate) fn handle_request_frame(
@@ -22,6 +41,30 @@ pub(crate) fn handle_request_frame(
     _retval: v8::ReturnValue,
 ) {
     REQUESTED.with(|r| r.set(true));
+    #[cfg(feature = "classic")]
+    {
+        let isolate = DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+        if crate::worker_threads::is_worker_isolate(isolate) {
+            let mut workers = WORKERS_REQUESTED.lock().unwrap_or_else(|e| e.into_inner());
+            if !workers.contains(&isolate) {
+                workers.push(isolate);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "classic")]
+fn hand_frames_to_workers() {
+    let isolate = DELEGATE_ISOLATE_PTR.with(|c| c.get()) as usize;
+    if crate::worker_threads::is_worker_isolate(isolate) {
+        return;
+    }
+    let workers = std::mem::take(&mut *WORKERS_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()));
+    for worker in workers {
+        crate::worker_threads::post_to_worker(worker, || {
+            pump();
+        });
+    }
 }
 
 /// Drops a pending request (the runtime on this thread is going away).
@@ -40,9 +83,12 @@ fn now_ms() -> f64 {
 /// Runs this thread's pending animation-frame callbacks, if a frame was requested, then drains
 /// microtasks. Returns whether callbacks ran.
 pub fn pump() -> bool {
+    #[cfg(feature = "classic")]
+    hand_frames_to_workers();
     if !REQUESTED.with(|r| r.replace(false)) {
         return false;
     }
+    LAST_FRAME.with(|l| l.set(Some(Instant::now())));
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
     if isolate_ptr.is_null() {
         return false;
