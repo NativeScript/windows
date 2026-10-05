@@ -31,8 +31,8 @@ public static partial class Bridge
     internal static unsafe delegate* unmanaged[Cdecl]<int, byte*, int, byte**, int*, void>
         s_jsInvoker;
 
-    private static readonly ConcurrentDictionary<string, Type?> s_typeCache
-        = new(StringComparer.Ordinal);
+    // Keyed by (assembly name or "", type name): no key string is built per lookup.
+    private static readonly ConcurrentDictionary<(string Assembly, string Type), Type?> s_typeCache = new();
     private static readonly ConcurrentDictionary<MethodKey, DispatchEntry> s_methodCache = new();
     private static readonly ConcurrentDictionary<PropKey, PropertyInfo?> s_propCache = new();
     private static readonly ConcurrentDictionary<CtorKey, CtorEntry> s_ctorCache = new();
@@ -53,6 +53,11 @@ public static partial class Bridge
         s_methodCache.Clear();
         s_propCache.Clear();
         s_ctorCache.Clear();
+        s_overloadCache.Clear();
+        s_ctorOverloadCache.Clear();
+        s_boxInfo.Clear();
+        s_paramsCache.Clear();
+        s_collectionInfo.Clear();
         s_handles.Clear();
         s_nativePtrs.Clear();
         s_nativePtrsReverse.Clear();
@@ -612,14 +617,13 @@ public static partial class Bridge
         // QueryInterface will succeed for all WinRT interfaces inherited by the type.
         try
         {
-            var winrtObjType = obj.GetType().GetInterface("WinRT.IWinRTObject");
-            if (winrtObjType != null)
+            var nativeObjProp = GetBoxInfo(obj.GetType()).WinRTNativeObject;
+            if (nativeObjProp != null)
             {
-                var nativeObjProp = winrtObjType.GetProperty("NativeObject");
-                var nativeObj = nativeObjProp?.GetValue(obj);
+                var nativeObj = nativeObjProp.GetValue(obj);
                 if (nativeObj != null)
                 {
-                    var thisPtrProp = nativeObj.GetType().GetProperty("ThisPtr");
+                    var thisPtrProp = s_thisPtrProps.GetOrAdd(nativeObj.GetType(), static t => t.GetProperty("ThisPtr"));
                     if (thisPtrProp?.GetValue(nativeObj) is IntPtr thisPtr && thisPtr != IntPtr.Zero)
                     {
                         Marshal.AddRef(thisPtr);
@@ -655,6 +659,9 @@ public static partial class Bridge
         // Path 3 — bare IUnknown fallback.
         return iunknown;
     }
+
+    // ThisPtr of C#/WinRT's IObjectReference types, by type.
+    private static readonly ConcurrentDictionary<Type, PropertyInfo?> s_thisPtrProps = new();
 
     private static MethodInfo? s_marshalInspectableFromManaged;
 
@@ -759,6 +766,6 @@ public static partial class Bridge
         CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
     public static unsafe void Free(byte* ptr)
     {
-        if (ptr != null) Marshal.FreeHGlobal((IntPtr)ptr);
+        if (ptr != null && !IsResponseBuffer(ptr)) Marshal.FreeHGlobal((IntPtr)ptr);
     }
 }

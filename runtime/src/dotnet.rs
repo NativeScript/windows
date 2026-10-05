@@ -467,17 +467,27 @@ pub(crate) fn init_js_callbacks(callback: FnJsCallback) {
 /// Callback ids whose managed delegate was garbage-collected, queued from the finalizer thread
 /// and dropped on the JS thread by [`take_released_js_callbacks`].
 static RELEASED_JS_CALLBACKS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+/// Whether `RELEASED_JS_CALLBACKS` may be non-empty (only changed under its lock), so the check
+/// made before every bridge call takes no lock when nothing was released.
+static RELEASED_JS_CALLBACKS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 unsafe extern "C" fn queue_js_callback_release(callback_id: i32) {
     if let Ok(mut ids) = RELEASED_JS_CALLBACKS.lock() {
         ids.push(callback_id);
+        RELEASED_JS_CALLBACKS_PENDING.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
 /// Callback ids released since the last call. Called on the JS thread, which owns the functions.
 pub(crate) fn take_released_js_callbacks() -> Vec<i32> {
+    if !RELEASED_JS_CALLBACKS_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
     match RELEASED_JS_CALLBACKS.lock() {
-        Ok(mut ids) if !ids.is_empty() => std::mem::take(&mut *ids),
+        Ok(mut ids) => {
+            RELEASED_JS_CALLBACKS_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            std::mem::take(&mut *ids)
+        }
         _ => Vec::new(),
     }
 }
@@ -485,6 +495,12 @@ pub(crate) fn take_released_js_callbacks() -> Vec<i32> {
 /// Calls the managed bridge with a pre-built binary request packet and returns
 /// the raw binary response bytes.  No JSON involved on either side.
 pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
+    call_dotnet_binary_with(request, |response| response.to_vec())
+}
+
+/// [`call_dotnet_binary`] that hands the response to `read` in the bridge's own buffer (freed
+/// afterwards) instead of copying it out first.
+pub(crate) fn call_dotnet_binary_with<R>(request: &[u8], read: impl FnOnce(&[u8]) -> R) -> Result<R, String> {
     ensure_dotnet_initialized();
     let host = DOTNET_HOST
         .get()
@@ -513,7 +529,7 @@ pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     let slice = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len as usize) };
-    let result = slice.to_vec();
+    let result = read(slice);
     unsafe { (host.free)(resp_ptr) };
     Ok(result)
 }

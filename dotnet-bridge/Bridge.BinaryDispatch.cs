@@ -27,7 +27,7 @@ public static partial class Bridge
             var buf = t_responseWriter ??= new ArrayBufferWriter<byte>(256);
             buf.ResetWrittenCount();
             res.WriteAsBin(buf);
-            WriteUnmanaged(buf.WrittenSpan, responsePtr, responseLenPtr);
+            WriteResponse(buf.WrittenSpan, responsePtr, responseLenPtr);
         }
         catch (Exception ex)
         {
@@ -35,6 +35,39 @@ public static partial class Bridge
         }
         return 0;
     }
+
+    // Per-thread unmanaged buffer InvokeBinary responses are written to, so a call allocates none.
+    // The runtime reads a response and hands it to Free (which leaves this buffer alone) before it
+    // makes another call on the thread, including a nested one from a JS callback, so reusing it
+    // is safe. Large responses still get their own allocation, keeping the buffer small.
+    [ThreadStatic]
+    private static unsafe byte* t_responseBuffer;
+    [ThreadStatic]
+    private static int t_responseCapacity;
+    private const int MaxReusedResponse = 64 * 1024;
+
+    private static unsafe void WriteResponse(ReadOnlySpan<byte> bytes, byte** outPtr, int* outLen)
+    {
+        var needed = bytes.Length + 1;
+        if (needed > MaxReusedResponse)
+        {
+            WriteUnmanaged(bytes, outPtr, outLen);
+            return;
+        }
+        if (needed > t_responseCapacity)
+        {
+            var capacity = Math.Max(256, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)needed));
+            t_responseBuffer = (byte*)NativeMemory.Realloc(t_responseBuffer, (nuint)capacity);
+            t_responseCapacity = capacity;
+        }
+        var p = t_responseBuffer;
+        bytes.CopyTo(new Span<byte>(p, bytes.Length));
+        p[bytes.Length] = 0;
+        *outPtr = p;
+        *outLen = bytes.Length;
+    }
+
+    internal static unsafe bool IsResponseBuffer(byte* ptr) => ptr == t_responseBuffer;
 
     internal static DispatchResult DispatchBin(ref BinReader r)
     {
@@ -69,8 +102,8 @@ public static partial class Bridge
 
         if (op == 0x06) // members by type
         {
-            var typeName = r.ReadString16();
-            var assembly = r.ReadString16();
+            var typeName = r.ReadName16();
+            var assembly = r.ReadName16();
             var type = ResolveType(NullIfEmpty(assembly), typeName)
                 ?? throw new TypeLoadException($"Type not found: {typeName} (assembly: {assembly})");
             return BuildMembersResult(type);
@@ -82,7 +115,7 @@ public static partial class Bridge
             if (!s_handles.TryGetValue(handle, out var target))
                 throw new KeyNotFoundException($"Invalid handle {handle}");
             var type   = target?.GetType() ?? throw new InvalidOperationException("Handle is null");
-            var method = r.ReadString16();
+            var method = r.ReadName16();
             var args   = r.ReadArgs();
 
             if (method == "__dotnet_await__" && args.Length == 2
@@ -105,23 +138,23 @@ public static partial class Bridge
 
         if (op == 0x09) // create JS delegate
         {
-            var delTypeName  = r.ReadString16(); // "" → System.Action
+            var delTypeName  = r.ReadName16(); // "" → System.Action
             var callbackId   = r.ReadI32();
             return CreateJsDelegate(delTypeName, callbackId);
         }
 
         if (op == 0x0A) // create JS-backed subclass instance
         {
-            var assembly = r.ReadString16();
-            var typeName = r.ReadString16();
+            var assembly = r.ReadName16();
+            var typeName = r.ReadName16();
 
             var interfaceCount = r.ReadI32();
             var interfaceNames = interfaceCount > 0 ? new string[interfaceCount] : [];
-            for (int i = 0; i < interfaceCount; i++) interfaceNames[i] = r.ReadString16();
+            for (int i = 0; i < interfaceCount; i++) interfaceNames[i] = r.ReadName16();
 
             var memberCount = r.ReadI32();
             var memberNames = memberCount > 0 ? new string[memberCount] : [];
-            for (int i = 0; i < memberCount; i++) memberNames[i] = r.ReadString16();
+            for (int i = 0; i < memberCount; i++) memberNames[i] = r.ReadName16();
 
             var callbackId = r.ReadI32();
             var ctorArgs = r.HasMore ? r.ReadArgs() : [];
@@ -131,19 +164,34 @@ public static partial class Bridge
         if (op == 0x0B) // get CLR-only property by raw IInspectable ptr (CLR reflection fallback)
         {
             var instancePtr = new IntPtr(r.ReadI64());
-            var propName    = r.ReadString16();
+            var propName    = r.ReadName16();
             return ClrGetProperty(instancePtr, propName);
         }
 
         // Static ops: 0x02 = call, 0x03 = constructor
-        var typeNameS = r.ReadString16();
-        var assemblyS = r.ReadString16();
+        var typeNameS = r.ReadName16();
+        var assemblyS = r.ReadName16();
         var typeS = ResolveType(NullIfEmpty(assemblyS), typeNameS)
             ?? throw new TypeLoadException($"Type not found: {typeNameS} (assembly: {assemblyS})");
 
         if (op == 0x03) // constructor
         {
             var args  = r.ReadArgs();
+            // Constructors with the same parameter count (StringBuilder(int) / StringBuilder(string)):
+            // the one whose parameter types best fit the arguments.
+            var ctors = GetCtorOverloads(typeS, args.Length);
+            if (ctors.Ctors.Length > 1)
+            {
+                var best = SelectOverload(ctors.Parameters, args);
+                object?[]? built = null;
+                if (best >= 0)
+                {
+                    try { built = BuildArgsBinExact(args, ctors.Parameters[best]); }
+                    catch { /* fall back to the first constructor by arity below */ }
+                }
+                if (built is not null && ArgsFit(built, ctors.Parameters[best]))
+                    return Box(ctors.Ctors[best].Invoke(built));
+            }
             var entry = GetCachedCtor(typeS, args.Length);
             if (entry.Ctor is null)
                 throw new MissingMethodException(
@@ -154,7 +202,7 @@ public static partial class Bridge
         }
 
         // op == 0x02: static call
-        var methodS = r.ReadString16();
+        var methodS = r.ReadName16();
         var argsS   = r.ReadArgs();
         return DispatchCallBin(null, typeS, methodS, argsS, isStatic: true);
     }
@@ -166,7 +214,7 @@ public static partial class Bridge
 
         
 
-        if (method.Length > 4
+        if (method.Length > 4 && args.Length == 0
             && method[0] == 'g' && method[1] == 'e' && method[2] == 't' && method[3] == '_')
         {
             var prop = GetCachedProp(type, method, 4, flags);
@@ -185,12 +233,31 @@ public static partial class Bridge
             }
         }
 
-        // Overloads with the same parameter count (Describe(Animal) / Describe(Shape)): pick the
-        // first whose parameter types the arguments convert to.
+        // Overloads with the same parameter count (Abs(int) / Abs(double), Describe(Animal) /
+        // Describe(Shape)): the one whose parameter types best fit the arguments.
         var overloads = GetOverloads(type, method, args.Length, flags);
-        if (overloads.Length > 1)
+        var best = overloads.Methods.Length > 0 ? overloads.Select(args) : -1;
+        // No method with this many parameters takes these arguments: a params method may
+        // (String.Join(",", "a", "b", "c")).
+        if (best < 0 && TryParamsCall(target, type, method, args, flags, out var paramsResult))
+            return paramsResult;
+        if (overloads.Methods.Length > 1)
         {
-            foreach (var overload in overloads)
+            if (best >= 0)
+            {
+                var chosen = overloads.Entry(best, type);
+                object?[]? built = null;
+                try { built = BuildArgsBin(args, chosen.Parameters); }
+                catch { /* an argument didn't convert: try the overloads one by one below */ }
+                if (built is not null)
+                {
+                    if (ArgsFit(built, chosen.Parameters))
+                        return InvokeBuilt(target, type, method, chosen, built);
+                    if (built.Length > 0) ReturnArgs(built);
+                }
+            }
+            // Nothing fits by type: the first overload the arguments convert to.
+            foreach (var overload in overloads.Methods)
             {
                 var ps = overload.GetParameters();
                 object?[] built;
@@ -252,36 +319,216 @@ public static partial class Bridge
                 $"Method '{method}' ({args.Length} args) not found on {type.FullName}");
         }
 
-        var builtArgs = BuildArgsBin(args, entry.Parameters);
-        try { 
+        return InvokeBuilt(target, type, method, entry, BuildArgsBin(args, entry.Parameters));
+    }
+
+    // Runs a compiled invoker on arguments from BuildArgsBin (returned to the pool afterwards),
+    // retrying on the UI thread when a COM object rejects the calling thread.
+    private static DispatchResult InvokeBuilt(object? target, Type type, string method, DispatchEntry entry, object?[] builtArgs)
+    {
+        try {
             try
             {
-                var res = (entry.Invoke(target, builtArgs));
+                var res = (entry.Invoke!(target, builtArgs));
                 return Box(res);
             }
             catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
             {
                 if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{method} on UI thread");
-                var res = InvokeOnUIThread(() => (entry.Invoke(target, builtArgs)));
+                var res = InvokeOnUIThread(() => (entry.Invoke!(target, builtArgs)));
                 return Box(res);
             }
             catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
             {
                 if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{method} on UI thread");
-                var res = InvokeOnUIThread(() => (entry.Invoke(target, builtArgs)));
+                var res = InvokeOnUIThread(() => (entry.Invoke!(target, builtArgs)));
                 return Box(res);
             }
         }
         finally { if (builtArgs.Length > 0) ReturnArgs(builtArgs); }
     }
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<MethodKey, MethodInfo[]> s_overloadCache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<MethodKey, OverloadSet> s_overloadCache = new();
 
-    private static MethodInfo[] GetOverloads(Type type, string name, int argCount, BindingFlags flags)
+    private static OverloadSet GetOverloads(Type type, string name, int argCount, BindingFlags flags)
         => s_overloadCache.GetOrAdd(new MethodKey(type, name, argCount, flags), static k =>
-            k.Type.GetMethods(k.Flags)
+            new OverloadSet(k.Type.GetMethods(k.Flags)
                 .Where(m => m.Name == k.Name && !m.IsGenericMethodDefinition && m.GetParameters().Length == k.ArgCount)
+                .ToArray()));
+
+    // The public methods of a type sharing a name and parameter count, with their parameters and
+    // (built on first use) compiled invokers.
+    private sealed class OverloadSet(MethodInfo[] methods)
+    {
+        public readonly MethodInfo[] Methods = methods;
+        private readonly ParameterInfo[][] _parameters = Array.ConvertAll(methods, m => m.GetParameters());
+        private readonly DispatchEntry?[] _entries = new DispatchEntry?[methods.Length];
+
+        public DispatchEntry Entry(int index, Type type) => _entries[index] ??= BuildDispatchEntry(type, Methods[index]);
+
+        public int Select(object?[] args) => SelectOverload(_parameters, args);
+    }
+
+    // The public constructors of a type with a given parameter count.
+    private sealed class CtorSet(ConstructorInfo[] ctors)
+    {
+        public readonly ConstructorInfo[] Ctors = ctors;
+        public readonly ParameterInfo[][] Parameters = Array.ConvertAll(ctors, c => c.GetParameters());
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<CtorKey, CtorSet> s_ctorOverloadCache = new();
+
+    private static CtorSet GetCtorOverloads(Type type, int argCount)
+        => s_ctorOverloadCache.GetOrAdd(new CtorKey(type, argCount), static k =>
+            new CtorSet(k.Type.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+                .Where(c => c.GetParameters().Length == k.ArgCount)
+                .ToArray()));
+
+    // The candidate (by its parameter list) the arguments fit best, or -1 when none can take them.
+    // Ties go to the first.
+    private static int SelectOverload(ParameterInfo[][] candidates, object?[] args)
+    {
+        int best = -1, bestScore = -1;
+        for (int m = 0; m < candidates.Length; m++)
+        {
+            var ps = candidates[m];
+            int total = 0;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var score = MatchScore(i < args.Length ? args[i] : null, ps[i].ParameterType);
+                if (score < 0) { total = -1; break; }
+                total += score;
+            }
+            if (total > bestScore) { bestScore = total; best = m; }
+        }
+        return best;
+    }
+
+    // How well a bridged argument fits a parameter type: higher is better, -1 when it can't be
+    // passed. An exact type beats a widening conversion, which beats a narrowing one the value
+    // fits, which beats object. So Abs(-0.5) is Abs(double) and Abs(-128) is Abs(int), never
+    // Abs(sbyte).
+    private static int MatchScore(object? arg, Type p)
+    {
+        if (p.IsByRef || p.IsByRefLike || p.IsPointer) return -1;
+        var underlying = Nullable.GetUnderlyingType(p);
+        if (arg is null) return !p.IsValueType || underlying is not null ? 1 : -1;
+        if (underlying is not null) p = underlying;
+        switch (arg)
+        {
+            case int i:
+                if (p == typeof(int)) return 10;
+                if (p == typeof(long)) return 9;
+                if (p == typeof(double)) return 8;
+                if (p == typeof(float) || p == typeof(decimal)) return 7;
+                if (p.IsEnum) return 6;
+                if (IsIntegerType(p)) return FitsInteger(i, p) ? 4 : -1;
+                return p.IsInstanceOfType(arg) ? 2 : -1;
+            case double d:
+                if (p == typeof(double)) return 10;
+                if (p == typeof(float)) return 8;
+                if (p == typeof(decimal)) return 7;
+                // Integral numbers that fit an int arrive as int; this is a larger one (3e9).
+                if (IsIntegerType(p)) return Math.Floor(d) == d && FitsInteger(d, p) ? 4 : -1;
+                return p.IsInstanceOfType(arg) ? 2 : -1;
+            case bool:
+                return p == typeof(bool) ? 10 : p.IsInstanceOfType(arg) ? 2 : -1;
+            case string s:
+                if (p == typeof(string)) return 10;
+                if (p == typeof(char)) return s.Length == 1 ? 6 : -1;
+                if (IsParsedFromString(p)) return 5;
+                return p.IsInstanceOfType(arg) ? 2 : -1;
+            case JsArrayValue:
+                if (p.IsArray) return 8;
+                if (p == typeof(string)) return -1;
+                if (typeof(System.Collections.IEnumerable).IsAssignableFrom(p)) return 6;
+                return p == typeof(object) ? 1 : -1;
+            case HandleRef h:
+                s_handles.TryGetValue(h.Id, out var obj);
+                if (obj is null) return p.IsValueType ? -1 : 1;
+                if (obj.GetType() == p) return 10;
+                return p.IsInstanceOfType(obj) ? (p == typeof(object) ? 2 : 8) : -1;
+            case JsFunctionRef:
+                if (typeof(Delegate).IsAssignableFrom(p))
+                    return p == typeof(Delegate) || p == typeof(MulticastDelegate) ? 4 : 8;
+                return p == typeof(object) ? 1 : -1;
+            case WinRtRef:
+                if (p == typeof(object)) return 2;
+                return p.IsInterface || (p.IsClass && p != typeof(string)) ? 4 : -1;
+            case JsJsonValue:
+                if (p == typeof(object)) return 1;
+                if (p == typeof(string)) return 2;
+                return p.IsPrimitive || p.IsEnum || typeof(Delegate).IsAssignableFrom(p) ? -1 : 5;
+            default:
+                return p.IsInstanceOfType(arg) ? 2 : -1;
+        }
+    }
+
+    // Methods whose last parameter is a params array, by type, name and binding flags.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, string, BindingFlags), MethodInfo[]> s_paramsCache = new();
+
+    // Calls the params method (`Join(string, params string[])`) the arguments fit best, the
+    // trailing ones packed into its params array. False when there is none they fit.
+    private static bool TryParamsCall(object? target, Type type, string method, object?[] args, BindingFlags flags, out DispatchResult result)
+    {
+        result = default;
+        var candidates = s_paramsCache.GetOrAdd((type, method, flags), static k =>
+            k.Item1.GetMethods(k.Item3)
+                .Where(m => m.Name == k.Item2 && !m.IsGenericMethodDefinition
+                    && m.GetParameters() is { Length: > 0 } ps
+                    && ps[^1].ParameterType.IsArray
+                    && ps[^1].IsDefined(typeof(ParamArrayAttribute), false))
                 .ToArray());
+        if (candidates.Length == 0) return false;
+
+        MethodInfo? best = null;
+        int bestScore = -1;
+        foreach (var m in candidates)
+        {
+            var ps = m.GetParameters();
+            var fixedCount = ps.Length - 1;
+            if (args.Length < fixedCount) continue;
+            var elementType = ps[^1].ParameterType.GetElementType()!;
+            int total = 0;
+            for (int i = 0; i < args.Length && total >= 0; i++)
+            {
+                var score = MatchScore(args[i], i < fixedCount ? ps[i].ParameterType : elementType);
+                total = score < 0 ? -1 : total + score;
+            }
+            if (total > bestScore) { bestScore = total; best = m; }
+        }
+        if (best is null) return false;
+
+        var parameters = best.GetParameters();
+        var fixedParams = parameters.Length - 1;
+        var element = parameters[^1].ParameterType.GetElementType()!;
+        var built = new object?[parameters.Length];
+        for (int i = 0; i < fixedParams; i++)
+            built[i] = CoerceBin(args[i], parameters[i].ParameterType);
+        var rest = Array.CreateInstance(element, args.Length - fixedParams);
+        for (int i = 0; i < rest.Length; i++)
+            rest.SetValue(CoerceBin(args[fixedParams + i], element), i);
+        built[^1] = rest;
+        result = Box(best.Invoke(target, built));
+        return true;
+    }
+
+    private static bool IsIntegerType(Type t) => Type.GetTypeCode(t) is
+        TypeCode.SByte or TypeCode.Byte or TypeCode.Int16 or TypeCode.UInt16 or
+        TypeCode.Int32 or TypeCode.UInt32 or TypeCode.Int64 or TypeCode.UInt64;
+
+    private static bool FitsInteger(double v, Type t) => Type.GetTypeCode(t) switch
+    {
+        TypeCode.SByte  => v >= sbyte.MinValue && v <= sbyte.MaxValue,
+        TypeCode.Byte   => v >= 0 && v <= byte.MaxValue,
+        TypeCode.Int16  => v >= short.MinValue && v <= short.MaxValue,
+        TypeCode.UInt16 => v >= 0 && v <= ushort.MaxValue,
+        TypeCode.Int32  => v >= int.MinValue && v <= int.MaxValue,
+        TypeCode.UInt32 => v >= 0 && v <= uint.MaxValue,
+        TypeCode.Int64  => v >= long.MinValue && v < 9223372036854775808.0,
+        TypeCode.UInt64 => v >= 0 && v < 18446744073709551616.0,
+        _ => false,
+    };
 
     private static object?[] BuildArgsBin(object?[] binArgs, ParameterInfo[] parameters)
     {
@@ -380,6 +627,10 @@ public static partial class Bridge
             var target = targetType == typeof(object) ? typeof(System.Text.Json.JsonElement) : targetType;
             return System.Text.Json.JsonSerializer.Deserialize(json.Json, target, s_jsJsonOptions);
         }
+        if (value is JsArrayValue array)
+            return CoerceArray(array.Items, targetType);
+        if (value is string text && IsParsedFromString(Nullable.GetUnderlyingType(targetType) ?? targetType))
+            return ParseString(text, Nullable.GetUnderlyingType(targetType) ?? targetType);
         if (value is JsFunctionRef fn)
         {
             var delegateType = typeof(Delegate).IsAssignableFrom(targetType)
@@ -388,7 +639,7 @@ public static partial class Bridge
                     : typeof(Action);
             return MakeJsDelegate(delegateType, fn.Id);
         }
-        if (value.GetType() == targetType) return value;
+        if (value.GetType() == targetType || targetType.IsInstanceOfType(value)) return value;
         var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
         if (underlying.IsEnum)
         {
@@ -397,6 +648,61 @@ public static partial class Bridge
         }
         try { return Convert.ChangeType(value, underlying); }
         catch { return value; }
+    }
+
+    private static bool IsParsedFromString(Type t) =>
+        t == typeof(DateTime) || t == typeof(DateTimeOffset) || t == typeof(TimeSpan) || t == typeof(Guid);
+
+    // A string for a DateTime, DateTimeOffset, TimeSpan or Guid parameter, parsed culture-invariantly
+    // (a JS Date is sent as its ISO 8601 string). Left as is when it doesn't parse.
+    private static object ParseString(string text, Type t)
+    {
+        var invariant = System.Globalization.CultureInfo.InvariantCulture;
+        var roundtrip = System.Globalization.DateTimeStyles.RoundtripKind;
+        if (t == typeof(DateTime) && DateTime.TryParse(text, invariant, roundtrip, out var dt)) return dt;
+        if (t == typeof(DateTimeOffset) && DateTimeOffset.TryParse(text, invariant, roundtrip, out var dto)) return dto;
+        if (t == typeof(TimeSpan) && TimeSpan.TryParse(text, invariant, out var ts)) return ts;
+        if (t == typeof(Guid) && Guid.TryParse(text, out var g)) return g;
+        return text;
+    }
+
+    // A JS array's items as the array or collection type a parameter expects: T[], a collection
+    // interface (IEnumerable<T>, IList<T>, IReadOnlyList<T>) or a concrete collection with Add
+    // (List<T>, ObservableCollection<T>). Anything else gets object[].
+    private static object? CoerceArray(object?[] items, Type targetType)
+    {
+        var target = Nullable.GetUnderlyingType(targetType) ?? targetType;
+        var element = target.IsArray ? target.GetElementType()! : CollectionElementType(target);
+        if (target.IsArray || (target.IsInterface && element is not null))
+        {
+            var array = Array.CreateInstance(element!, items.Length);
+            for (int i = 0; i < items.Length; i++) array.SetValue(CoerceBin(items[i], element!), i);
+            return array;
+        }
+        if (element is not null && !target.IsAbstract && target.GetConstructor(Type.EmptyTypes) is not null)
+        {
+            var collection = Activator.CreateInstance(target)!;
+            var add = target.GetMethod("Add", [element]);
+            if (add is not null)
+            {
+                foreach (var item in items) add.Invoke(collection, [CoerceBin(item, element)]);
+                return collection;
+            }
+        }
+        var objects = new object?[items.Length];
+        for (int i = 0; i < items.Length; i++) objects[i] = CoerceBin(items[i], typeof(object));
+        return objects;
+    }
+
+    // T of the IEnumerable<T> a type is or implements, or null.
+    internal static Type? CollectionElementType(Type t)
+    {
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+            return t.GetGenericArguments()[0];
+        foreach (var i in t.GetInterfaces())
+            if (i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+                return i.GetGenericArguments()[0];
+        return null;
     }
 
     // CLR reflection fallback for properties that exist only in managed code and are

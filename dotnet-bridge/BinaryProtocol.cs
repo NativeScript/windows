@@ -31,6 +31,13 @@ internal sealed class JsJsonValue(string json)
     public readonly string Json = json;
 }
 
+// A JS array (tag 0x07): its items, each read like an argument, converted to the array or
+// collection type the parameter expects.
+internal sealed class JsArrayValue(object?[] items)
+{
+    public readonly object?[] Items = items;
+}
+
 internal ref struct BinReader(ReadOnlySpan<byte> buf)
 {
     private readonly ReadOnlySpan<byte> _buf = buf;
@@ -73,9 +80,17 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
         var len = ReadU16();
         var s   = Encoding.UTF8.GetString(_buf.Slice(_pos, len));
         _pos += len;
-        // Intern so repeated method/type names reuse the same heap string.
-        // Eliminates the allocation on every subsequent warm-path call.
-        return string.Intern(s);
+        return s;
+    }
+
+    // A type, assembly or member name: the same few names arrive on every call, so they come from
+    // NameCache instead of being decoded (and allocated) again.
+    public string ReadName16()
+    {
+        var len = ReadU16();
+        var s   = NameCache.Get(_buf.Slice(_pos, len));
+        _pos += len;
+        return s;
     }
 
     public string ReadString32()
@@ -84,7 +99,7 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
         _pos += 4;
         var s = Encoding.UTF8.GetString(_buf.Slice(_pos, (int)len));
         _pos += (int)len;
-        return string.Intern(s);
+        return s;
     }
 
     public uint ReadU32()
@@ -100,24 +115,64 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
         if (count == 0) return [];
         var args = new object?[count];
         for (int i = 0; i < count; i++)
-        {
-            var tag = ReadByte();
-            args[i] = tag switch
-            {
-                0x00 => null,
-                0x01 => (object)false,
-                0x02 => (object)true,
-                0x03 => (object)ReadI32(),
-                0x04 => (object)ReadF64(),
-                0x05 => (object)ReadString16(),
-                0x06 => (object)new HandleRef(ReadI32()),
-                0x0A => (object)new WinRtRef(ReadI64()),
-                0x0C => (object)new JsFunctionRef(ReadI32()),
-                0x0D => (object)new JsJsonValue(ReadString32()),
-                _    => null,
-            };
-        }
+            args[i] = ReadArg();
         return args;
+    }
+
+    private object? ReadArg()
+    {
+        var tag = ReadByte();
+        switch (tag)
+        {
+            case 0x00: return null;
+            case 0x01: return false;
+            case 0x02: return true;
+            case 0x03: return ReadI32();
+            case 0x04: return ReadF64();
+            case 0x05: return ReadString16();
+            case 0x06: return new HandleRef(ReadI32());
+            case 0x07:
+            {
+                var items = new object?[ReadU32()];
+                for (int i = 0; i < items.Length; i++) items[i] = ReadArg();
+                return new JsArrayValue(items);
+            }
+            case 0x0A: return new WinRtRef(ReadI64());
+            case 0x0C: return new JsFunctionRef(ReadI32());
+            case 0x0D: return new JsJsonValue(ReadString32());
+            default: return null;
+        }
+    }
+}
+
+// Decoded names by their UTF-8 bytes. Per thread and direct-mapped: a lookup takes no lock and a
+// collision just decodes the name again. Only names land here, never argument values, so unlike
+// string.Intern it can't grow without bound.
+internal static class NameCache
+{
+    private const int Size = 512;
+
+    [ThreadStatic]
+    private static Entry[]? t_entries;
+
+    private sealed class Entry(byte[] utf8, string value)
+    {
+        public readonly byte[] Utf8 = utf8;
+        public readonly string Value = value;
+    }
+
+    public static string Get(ReadOnlySpan<byte> utf8)
+    {
+        if (utf8.IsEmpty) return string.Empty;
+        var entries = t_entries ??= new Entry[Size];
+        var hash = new HashCode();
+        hash.AddBytes(utf8);
+        ref var slot = ref entries[hash.ToHashCode() & (Size - 1)];
+        var entry = slot;
+        if (entry is not null && utf8.SequenceEqual(entry.Utf8)) return entry.Value;
+        var value = Encoding.UTF8.GetString(utf8);
+        slot = new Entry(utf8.ToArray(), value);
+        return value;
     }
 }
 

@@ -737,3 +737,101 @@ fn event_supports_in_operator() {
         "'EventName' in instance should be true for declared WinRT events",
     );
 }
+
+/// Runs `expr` against the published .NET bridge and asserts it evaluates to `true`; skips when
+/// the bridge isn't published.
+fn assert_dotnet_js(expr: &str, msg: &str) {
+    if !dotnet_bridge_available() {
+        eprintln!("SKIP: dotnet-bridge not published, run `dotnet publish` in dotnet-bridge/");
+        return;
+    }
+    let mut rt = Runtime::new(".");
+    assert_js(&mut rt, expr, msg);
+}
+
+#[test]
+fn dotnet_overloads_pick_the_best_fitting_parameter_types() {
+    assert_dotnet_js(
+        r#"
+        System.Math.Abs(-0.5) === 0.5
+            && System.Math.Abs(-128) === 128
+            && System.Math.Max(3.5, 2) === 3.5
+            && new System.Text.StringBuilder('q').ToString() === 'q'
+    "#,
+        "overloads should resolve by argument type, not first convertible",
+    );
+}
+
+#[test]
+fn dotnet_collections_are_objects_that_act_like_arrays() {
+    assert_dotnet_js(
+        r#"
+        (function(){
+            var list = new System.Collections.ArrayList();
+            list.Add(1); list.Add('x');
+            list[0] = 7;
+            var seen = [];
+            for (var v of list) seen.push(v);
+            return list.Count === 2 && list.length === 2 && list[1] === 'x' && list[5] === null
+                && list.map(String).join('|') === '7|x' && seen.join('|') === '7|x'
+                && JSON.stringify(list) === '[7,"x"]'
+                && Array.isArray(System.IO.Path.GetInvalidPathChars());
+        })()
+    "#,
+        "a constructed collection should keep its .NET methods and be array-like",
+    );
+}
+
+#[test]
+fn dotnet_date_and_time_values_are_objects() {
+    assert_dotnet_js(
+        r#"
+        (function(){
+            var span = System.TimeSpan.FromSeconds(2);
+            var year = System.Convert.ToDateTime(new Date(Date.UTC(2031, 4, 6, 12))).ToUniversalTime().Year;
+            return span.TotalMilliseconds === 2000 && String(span) === '00:00:02'
+                && System.DateTime.Now.Year > 2000 && year === 2031;
+        })()
+    "#,
+        "TimeSpan/DateTime results should expose their members, JS Dates should convert",
+    );
+}
+
+#[test]
+fn dotnet_callback_arguments_are_dotnet_objects() {
+    assert_dotnet_js(
+        r#"
+        System.Text.RegularExpressions.Regex.Replace('a1b2', '\d', function (m) { return '[' + m.Value + ']'; }) === 'a[1]b[2]'
+    "#,
+        "a JS function passed as a delegate should receive .NET object proxies",
+    );
+}
+
+#[test]
+fn dotnet_params_and_array_arguments() {
+    assert_dotnet_js(
+        r#"
+        System.String.Join(',', 'a', 'b', 'c') === 'a,b,c'
+            && System.String.Join('-', ['a', 'b']) === 'a-b'
+            && System.String.Format('{0}+{1}={2}', 1, 2, 3) === '1+2=3'
+    "#,
+        "params arrays and JS array arguments should marshal",
+    );
+}
+
+#[test]
+fn dotnet_plain_js_fields_are_kept() {
+    assert_dotnet_js(
+        r#"
+        (function(){
+            var sb = new System.Text.StringBuilder();
+            sb.tag = 3;
+            sb.Capacity = 99;
+            System.Text.tag = 'ns';
+            return sb.tag === 3 && Object.keys(sb).join() === 'tag' && sb.Capacity >= 99
+                && System.Text.tag === 'ns' && ('' + sb).indexOf('DotNetObject') >= 0;
+        })()
+    "#,
+        "plain JS fields on .NET objects and namespaces should be kept",
+    );
+}
