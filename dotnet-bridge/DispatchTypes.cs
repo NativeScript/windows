@@ -30,7 +30,7 @@ internal sealed record InvokeRequest(
 // equality and reference hash codes are sufficient and allocation-free.
 
 internal readonly record struct MethodKey(Type Type, string Name, int ArgCount, BindingFlags Flags);
-internal readonly record struct PropKey(Type Type, string Name, BindingFlags Flags);
+internal readonly record struct PropKey(Type Type, string Name, int PrefixLen, BindingFlags Flags);
 internal readonly record struct CtorKey(Type Type, int ArgCount);
 
 internal readonly struct DispatchEntry(Func<object?, object?[], object?>? invoke, ParameterInfo[] parameters)
@@ -272,7 +272,7 @@ internal readonly struct DispatchResult
             WritePrimitiveBin(ref w, value);
             return;
         }
-        if (value is IEnumerable enumerable)
+        if (value is Array enumerable)
         {
             var items = new List<object?>();
             foreach (var item in enumerable) items.Add(item);

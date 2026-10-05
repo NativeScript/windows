@@ -222,7 +222,8 @@ public static partial class Bridge
         if (arg is Enum e)  { w.WriteByte(0x04); w.WriteF64(Convert.ToDouble(e)); return; }
         if (arg is decimal m){ w.WriteByte(0x04); w.WriteF64((double)m); return; }
         // A struct (Windows.Foundation.Size, a C# record struct, ...) arrives as a plain JS object.
-        if (arg.GetType().IsValueType && !arg.GetType().IsPrimitive)
+        if (arg.GetType().IsValueType && !arg.GetType().IsPrimitive
+            && arg is not DateTime && arg is not DateTimeOffset && arg is not TimeSpan)
         {
             string? json = null;
             try { json = System.Text.Json.JsonSerializer.Serialize(arg, arg.GetType(), s_jsJsonOptions); } catch { }

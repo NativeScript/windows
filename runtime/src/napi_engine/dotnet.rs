@@ -189,6 +189,19 @@ fn napi_bin_write_arg(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
             crate::dotnet::bin_write_str16(buf, s.as_bytes());
         }
         ValueType::Object | ValueType::Function => {
+            // A JS array: tag 0x07, a u32 count, then each item encoded like an argument (see
+            // `global_fns::bin_write_v8_arg`).
+            if let Some(len) = napi_array_length(env, arg) {
+                buf.push(0x07);
+                buf.extend_from_slice(&len.to_le_bytes());
+                for i in 0..len {
+                    match napi_array_get(env, arg, i) {
+                        Some(item) => napi_bin_write_arg(env, buf, &item),
+                        None => buf.push(0x00),
+                    }
+                }
+                return;
+            }
             let obj: JsObject = unsafe { arg.cast() };
             if let Ok(hval) = obj.get_named_property::<JsUnknown>("__handle") {
                 if let Ok(ValueType::Number) = hval.get_type() {
@@ -537,8 +550,8 @@ fn native_invoke_bin(ctx: &CallContext) -> napi::Result<JsUnknown> {
     }
 
     release_collected_js_callbacks();
-    match crate::dotnet::call_dotnet_binary(&req) {
-        Ok(response) => napi_bin_read_response(env, &response).map_err(napi::Error::from_reason),
+    match crate::dotnet::call_dotnet_binary_with(&req, |response| napi_bin_read_response(env, response)) {
+        Ok(result) => result.map_err(napi::Error::from_reason),
         Err(e) => Err(napi::Error::from_reason(e)),
     }
 }
@@ -575,8 +588,8 @@ fn native_create_delegate(ctx: &CallContext) -> napi::Result<JsUnknown> {
     crate::dotnet::bin_write_str16(&mut req, type_name.as_bytes());
     req.extend_from_slice(&cb_id.to_le_bytes());
 
-    match crate::dotnet::call_dotnet_binary(&req) {
-        Ok(response) => napi_bin_read_response(env, &response).map_err(napi::Error::from_reason),
+    match crate::dotnet::call_dotnet_binary_with(&req, |response| napi_bin_read_response(env, response)) {
+        Ok(result) => result.map_err(napi::Error::from_reason),
         Err(e) => Err(napi::Error::from_reason(e)),
     }
 }
@@ -656,8 +669,8 @@ fn native_create_js_subclass(ctx: &CallContext) -> napi::Result<JsUnknown> {
     }
 
     release_collected_js_callbacks();
-    match crate::dotnet::call_dotnet_binary(&req) {
-        Ok(response) => napi_bin_read_response(env, &response).map_err(napi::Error::from_reason),
+    match crate::dotnet::call_dotnet_binary_with(&req, |response| napi_bin_read_response(env, response)) {
+        Ok(result) => result.map_err(napi::Error::from_reason),
         Err(e) => Err(napi::Error::from_reason(e)),
     }
 }
@@ -1974,35 +1987,92 @@ const DOTNET_HELPERS_JS: &str = r#"
     // throws on error, returns the result value directly.
     function _invoke(req) {
         var handle = (req.handle !== undefined && req.handle !== null) ? req.handle : -1;
-        var args   = req.args || [];
-        return globalThis.__nsDotNetInvokeBin(
-            handle,
-            req.typeName  || '',
-            req.assembly  || '',
-            req.method    || '',
-            ...args
-        );
+        var args   = req.args;
+        var typeName = req.typeName || '', assembly = req.assembly || '', method = req.method || '';
+        if (!args || args.length === 0) return globalThis.__nsDotNetInvokeBin(handle, typeName, assembly, method);
+        if (args.length === 1) return globalThis.__nsDotNetInvokeBin(handle, typeName, assembly, method, args[0]);
+        return globalThis.__nsDotNetInvokeBin(handle, typeName, assembly, method, ...args);
+    }
+
+    // _invoke with a function's own `arguments`, unwrapped straight into the native call (no
+    // request object or intermediate arrays).
+    function _invokeWith(handle, typeName, assembly, method, args) {
+        var invoke = globalThis.__nsDotNetInvokeBin;
+        switch (args.length) {
+            case 0: return invoke(handle, typeName, assembly, method);
+            case 1: return invoke(handle, typeName, assembly, method, _unwrap(args[0]));
+            case 2: return invoke(handle, typeName, assembly, method, _unwrap(args[0]), _unwrap(args[1]));
+            case 3: return invoke(handle, typeName, assembly, method, _unwrap(args[0]), _unwrap(args[1]), _unwrap(args[2]));
+        }
+        // Built by push so the array stays packed: apply on a holey array takes V8's slow path.
+        var call = [handle, typeName, assembly, method];
+        for (var i = 0; i < args.length; i++) call.push(_unwrap(args[i]));
+        return invoke.apply(null, call);
     }
 
     // Populated lazily on first access; avoids repeated bridge round-trips.
     var _typeInfoCache = {};
-    var _emptyInfo = { methods: [], properties: [], staticMethods: [], staticProperties: [], readonlyProperties: [], readonlyStaticProperties: [], writeonlyProperties: [], writeonlyStaticProperties: [] };
+    // A type's member lists get `kinds` (member name -> _K_* flags), so the proxy traps look a name up
+    // instead of scanning the lists on every access.
+    var _K_PROP = 1, _K_WO = 2, _K_RO = 4, _K_SPROP = 8, _K_SMETHOD = 16, _K_SWO = 32, _K_SRO = 64;
+    function _withKinds(info) {
+        var kinds = Object.create(null);
+        function add(list, flag) {
+            if (!list) return;
+            for (var i = 0; i < list.length; i++) kinds[list[i]] = (kinds[list[i]] | 0) | flag;
+        }
+        add(info.properties, _K_PROP);
+        add(info.writeonlyProperties, _K_WO);
+        add(info.readonlyProperties, _K_RO);
+        add(info.staticProperties, _K_SPROP);
+        add(info.staticMethods, _K_SMETHOD);
+        add(info.writeonlyStaticProperties, _K_SWO);
+        add(info.readonlyStaticProperties, _K_SRO);
+        info.kinds = kinds;
+        return info;
+    }
+    function _kindsOf(info) { return info.kinds || _withKinds(info).kinds; }
+
+    // "get_X" / "set_X" accessor names, made once per property name.
+    var _getterNames = Object.create(null), _setterNames = Object.create(null);
+    function _getterName(prop) { return _getterNames[prop] || (_getterNames[prop] = 'get_' + prop); }
+    function _setterName(prop) { return _setterNames[prop] || (_setterNames[prop] = 'set_' + prop); }
+
+    // The native COM pointer of a handle's object as the BigInt the runtime reads from `__native_ptr`,
+    // or undefined when it has none. The bridge makes it for a plain .NET object only on request.
+    function _nativePtrOf(handle) {
+        try {
+            var p = _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'GetNativePtrForHandle', args: [handle] });
+            if (typeof p !== 'number' || p === 0) return undefined;
+            return typeof BigInt === 'function' ? BigInt(p) : p;
+        } catch (_) {
+            return undefined;
+        }
+    }
+    var _emptyInfo = _withKinds({ methods: [], properties: [], staticMethods: [], staticProperties: [], readonlyProperties: [], readonlyStaticProperties: [], writeonlyProperties: [], writeonlyStaticProperties: [] });
     // Optional mapping for namespace prefixes -> assembly simple-name.
     // Exact namespaces are preferred first, then progressively shorter
     // prefixes are tried as a fallback.
     var _namespaceAssemblyMap = Object.create(null);
 
+    // _resolveAssembly results by type name, cleared whenever the namespace map changes.
+    var _assemblyCache = Object.create(null);
+
     function _resolveAssembly(typeName) {
         if (!typeName || typeof typeName !== 'string') return '';
-        var probe = String(typeName);
+        var cached = _assemblyCache[typeName];
+        if (cached !== undefined) return cached;
+        var resolved = '';
+        var probe = typeName;
         while (probe) {
             var assembly = _namespaceAssemblyMap[probe];
-            if (typeof assembly === 'string' && assembly) return assembly;
+            if (typeof assembly === 'string' && assembly) { resolved = assembly; break; }
             var lastDot = probe.lastIndexOf('.');
             if (lastDot < 0) break;
             probe = probe.substring(0, lastDot);
         }
-        return '';
+        _assemblyCache[typeName] = resolved;
+        return resolved;
     }
 
     // When the JS GC collects a DotNet proxy the registry fires the
@@ -2036,39 +2106,117 @@ const DOTNET_HELPERS_JS: &str = r#"
         if (!typeName) return _emptyInfo;
         var cached = _typeInfoCache[typeName];
         if (cached !== undefined) return cached;
+        var info = _emptyInfo;
         try {
             // Respect an explicitly-provided assembly name. When empty,
             // let the managed side attempt resolution (BCL types via Type.GetType).
             var asm = (typeof assembly === 'string') ? assembly : '';
-            var info = _invoke({ assembly: asm, typeName: typeName, method: '__members__', args: [] });
-            _typeInfoCache[typeName] = (info && typeof info === 'object') ? info : _emptyInfo;
-        } catch (e) {
-            _typeInfoCache[typeName] = _emptyInfo;
-        }
-        return _typeInfoCache[typeName];
+            var members = _invoke({ assembly: asm, typeName: typeName, method: '__members__', args: [] });
+            if (members && typeof members === 'object') info = _withKinds(members);
+        } catch (e) {}
+        _typeInfoCache[typeName] = info;
+        return info;
     }
 
     function _unwrap(v) {
         if (v && typeof v === 'object' && typeof v.__handle === 'number') return { __handle: v.__handle };
+        if (Array.isArray(v)) return v.map(_unwrap);
+        // A JS Date reaches DateTime / DateTimeOffset parameters as its ISO 8601 string.
+        if (v instanceof Date) return isNaN(v.getTime()) ? null : v.toISOString();
+        // A JS function passed where .NET expects a delegate gets .NET objects as arguments, the same
+        // proxies a method result would be, rather than raw handles.
+        if (typeof v === 'function' && typeof v.__dotnetType__ !== 'string' && typeof v.__handle !== 'number')
+            return _callbackFor(v);
         return v;
     }
+
+    // The wrapper sent for a JS callback: one per function, so passing it again sends the same one.
+    var _callbacks = typeof WeakMap === 'function' ? new WeakMap() : null;
+    function _callbackFor(fn) {
+        var wrapped = _callbacks && _callbacks.get(fn);
+        if (wrapped) return wrapped;
+        wrapped = function () { return fn.apply(this, Array.prototype.map.call(arguments, _wrap)); };
+        if (_callbacks) _callbacks.set(fn, wrapped);
+        return wrapped;
+    }
+
+    // .NET collections (List<T>, Dictionary, ObservableCollection) act like JS arrays: `length`,
+    // `list[i]`, for...of, and the array methods (map, filter, ...) on a copy of their items.
+    // _collectionKind is the bridge's CollectionKind flags (1 enumerable, 2 count, 4 indexed) by type.
+    var _collectionKinds = Object.create(null);
+    var _arrayMethods = Object.create(null);
+    ['forEach', 'map', 'filter', 'reduce', 'reduceRight', 'some', 'every', 'find', 'findIndex', 'findLast',
+        'findLastIndex', 'indexOf', 'lastIndexOf', 'includes', 'join', 'slice', 'concat', 'flat', 'flatMap',
+        'entries', 'keys', 'values', 'at', 'toJSON'].forEach(function (name) { _arrayMethods[name] = 1; });
+
+    function _bridgeCall(method, args) {
+        return _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: method, args: args });
+    }
+
+    function _isIndex(prop) {
+        var c = prop.charCodeAt(0);
+        return c >= 48 && c <= 57 && /^(0|[1-9]\d*)$/.test(prop);
+    }
+
+    function _collectionKind(handle, typeName) {
+        var kind = typeName ? _collectionKinds[typeName] : undefined;
+        if (kind !== undefined) return kind;
+        try { kind = _bridgeCall('CollectionKind', [{ __handle: handle }]) | 0; } catch (_) { kind = 0; }
+        if (typeName) _collectionKinds[typeName] = kind;
+        return kind;
+    }
+
+    function _collectionItems(handle) {
+        return _wrap(_bridgeCall('CollectionItems', [{ __handle: handle }])) || [];
+    }
+
+    // `prop` of a collection proxy when it is one of the array-like members, else undefined.
+    function _collectionMember(handle, typeName, prop) {
+        var kind = _collectionKind(handle, typeName);
+        if (prop === 'length') return (kind & 2) ? _bridgeCall('CollectionCount', [{ __handle: handle }]) : undefined;
+        if (_arrayMethods[prop] === 1) {
+            if (!(kind & 1)) return undefined;
+            return function () {
+                var items = _collectionItems(handle);
+                return prop === 'toJSON' ? items : Array.prototype[prop].apply(items, arguments);
+            };
+        }
+        return (kind & 4) ? _wrap(_bridgeCall('ItemAt', [{ __handle: handle }, +prop])) : undefined;
+    }
+
+    // Value types whose JS string is their .NET ToString(), so `${DateTime.Now}` reads as a date.
+    var _netToString = { 'System.DateTime': 1, 'System.DateTimeOffset': 1, 'System.TimeSpan': 1 };
 
     // Makes sw.Stop() and sw.Elapsed both work naturally.
     // The proxy is registered with _dotNetFinalizers so the CLR reference
     // is released automatically when JS GC collects the proxy.
     function _makeDotNetInstance(handle, assembly, typeName, isTask, nativePtr) {
-        var info = _getTypeInfo(assembly, typeName);
+        _getTypeInfo(assembly, typeName);
+        // Method functions by name, made on first access.
+        var methods = null;
+        var ptrKnown = nativePtr !== undefined;
+        // The proxy target holds the plain JS fields set on the object.
         var proxy = new Proxy({}, {
-            get: function (_, prop) {
-                if (typeof prop === 'symbol') return undefined;
+            get: function (target, prop) {
+                if (typeof prop === 'symbol') {
+                    if (prop === Symbol.iterator && (_collectionKind(handle, typeName) & 1))
+                        return function () { return _collectionItems(handle)[Symbol.iterator](); };
+                    return target[prop];
+                }
                 if (prop === '__handle') return handle;
                 if (prop === '__type')   return typeName;
                 if (prop === '__isTask') return isTask === true;
-                if (prop === '__native_ptr') return nativePtr;
+                if (prop === '__native_ptr') {
+                    if (!ptrKnown) { ptrKnown = true; nativePtr = _nativePtrOf(handle); }
+                    return nativePtr;
+                }
                 if (prop === 'release') return function () {
                     _invoke({ handle: handle, method: '__release', args: [] });
                 };
+                // Like a plain object, so `'' + obj` and comparisons fall through to toString.
+                if (prop === 'valueOf') return function () { return proxy; };
                 if (prop === 'toString') return function () {
+                    if (_netToString[typeName] === 1) return String(_invoke({ handle: handle, method: 'ToString', args: [] }));
                     return '[DotNetObject ' + typeName + ' #' + handle + ']';
                 };
                 // A Task/ValueTask (awaitable) result is thenable, so `await obj.SomethingAsync()` works;
@@ -2079,30 +2227,42 @@ const DOTNET_HELPERS_JS: &str = r#"
                         return globalThis.NSWinRT.dotnet.taskToPromise({ __handle: handle, __isTask: true }).then(onFulfilled, onRejected);
                     };
                 }
+                if (Object.prototype.hasOwnProperty.call(target, prop)) return target[prop];
                 // Re-read info in case it was populated after construction.
-                var i = _typeInfoCache[typeName] || _emptyInfo;
-                // Write-only: has setter but no getter: reading it is an error.
-                if (i.writeonlyProperties && i.writeonlyProperties.indexOf(prop) >= 0)
+                var kind = _kindsOf(_typeInfoCache[typeName] || _emptyInfo)[prop] | 0;
+                // Write-only (setter, no getter): reading it is an error.
+                if (kind & _K_WO)
                     throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
-                if (i.properties && i.properties.indexOf(prop) >= 0)
-                    return _wrap(_invoke({ handle: handle, method: 'get_' + prop, args: [] }));
-                // Not a native property: return a callable for method dispatch.
-                return function () {
-                    var args = Array.prototype.slice.call(arguments).map(_unwrap);
-                    return _wrap(_invoke({ handle: handle, method: prop, args: args }));
-                };
+                if (kind & _K_PROP)
+                    return _wrap(_invoke({ handle: handle, method: _getterName(prop), args: [] }));
+                if (prop === 'length' || _arrayMethods[prop] === 1 || _isIndex(prop)) {
+                    var member = _collectionMember(handle, typeName, prop);
+                    if (member !== undefined) return member;
+                }
+                // Not a native property: a function for method dispatch.
+                if (methods === null) methods = Object.create(null);
+                return methods[prop] || (methods[prop] = function () {
+                    return _wrap(_invokeWith(handle, '', '', prop, arguments));
+                });
             },
-            set: function (_, prop, value) {
-                if (typeof prop === 'symbol') return true;
-                var i = _typeInfoCache[typeName] || _emptyInfo;
-                // Read-only: has getter but no setter: assignment is an error.
-                if (i.readonlyProperties && i.readonlyProperties.indexOf(prop) >= 0)
-                    throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
-                // Writable (read-write or write-only): invoke the setter.
-                if ((i.properties && i.properties.indexOf(prop) >= 0) ||
-                    (i.writeonlyProperties && i.writeonlyProperties.indexOf(prop) >= 0))
-                    _invoke({ handle: handle, method: 'set_' + prop, args: [_unwrap(value)] });
-                // Not a native property: don't intercept, let JS do its thing.
+            set: function (target, prop, value) {
+                if (typeof prop !== 'symbol') {
+                    var kind = _kindsOf(_typeInfoCache[typeName] || _emptyInfo)[prop] | 0;
+                    // Read-only (getter, no setter): assigning it is an error.
+                    if (kind & _K_RO)
+                        throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
+                    // Writable (read-write or write-only): invoke the setter.
+                    if (kind & (_K_PROP | _K_WO)) {
+                        _invoke({ handle: handle, method: _setterName(prop), args: [_unwrap(value)] });
+                        return true;
+                    }
+                    if (_isIndex(prop) && (_collectionKind(handle, typeName) & 4)) {
+                        _bridgeCall('SetItemAt', [{ __handle: handle }, +prop, _unwrap(value)]);
+                        return true;
+                    }
+                }
+                // Not a native property: a plain JS field of this object.
+                target[prop] = value;
                 return true;
             },
         });
@@ -2151,6 +2311,7 @@ const DOTNET_HELPERS_JS: &str = r#"
             var name = String(rootName);
             var root = name.split('.')[0];
             if (assemblyName && typeof assemblyName === 'string') {
+                _assemblyCache = Object.create(null);
                 _namespaceAssemblyMap[name] = assemblyName;
                 if (!_namespaceAssemblyMap[root]) {
                     _namespaceAssemblyMap[root] = assemblyName;
@@ -2663,6 +2824,10 @@ const DOTNET_HELPERS_JS: &str = r#"
     function _makeNamespaceProxy(path) {
         var cached = _nsProxyCache[path];
         if (cached) return cached;
+        // Static method functions and child namespace/type proxies by name, made on first access.
+        var members = Object.create(null);
+        // Plain JS fields assigned to the namespace or type, made on first assignment.
+        var fields = null;
         function _node() {}
         var proxy = new Proxy(_node, {
             get: function (_, prop) {
@@ -2676,43 +2841,47 @@ const DOTNET_HELPERS_JS: &str = r#"
                     return function() { return '[.NET ' + path + ']'; };
                 var extras = _namespaceExtras[path];
                 if (extras && Object.prototype.hasOwnProperty.call(extras, prop)) return extras[prop];
+                if (fields !== null && prop in fields) return fields[prop];
+                var member = members[prop];
+                if (member !== undefined) return member;
                 if (prop === '__dotnetType__') return path;
                 if (prop === 'prototype') return _typePrototype(path);
                 // Not a WinRT class: TypeScript's __extends must take the standard path.
                 if (prop === '__nsWinRTClass__' || prop === 'then') return undefined;
                 var assembly = _resolveAssembly(path);
-                var info = _getTypeInfo(assembly, path);
-                // Write-only static property — reading it is an error.
-                if (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0)
+                var kind = _kindsOf(_getTypeInfo(assembly, path))[prop] | 0;
+                // Write-only static property: reading it is an error.
+                if (kind & _K_SWO)
                     throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + path + '\'');
                 // Readable static property: resolve value immediately.
-                if (info.staticProperties && info.staticProperties.indexOf(prop) >= 0)
-                    return _wrap(_invoke({ assembly: assembly, typeName: path, method: 'get_' + prop, args: [] }));
-                // Static method: return a callable.
-                if (info.staticMethods && info.staticMethods.indexOf(prop) >= 0) {
-                    return function () {
-                        var args = Array.prototype.slice.call(arguments).map(_unwrap);
-                        return _wrap(_invoke({ assembly: assembly, typeName: path, method: prop, args: args }));
+                if (kind & _K_SPROP)
+                    return _wrap(_invoke({ assembly: assembly, typeName: path, method: _getterName(prop), args: [] }));
+                // Static method: a function, made once.
+                if (kind & _K_SMETHOD) {
+                    return members[prop] = function () {
+                        return _wrap(_invokeWith(-1, path, _resolveAssembly(path), prop, arguments));
                     };
                 }
                 if (prop === 'extend') return function (nameOrMembers, maybeMembers) { return _extendClass(this, nameOrMembers, maybeMembers); };
                 if (prop === 'call') return function (thisArg) { return _es5SuperCall(path, thisArg, Array.prototype.slice.call(arguments, 1)); };
                 if (prop === 'apply') return function (thisArg, args) { return _es5SuperCall(path, thisArg, args ? Array.prototype.slice.call(args) : []); };
                 // Namespace / sub-type: keep descending.
-                return _makeNamespaceProxy(path + '.' + prop);
+                return members[prop] = _makeNamespaceProxy(path + '.' + prop);
             },
             set: function (_, prop, value) {
                 if (typeof prop === 'symbol') return true;
                 var assembly = _resolveAssembly(path);
-                var info = _getTypeInfo(assembly, path);
-                // Read-only static property — assignment is an error.
-                if (info.readonlyStaticProperties && info.readonlyStaticProperties.indexOf(prop) >= 0)
+                var kind = _kindsOf(_getTypeInfo(assembly, path))[prop] | 0;
+                // Read-only static property: assignment is an error.
+                if (kind & _K_SRO)
                     throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + path + '\'');
-                // Writable (read-write or write-only) — invoke the setter.
-                if ((info.staticProperties && info.staticProperties.indexOf(prop) >= 0) ||
-                    (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0))
-                    _invoke({ assembly: assembly, typeName: path, method: 'set_' + prop, args: [_unwrap(value)] });
-                // Not a native property — don't intercept.
+                // Writable (read-write or write-only): invoke the setter.
+                if (kind & (_K_SPROP | _K_SWO)) {
+                    _invoke({ assembly: assembly, typeName: path, method: _setterName(prop), args: [_unwrap(value)] });
+                    return true;
+                }
+                // Not a native property: a plain JS field.
+                (fields || (fields = Object.create(null)))[prop] = value;
                 return true;
             },
             apply: function (_, _this, args) {

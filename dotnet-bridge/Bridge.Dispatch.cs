@@ -175,8 +175,11 @@ public static partial class Bridge
     private static DispatchEntry BuildDispatchEntry(Type type, string name, int argCount, BindingFlags flags)
     {
         var mi = FindMethodCore(type, name, argCount, flags);
-        if (mi is null) return DispatchEntry.Empty;
+        return mi is null ? DispatchEntry.Empty : BuildDispatchEntry(type, mi);
+    }
 
+    internal static DispatchEntry BuildDispatchEntry(Type type, MethodInfo mi)
+    {
         var parameters = mi.GetParameters();
 
         try
@@ -222,10 +225,12 @@ public static partial class Bridge
             return new CtorEntry(ctor, ctor?.GetParameters() ?? []);
         });
 
+    // Keyed by the accessor name as called ("get_Length") plus the prefix length, so a warm lookup
+    // allocates no property-name substring.
     private static PropertyInfo? GetCachedProp(Type type, string method, int prefixLen, BindingFlags flags)
         => s_propCache.GetOrAdd(
-            new PropKey(type, method[prefixLen..], flags),
-            static k => k.Type.GetProperty(k.Name, k.Flags));
+            new PropKey(type, method, prefixLen, flags),
+            static k => k.Type.GetProperty(k.Name[k.PrefixLen..], k.Flags));
 
     // Pooled: rented array passed to the compiled delegate (which accesses by index,
     // not by Length). Caller must return via ReturnArgs immediately after invoke.
@@ -274,24 +279,19 @@ public static partial class Bridge
             return DispatchResult.Primitive(unchecked((long)up.ToUInt64()), typeof(long));
 
         var t = value.GetType();
+        var info = GetBoxInfo(t);
 
-        if (t.IsPrimitive || t == typeof(string)  || t == typeof(decimal)
-            || t == typeof(DateTime) || t == typeof(DateTimeOffset)
-            || t == typeof(TimeSpan) || t == typeof(Guid))
+        if (info.Primitive)
             return DispatchResult.Primitive(value, t);
 
-        // Arrays and other enumerable results should be marshalled as Collections
-        // (0x07) so the runtime receives the items directly instead of a handle.
-        if (value is System.Collections.IEnumerable enumerable && !(value is string))
-        {
-            return DispatchResult.Collection(enumerable);
-        }
+        // Arrays are marshalled as Collections (0x07) so the runtime receives the items
+        // directly. Other collections (List<T>, Dictionary, ObservableCollection) stay .NET
+        // objects, so their methods work and native code sees the same instance.
+        if (info.Collection)
+            return DispatchResult.Collection((System.Collections.IEnumerable)value);
 
-        if (t.IsEnum)
-        {
-            var ut = Enum.GetUnderlyingType(t);
+        if (info.EnumUnderlying is { } ut)
             return DispatchResult.Primitive(Convert.ChangeType(value, ut), ut);
-        }
 
         // An instance of a JS subclass goes back to JS as the handle its JS object holds, so the
         // runtime hands out that same JS object. If that object was collected (its handle released),
@@ -312,9 +312,12 @@ public static partial class Bridge
             // the C#/WinRT inner object for managed WinRT subclasses (e.g. FlexboxLayout
             // subclasses), ensuring QI succeeds for all inherited WinRT interfaces.
             // The pointer is addref'd here and released on __release.
+            // C#/WinRT objects and JS subclass instances get it here, since the runtime wraps them
+            // as WinRT objects right away. Other objects get one when first passed to a WinRT API
+            // (GetNativePtrForHandle): making a COM wrapper costs more than the rest of the call.
             try
             {
-                if (value != null)
+                if (info.WinRTNativeObject is not null || jsHolder is not null)
                 {
                     var p = ObtainNativePtr(value);
                     if (p != IntPtr.Zero)
@@ -325,15 +328,52 @@ public static partial class Bridge
             {
                 // Not a COM object or failed to obtain native pointer; ignore.
             }
-        var typeName = t.FullName ?? t.Name;
-        return IsAwaitable(value, t)
-            ? DispatchResult.TaskHandle(id, typeName)
-            : DispatchResult.Handle(id, typeName);
+        return info.Awaitable
+            ? DispatchResult.TaskHandle(id, info.TypeName)
+            : DispatchResult.Handle(id, info.TypeName);
     }
 
-    private static bool IsAwaitable(object? value, Type t)
+    // What Box needs to know about a returned value's type, worked out once per type rather than
+    // by reflection on every call.
+    internal sealed class BoxInfo
     {
-        if (value is Task || value is ValueTask) return true;
+        public string TypeName = "";
+        public bool Primitive;
+        public bool Collection;
+        public Type? EnumUnderlying;
+        public bool Awaitable;
+        // WinRT.IWinRTObject.NativeObject when the type is a C#/WinRT projection (see ObtainNativePtr).
+        public PropertyInfo? WinRTNativeObject;
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, BoxInfo> s_boxInfo = new();
+
+    internal static BoxInfo GetBoxInfo(Type t) => s_boxInfo.GetOrAdd(t, static t =>
+    {
+        var info = new BoxInfo { TypeName = t.FullName ?? t.Name };
+        if (t.IsPrimitive || t == typeof(string) || t == typeof(decimal) || t == typeof(Guid))
+        {
+            info.Primitive = true;
+            return info;
+        }
+        if (t.IsArray)
+        {
+            info.Collection = true;
+            return info;
+        }
+        if (t.IsEnum)
+        {
+            info.EnumUnderlying = Enum.GetUnderlyingType(t);
+            return info;
+        }
+        info.Awaitable = IsAwaitable(t);
+        try { info.WinRTNativeObject = t.GetInterface("WinRT.IWinRTObject")?.GetProperty("NativeObject"); } catch { }
+        return info;
+    });
+
+    private static bool IsAwaitable(Type t)
+    {
+        if (typeof(Task).IsAssignableFrom(t) || t == typeof(ValueTask)) return true;
         if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(ValueTask<>)) return true;
         if ((t.FullName ?? "").StartsWith("Windows.Foundation.IAsync", StringComparison.Ordinal)) return true;
         foreach (var iface in t.GetInterfaces())
@@ -360,6 +400,79 @@ public static partial class Bridge
         return "class";
     }
 
+    // What a .NET collection supports, for the JS side to make it array-like: 1 = enumerable
+    // (for...of, map, ...), 2 = has a count (length), 4 = indexed by position (list[0]).
+    public static int CollectionKind(object? value)
+    {
+        if (value is null or string || value is not System.Collections.IEnumerable) return 0;
+        var info = GetCollectionInfo(value.GetType());
+        return 1 | (info.Count is not null ? 2 : 0) | (info.Indexer is not null ? 4 : 0);
+    }
+
+    // A collection's items, as an array the runtime copies into a JS array.
+    public static object?[] CollectionItems(object? value)
+    {
+        if (value is not System.Collections.IEnumerable items) return [];
+        var list = new List<object?>();
+        foreach (var item in items) list.Add(item);
+        return list.ToArray();
+    }
+
+    public static int CollectionCount(object? value)
+    {
+        if (value is System.Collections.ICollection c) return c.Count;
+        var count = value is null ? null : GetCollectionInfo(value.GetType()).Count;
+        return count?.GetValue(value) is int n ? n : CollectionItems(value).Length;
+    }
+
+    // The item at `index`, or null past either end (as a JS array gives undefined).
+    public static object? ItemAt(object? value, int index)
+    {
+        if (index < 0 || index >= CollectionCount(value)) return null;
+        if (value is System.Collections.IList list) return list[index];
+        var indexer = value is null ? null : GetCollectionInfo(value.GetType()).Indexer;
+        if (indexer is null) throw new NotSupportedException($"{value?.GetType().FullName} is not indexed by position");
+        return indexer.GetValue(value, [index]);
+    }
+
+    public static void SetItemAt(object? value, int index, object? item)
+    {
+        var info = value is null ? null : GetCollectionInfo(value.GetType());
+        if (info?.Indexer is not { CanWrite: true } indexer)
+            throw new NotSupportedException($"{value?.GetType().FullName} has no settable items");
+        indexer.SetValue(value, CoerceBin(item, indexer.PropertyType), [index]);
+    }
+
+    // The count property and positional indexer of a collection type, from IList<T> /
+    // IReadOnlyList<T> / ICollection<T> / IReadOnlyCollection<T> (or their non-generic forms).
+    internal sealed class CollectionInfo
+    {
+        public PropertyInfo? Count;
+        public PropertyInfo? Indexer;
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, CollectionInfo> s_collectionInfo = new();
+
+    private static CollectionInfo GetCollectionInfo(Type t) => s_collectionInfo.GetOrAdd(t, static t =>
+    {
+        var info = new CollectionInfo();
+        Type[] interfaces = t.IsInterface ? [t, .. t.GetInterfaces()] : t.GetInterfaces();
+        foreach (var i in interfaces)
+        {
+            var definition = i.IsGenericType ? i.GetGenericTypeDefinition() : i;
+            if (info.Indexer is null && (definition == typeof(IList<>) || definition == typeof(IReadOnlyList<>) || definition == typeof(System.Collections.IList)))
+                info.Indexer = i.GetProperty("Item");
+            if (info.Count is null && (definition == typeof(ICollection<>) || definition == typeof(IReadOnlyCollection<>) || definition == typeof(System.Collections.ICollection)))
+                info.Count = i.GetProperty("Count");
+        }
+        // A writable IList<T> indexer beats a read-only IReadOnlyList<T> one.
+        if (info.Indexer is { CanWrite: false })
+            foreach (var i in interfaces)
+                if (i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IList<>))
+                    info.Indexer = i.GetProperty("Item");
+        return info;
+    });
+
     /// `value instanceof SomeType` for a .NET object that was not constructed from JS.
     public static bool IsInstanceOf(object? value, string typeName)
     {
@@ -373,8 +486,8 @@ public static partial class Bridge
         const BindingFlags inst = BindingFlags.Public | BindingFlags.Instance;
         const BindingFlags stat = BindingFlags.Public | BindingFlags.Static;
 
-        var instProps = t.GetProperties(inst);
-        var statProps = t.GetProperties(stat);
+        var instProps = Array.FindAll(t.GetProperties(inst), p => p.GetIndexParameters().Length == 0);
+        var statProps = Array.FindAll(t.GetProperties(stat), p => p.GetIndexParameters().Length == 0);
 
         return DispatchResult.Members(
             methods:               t.GetMethods(inst).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
@@ -391,8 +504,8 @@ public static partial class Bridge
     internal static Type? ResolveType(string? assemblyName, string? typeName)
     {
         if (string.IsNullOrEmpty(typeName)) return null;
-        var key = string.IsNullOrEmpty(assemblyName) ? typeName : $"{assemblyName}|{typeName}";
-        return s_typeCache.GetOrAdd(key, _ => ResolveTypeCore(assemblyName, typeName));
+        return s_typeCache.GetOrAdd((assemblyName ?? "", typeName),
+            static k => ResolveTypeCore(k.Assembly.Length == 0 ? null : k.Assembly, k.Type));
     }
 
     private static Type? ResolveTypeInAssembly(Assembly asm, string typeName, int lastDot, string shortName)
