@@ -867,6 +867,21 @@ pub fn box_as_ireference(
             None,
         ));
     }
+    if vt == ValueType::Object {
+        if let Some(declaration) = crate::struct_reference::struct_declaration(inner_type) {
+            let obj: JsObject = unsafe { arg.cast() };
+            let mut bytes = Vec::new();
+            {
+                let lock = declaration.read();
+                let sd = lock
+                    .as_any()
+                    .downcast_ref::<metadata::declarations::struct_declaration::StructDeclaration>()?;
+                crate::property_call::append_struct_object_bytes_napi(env, &mut bytes, &obj, sd);
+            }
+            let reference = crate::struct_reference::create(bytes, *iid);
+            return Some((NativeValue { pointer: reference.as_raw() }, Some(reference)));
+        }
+    }
     let wrapped = if vt == ValueType::Object || vt == ValueType::Function {
         let obj: JsObject = unsafe { arg.cast() };
         try_get_external_handle(env, &obj).filter(|ptr| !ptr.is_null())

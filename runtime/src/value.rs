@@ -1102,6 +1102,21 @@ pub fn box_as_ireference(
             None,
         ));
     }
+    if arg.is_object() {
+        if let Some(declaration) = crate::struct_reference::struct_declaration(inner_type) {
+            let obj = arg.to_object(scope)?;
+            let mut bytes = Vec::new();
+            {
+                let lock = declaration.read();
+                let sd = lock
+                    .as_any()
+                    .downcast_ref::<metadata::declarations::struct_declaration::StructDeclaration>()?;
+                crate::property_call::append_struct_object_bytes(&mut bytes, scope, obj, sd);
+            }
+            let reference = crate::struct_reference::create(bytes, *iid);
+            return Some((NativeValue { pointer: reference.as_raw() }, Some(reference)));
+        }
+    }
     let wrapped = if arg.is_object() {
         arg.to_object(scope)
             .and_then(|obj| try_get_external_handle(scope, obj))
