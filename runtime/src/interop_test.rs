@@ -2683,3 +2683,29 @@ fn ireference_parameters_and_results() {
         "#,
     );
 }
+
+/// Struct `IReference<T>` parameters take a plain object or a struct value, and null clears them.
+#[test]
+fn ireference_struct_parameters() {
+    run_js_assert(
+        "ireference_struct_parameters",
+        r#"
+            const argb = (c) => c && `${c.A},${c.R},${c.G},${c.B}`;
+            const quota = new Windows.Storage.Provider.StorageProviderQuotaUI();
+            if (quota.QuotaUsedColor !== null) throw new Error(`unset color was ${argb(quota.QuotaUsedColor)}`);
+            quota.QuotaUsedColor = { A: 255, R: 10, G: 20, B: 30 };
+            if (argb(quota.QuotaUsedColor) !== '255,10,20,30') throw new Error(`object color was ${argb(quota.QuotaUsedColor)}`);
+            quota.QuotaUsedColor = Windows.UI.ColorHelper.FromArgb(128, 1, 2, 3);
+            if (argb(quota.QuotaUsedColor) !== '128,1,2,3') throw new Error(`ColorHelper color was ${argb(quota.QuotaUsedColor)}`);
+            quota.QuotaUsedColor = null;
+            if (quota.QuotaUsedColor !== null) throw new Error(`cleared color was ${argb(quota.QuotaUsedColor)}`);
+
+            const share = new Windows.ApplicationModel.DataTransfer.ShareUIOptions();
+            share.SelectionRect = { X: 1, Y: 2, Width: 3.5, Height: 4 };
+            const r = share.SelectionRect;
+            if (!r || r.X !== 1 || r.Y !== 2 || r.Width !== 3.5 || r.Height !== 4) {
+                throw new Error(`SelectionRect was ${r && `${r.X},${r.Y},${r.Width},${r.Height}`}`);
+            }
+        "#,
+    );
+}

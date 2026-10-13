@@ -46,6 +46,7 @@ mod property_call;
 #[cfg(feature = "classic")]
 mod proxy_manifest_loader;
 pub mod source_protect;
+mod struct_reference;
 #[cfg(feature = "classic")]
 pub mod timers;
 #[cfg(feature = "classic")]
