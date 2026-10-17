@@ -1252,11 +1252,22 @@ impl PropertyCall {
                     // Signature classification precomputed into the per-parameter plan at
                     // static-info build time (see method_call::PointerPlan).
                     match &self.si.param_plans[i] {
-                        // TypeName synthesis was never applied on the PropertyCall path
-                        // (parity with the original decision tree).
-                        PointerPlan::Plain | PointerPlan::TypeName => {
-                            ffi_parse_pointer_arg(scope, value)
-                        }
+                        PointerPlan::Plain => ffi_parse_pointer_arg(scope, value),
+                        // A TypeName value ({ Name, Kind }); ctor synthesis is method-call only.
+                        PointerPlan::TypeName => match (
+                            value.is_object().then(|| value.to_object(scope)).flatten(),
+                            crate::struct_value::type_name_declaration(),
+                        ) {
+                            (Some(obj), Some(decl)) if !value.is_function() => Ok(NativeValue {
+                                pointer: crate::struct_value::serialize_into(
+                                    scope,
+                                    &decl,
+                                    obj,
+                                    &mut struct_scratch,
+                                ),
+                            }),
+                            _ => ffi_parse_pointer_arg(scope, value),
+                        },
                         // IReference<T> parameters: box JS primitives with the correct Create* call
                         // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
                         PointerPlan::IReference(inner, iid) => {

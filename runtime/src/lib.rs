@@ -48,6 +48,8 @@ mod proxy_manifest_loader;
 pub mod source_protect;
 mod struct_reference;
 #[cfg(feature = "classic")]
+mod struct_value;
+#[cfg(feature = "classic")]
 pub mod timers;
 #[cfg(feature = "classic")]
 mod type_description;
@@ -73,20 +75,11 @@ use crate::ns_proxy::CallbackThisObject;
 #[cfg(feature = "classic")]
 use crate::proxy_manifest_loader::SbgManifestLoader;
 #[cfg(feature = "classic")]
-use crate::value::{
-    ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg,
-    ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg,
-    ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg,
-    ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg,
-    ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr, set_ret_val, MAX_SAFE_INTEGER,
-    MIN_SAFE_INTEGER,
-};
+use crate::value::{read_value_from_ptr, set_ret_val, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
 use crate::value::NativeType;
 #[cfg(feature = "classic")]
 use crate::delegate_invoke::DelegateArg;
 use crate::delegate_invoke::{DelegateReturn, DelegateSignature};
-#[cfg(feature = "classic")]
-use crate::value::NativeValue;
 use ahash::AHashSet;
 #[cfg(feature = "classic")]
 use ahash::{AHashMap, AHasher};
@@ -120,8 +113,6 @@ use metadata::signature::Signature;
 #[cfg(feature = "classic")]
 use metadata::value::Value;
 use parking_lot::lock_api::{MappedRwLockReadGuard, RwLockReadGuard};
-#[cfg(feature = "classic")]
-use parking_lot::lock_api::{MappedRwLockWriteGuard, RwLockWriteGuard};
 use parking_lot::{RawRwLock, RwLock};
 #[cfg(feature = "classic")]
 use parking_lot::Mutex;
@@ -1262,7 +1253,6 @@ pub(crate) struct DeclarationFFI {
     pub(crate) instance: Option<IUnknown>,
     #[cfg(feature = "classic")]
     pub(crate) parent: Option<Arc<RwLock<dyn Declaration>>>,
-    pub(crate) struct_instance: Option<(Vec<u8>, Vec<NativeType>)>,
     /// For inherited static properties/methods: the fully-qualified name of the
     /// WinRT class that declares them. Resolved lazily via class_activation_factory
     /// on first access so that constructors don't pay the cost of RoGetActivationFactory
@@ -1295,7 +1285,6 @@ impl DeclarationFFI {
             inner: declaration,
             instance: None,
             parent: None,
-            struct_instance: None,
             static_factory_class: None,
             activation: std::cell::OnceCell::new(),
             qi: crate::method_call::QiCache::new(),
@@ -1313,7 +1302,6 @@ impl DeclarationFFI {
             inner: declaration,
             instance,
             parent: None,
-            struct_instance: None,
             static_factory_class: None,
             activation: std::cell::OnceCell::new(),
             qi: crate::method_call::QiCache::new(),
@@ -1329,11 +1317,6 @@ impl DeclarationFFI {
 
     pub fn read(&self) -> MappedRwLockReadGuard<'_, RawRwLock, dyn Declaration> {
         RwLockReadGuard::map(self.inner.read(), |dec| dec)
-    }
-
-    #[cfg(feature = "classic")]
-    pub fn write(&self) -> MappedRwLockWriteGuard<'_, RawRwLock, dyn Declaration> {
-        RwLockWriteGuard::map(self.inner.write(), |dec| dec)
     }
 }
 
@@ -2585,11 +2568,16 @@ fn create_ns_object<'a>(
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
     tmpl.set_class_name(name_str);
     let object_tmpl = tmpl.instance_template(scope);
+    // Non-masking: names resolved once become own properties (see `memoize_ns_member`).
     object_tmpl.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
             .query(handle_named_property_query)
             .getter(handle_named_property_getter)
-            .setter(handle_named_property_setter),
+            .setter(handle_named_property_setter)
+            .flags(
+                v8::PropertyHandlerFlags::NON_MASKING
+                    | v8::PropertyHandlerFlags::ONLY_INTERCEPT_STRINGS,
+            ),
     );
     object_tmpl.set_internal_field_count(2);
 
@@ -7040,544 +7028,13 @@ fn create_ns_ctor_object<'a>(
 }
 
 #[cfg(feature = "classic")]
-fn create_ns_struct_ctor_object<'a>(
-    name: &str,
-    declaration: Arc<RwLock<dyn Declaration>>,
-    scope: &mut v8::PinScope<'a, '_>,
-) -> Local<'a, v8::Value> {
-    let name = v8::String::new(scope, name).unwrap();
-
-    let ext = DeclarationFFI::new(Arc::clone(&declaration));
-
-    let ext = Box::into_raw(Box::new(ext));
-
-    let ext = v8::External::new(scope, ext as _);
-
-    let tmpl = FunctionTemplate::builder(
-        |scope: &mut v8::PinScope<'_, '_>,
-         args: v8::FunctionCallbackArguments,
-         mut retval: v8::ReturnValue| {
-            let dec = unsafe { args.data().cast::<v8::External>() };
-
-            let dec = dec.value() as *mut DeclarationFFI;
-
-            let dec = unsafe { &mut *dec };
-
-            let lock = dec.write();
-
-            let ext = args.data();
-
-            let object_tmpl = v8::ObjectTemplate::new(scope);
-            object_tmpl.set_internal_field_count(1);
-
-            let mut field_args: Vec<NativeValue> = Vec::new();
-
-            let mut field_types: Vec<NativeType> = Vec::new();
-
-            let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else {
-                return;
-            };
-
-            // Support both positional args `new Thickness(5, 10, 15, 20)` and
-            // named-field object `new Thickness({ Left: 5, Top: 10, Right: 15, Bottom: 20 })`.
-            let use_positional = args.length() > 0 && !args.get(0).is_object();
-            let named_object: Option<v8::Local<v8::Object>> = if !use_positional {
-                match args.get(0).to_object(scope) {
-                    Some(obj) => Some(obj),
-                    None => {
-                        throw_js_error(
-                            scope,
-                            "Expected object or positional arguments for struct constructor",
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            for (field_idx, field) in struct_dec.fields().iter().enumerate() {
-                let Some(metadata) = field.base().metadata() else {
-                    continue;
-                };
-                let field_type = Signature::to_string(metadata, &field.type_());
-
-                let Ok(native_type) = NativeType::try_from(field_type.as_str()) else {
-                    continue;
-                };
-
-                field_types.push(native_type.clone());
-
-                let field_value = if use_positional {
-                    Some(args.get(field_idx as i32))
-                } else {
-                    let Some(name) = v8::String::new(scope, field.name()) else {
-                        continue;
-                    };
-                    named_object.unwrap().get(scope, name.into())
-                };
-
-                match field_value {
-                    None => {
-                        let message = format!("Missing key {}", field.name());
-                        let message = v8::String::new(scope, message.as_str()).unwrap();
-                        let error = v8::Exception::error(scope, message.into());
-                        scope.throw_exception(error);
-                    }
-                    Some(field) => {
-                        let value = match native_type {
-                            NativeType::Void => Err(error::type_error(
-                                "Void is not a valid WinRT struct field type",
-                            )),
-                            NativeType::Bool => ffi_parse_bool_arg(field),
-                            NativeType::U8 => ffi_parse_u8_arg(field),
-                            NativeType::I8 => ffi_parse_i8_arg(field),
-                            NativeType::U16 => ffi_parse_u16_arg(field),
-                            NativeType::I16 => ffi_parse_i16_arg(field),
-                            NativeType::U32 => ffi_parse_u32_arg(field),
-                            NativeType::I32 => ffi_parse_i32_arg(field),
-                            NativeType::U64 => ffi_parse_u64_arg(scope, field),
-                            NativeType::I64 => ffi_parse_i64_arg(scope, field),
-                            NativeType::USize => ffi_parse_usize_arg(scope, field),
-                            NativeType::ISize => ffi_parse_isize_arg(scope, field),
-                            NativeType::F32 => ffi_parse_f32_arg(field),
-                            NativeType::F64 => ffi_parse_f64_arg(field),
-                            NativeType::Pointer => ffi_parse_pointer_arg(scope, field),
-                            NativeType::Buffer => ffi_parse_buffer_arg(scope, field),
-                            NativeType::Function => ffi_parse_function_arg(scope, field),
-                            NativeType::Struct(_) => ffi_parse_struct_arg(scope, field),
-                            NativeType::String => ffi_parse_string_arg(scope, field),
-                        };
-                        match value {
-                            Ok(value) => {
-                                field_args.push(value);
-                            }
-                            Err(err) => {
-                                let message = err.to_string();
-                                let message = v8::String::new(scope, message.as_str()).unwrap();
-                                let error = v8::Exception::error(scope, message.into());
-                                scope.throw_exception(error);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut struct_size = 0_usize;
-
-            let params = field_types
-                .clone()
-                .into_iter()
-                .map(|item| {
-                    struct_size = struct_size + item.size();
-                    libffi::middle::Type::try_from(item)
-                })
-                .collect::<Result<Vec<libffi::middle::Type>, error::AnyError>>();
-
-            if params.is_err() {
-                return;
-            }
-
-            let mut struct_buf: Vec<u8> = unsafe { vec![0_u8; struct_size] };
-
-            struct_buf.shrink_to_fit();
-
-            let mut position = 0_isize;
-
-            for (field_type, field_value) in field_types.iter().zip(field_args.iter()) {
-                let size = field_type.size();
-
-                unsafe {
-                    let buffer = struct_buf.as_mut_ptr();
-                    let buffer = buffer.offset(position);
-
-                    let value: *mut u8 = std::mem::transmute(field_value.as_arg(field_type));
-
-                    let slice = std::slice::from_raw_parts_mut(buffer, size);
-
-                    std::ptr::copy(value, slice.as_mut_ptr(), size);
-                }
-
-                position = position + size as isize;
-            }
-
-            let name = lock.name().to_string();
-
-            drop(lock);
-
-            dec.struct_instance = Some((struct_buf, field_types));
-
-            let _name = v8::String::new(scope, name.as_str()).unwrap();
-
-            let getter = |scope: &mut v8::PinScope<'_, '_>,
-                          key: Local<v8::Name>,
-                          args: v8::PropertyCallbackArguments,
-                          mut rv: v8::ReturnValue<v8::Value>|
-             -> v8::Intercepted {
-                let key = key.to_rust_string_lossy(scope);
-
-                let this = args.data();
-
-                let dec = unsafe { this.cast::<v8::External>() };
-
-                let dec = dec.value() as *mut DeclarationFFI;
-
-                let dec = unsafe { &*dec };
-
-                let lock = dec.read();
-
-                if key == "toString" {
-                    let name = lock.name();
-
-                    let name = v8::String::new(scope, name).unwrap();
-                    let func = v8::Function::builder(
-                        |_scope: &mut v8::PinScope<'_, '_>,
-                         args: v8::FunctionCallbackArguments,
-                         mut retval: v8::ReturnValue| {
-                            retval.set(args.data());
-                        },
-                    )
-                    .data(name.into())
-                    .build(scope);
-
-                    if let Some(f) = func {
-                        rv.set(f.into());
-                    }
-                    return v8::Intercepted::kYes;
-                }
-
-                let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else {
-                    return v8::Intercepted::kNo;
-                };
-
-                let mut offset = 0;
-                let instance = dec.struct_instance.as_ref();
-                let mut position = 0;
-                for field in struct_dec.fields() {
-                    if field.name() == key.as_str() {
-                        if let Some((buffer, types)) = instance {
-                            let mut current_field_position = 0;
-                            for field_type in types.iter() {
-                                let size = field_type.size();
-
-                                if position == current_field_position {
-                                    unsafe {
-                                        let buffer = buffer.as_ptr();
-                                        let buffer = buffer.offset(offset);
-
-                                        let slice = std::slice::from_raw_parts(buffer, size);
-
-                                        match field_type {
-                                            NativeType::Void => {}
-                                            NativeType::Bool => {
-                                                let ret: &u8 = std::mem::transmute(
-                                                    slice.as_ptr() as *const u8
-                                                );
-                                                rv.set_bool(*ret == 1);
-                                            }
-                                            NativeType::U8 => {
-                                                let ret: &u8 = std::mem::transmute(
-                                                    slice.as_ptr() as *const u8
-                                                );
-                                                rv.set_uint32(*ret as u32);
-                                            }
-                                            NativeType::I8 => {
-                                                let ret: &i8 = std::mem::transmute(
-                                                    slice.as_ptr() as *const i8
-                                                );
-                                                rv.set_int32(*ret as i32);
-                                            }
-                                            NativeType::U16 => {
-                                                let ret: &u16 = std::mem::transmute(
-                                                    slice.as_ptr() as *const u16
-                                                );
-                                                rv.set_uint32(*ret as u32);
-                                            }
-                                            NativeType::I16 => {
-                                                let ret: &i16 = std::mem::transmute(
-                                                    slice.as_ptr() as *const i16
-                                                );
-                                                rv.set_int32(*ret as i32);
-                                            }
-                                            NativeType::U32 => {
-                                                let ret: &u32 = std::mem::transmute(
-                                                    slice.as_ptr() as *const u32
-                                                );
-                                                rv.set_uint32(*ret);
-                                            }
-                                            NativeType::I32 => {
-                                                let ret: &i32 = std::mem::transmute(
-                                                    slice.as_ptr() as *const i32
-                                                );
-                                                rv.set_int32(*ret);
-                                            }
-                                            NativeType::U64 => {
-                                                let ret: u64 =
-                                                    *std::mem::transmute::<*const u64, &u64>(
-                                                        slice.as_ptr() as *const u64,
-                                                    );
-
-                                                let local_value: v8::Local<v8::Value> =
-                                                    if ret > MAX_SAFE_INTEGER as u64 {
-                                                        v8::BigInt::new_from_u64(scope, ret).into()
-                                                    } else {
-                                                        v8::Number::new(scope, ret as f64).into()
-                                                    };
-
-                                                rv.set(local_value);
-                                            }
-                                            NativeType::I64 => {
-                                                let ret: i64 =
-                                                    *std::mem::transmute::<*const i64, &i64>(
-                                                        slice.as_ptr() as *const i64,
-                                                    );
-                                                let local_value: v8::Local<v8::Value> = if ret
-                                                    > MAX_SAFE_INTEGER as i64
-                                                    || ret < MIN_SAFE_INTEGER as i64
-                                                {
-                                                    v8::BigInt::new_from_i64(scope, ret).into()
-                                                } else {
-                                                    v8::Number::new(scope, ret as f64).into()
-                                                };
-                                                rv.set(local_value);
-                                            }
-                                            NativeType::USize => {}
-                                            NativeType::ISize => {}
-                                            NativeType::F32 => {
-                                                //let ret: &f32 = std::mem::transmute(slice.as_ptr() as *const f32);
-
-                                                let ret: f32 = if cfg!(target_endian = "big") {
-                                                    f32::from_be_bytes(
-                                                        <[u8; 4]>::try_from(slice).unwrap(),
-                                                    )
-                                                } else {
-                                                    f32::from_le_bytes(
-                                                        <[u8; 4]>::try_from(slice).unwrap(),
-                                                    )
-                                                };
-
-                                                rv.set(v8::Number::new(scope, ret as f64).into());
-                                            }
-                                            NativeType::F64 => {
-                                                let ret: &f64 = std::mem::transmute(
-                                                    slice.as_ptr() as *const f64
-                                                );
-                                                rv.set(v8::Number::new(scope, *ret).into());
-                                            }
-                                            NativeType::Pointer => {}
-                                            NativeType::Buffer => {}
-                                            NativeType::Function => {}
-                                            NativeType::Struct(_) => {}
-                                            NativeType::String => {
-                                                // TODO
-                                            }
-                                        }
-                                    }
-                                }
-
-                                current_field_position = current_field_position + 1;
-
-                                offset = offset + size as isize;
-                            }
-                        }
-                        break;
-                    }
-                    position = position + 1;
-                }
-                v8::Intercepted::kYes
-            };
-
-            let setter = |scope: &mut v8::PinScope<'_, '_>,
-                          key: Local<v8::Name>,
-                          value: Local<v8::Value>,
-                          args: v8::PropertyCallbackArguments,
-                          _rv: v8::ReturnValue<()>|
-             -> v8::Intercepted {
-                let key = key.to_rust_string_lossy(scope);
-
-                let this = args.data();
-
-                let dec = unsafe { this.cast::<v8::External>() };
-
-                let dec = dec.value() as *mut DeclarationFFI;
-
-                let instance = unsafe { (&mut *dec).struct_instance.as_mut() };
-
-                let dec = unsafe { &mut *dec };
-
-                let lock = dec.write();
-
-                let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else {
-                    return v8::Intercepted::kNo;
-                };
-
-                let mut offset = 0;
-
-                let mut position = 0;
-                for field in struct_dec.fields() {
-                    if field.name() == key.as_str() {
-                        if let Some((buffer, types)) = instance {
-                            let field = value;
-
-                            let mut current_field_position = 0;
-                            for field_type in types.iter() {
-                                let size = field_type.size();
-
-                                if position == current_field_position {
-                                    let value = match field_type {
-                                        NativeType::Void => Err(error::type_error(
-                                            "Void is not a valid WinRT struct field type",
-                                        )),
-                                        NativeType::Bool => ffi_parse_bool_arg(field),
-                                        NativeType::U8 => ffi_parse_u8_arg(field),
-                                        NativeType::I8 => ffi_parse_i8_arg(field),
-                                        NativeType::U16 => ffi_parse_u16_arg(field),
-                                        NativeType::I16 => ffi_parse_i16_arg(field),
-                                        NativeType::U32 => ffi_parse_u32_arg(field),
-                                        NativeType::I32 => ffi_parse_i32_arg(field),
-                                        NativeType::U64 => ffi_parse_u64_arg(scope, field),
-                                        NativeType::I64 => ffi_parse_i64_arg(scope, field),
-                                        NativeType::USize => ffi_parse_usize_arg(scope, field),
-                                        NativeType::ISize => ffi_parse_isize_arg(scope, field),
-                                        NativeType::F32 => ffi_parse_f32_arg(field),
-                                        NativeType::F64 => ffi_parse_f64_arg(field),
-                                        NativeType::Pointer => ffi_parse_pointer_arg(scope, field),
-                                        NativeType::Buffer => ffi_parse_buffer_arg(scope, field),
-                                        NativeType::Function => {
-                                            ffi_parse_function_arg(scope, field)
-                                        }
-                                        NativeType::Struct(_) => ffi_parse_struct_arg(scope, field),
-                                        NativeType::String => ffi_parse_string_arg(scope, field),
-                                    };
-                                    match value {
-                                        Ok(value) => unsafe {
-                                            let buffer = buffer.as_mut_ptr();
-                                            let buffer = buffer.offset(offset);
-
-                                            let value: *mut u8 =
-                                                std::mem::transmute(value.as_arg(field_type));
-
-                                            let slice =
-                                                std::slice::from_raw_parts_mut(buffer, size);
-
-                                            std::ptr::copy(value, slice.as_mut_ptr(), size);
-                                        },
-                                        Err(err) => {
-                                            let message = err.to_string();
-                                            let message =
-                                                v8::String::new(scope, message.as_str()).unwrap();
-                                            let error = v8::Exception::error(scope, message.into());
-                                            scope.throw_exception(error);
-                                        }
-                                    }
-                                }
-
-                                current_field_position = current_field_position + 1;
-
-                                offset = offset + size as isize;
-                            }
-                        }
-                        break;
-                    }
-                    position = position + 1;
-                }
-                v8::Intercepted::kYes
-            };
-
-            object_tmpl.set_named_property_handler(
-                v8::NamedPropertyHandlerConfiguration::new()
-                    .getter(getter)
-                    .setter(setter)
-                    .data(ext),
-            );
-
-            let Some(object) = object_tmpl.new_instance(scope) else {
-                return;
-            };
-
-            object.set_internal_field(0, ext.into());
-
-            retval.set(object.into());
-        },
-    )
-    .data(ext.into())
-    .build(scope);
-    tmpl.set_class_name(name);
-
-    let Some(func) = tmpl.get_function(scope) else {
-        return v8::undefined(scope).into();
-    };
-    let ret = func;
-
-    ret.into()
-}
-
-#[cfg(feature = "classic")]
 pub(crate) fn create_struct_object_from_raw<'a>(
     declaration: Arc<RwLock<dyn Declaration>>,
     raw_data: *mut c_void,
     scope: &mut v8::PinScope<'a, '_>,
 ) -> Local<'a, v8::Object> {
-    let fallback = v8::Object::new(scope);
-
-    // Build the byte buffer from raw_data before setting up the template.
-    let (struct_buf, field_types) = {
-        let lock = declaration.read();
-        let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else {
-            return fallback;
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        let mut types: Vec<NativeType> = Vec::new();
-        let mut offset: isize = 0;
-        for field in struct_dec.fields() {
-            let Some(metadata) = field.base().metadata() else {
-                continue;
-            };
-            let field_type_str = Signature::to_string(metadata, &field.type_());
-            let Ok(native_type) = NativeType::try_from(field_type_str.as_str()) else {
-                continue;
-            };
-            let size = native_type.size() as isize;
-            let field_ptr = unsafe { (raw_data as *const u8).offset(offset) as *mut c_void };
-            let buf_start = buf.len();
-            buf.extend(std::iter::repeat(0u8).take(size as usize));
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    field_ptr as *const u8,
-                    buf[buf_start..].as_mut_ptr(),
-                    size as usize,
-                );
-            }
-            types.push(native_type);
-            offset += size;
-        }
-        (buf, types)
-    };
-
-    // Store the byte buffer in a DeclarationFFI so native code can read it back
-    // via ffi_parse_pointer_arg → try_get_external_handle, AND so the property
-    // interceptors can keep reads/writes in sync with the same buffer.
-    let mut dec_ffi = DeclarationFFI::new(Arc::clone(&declaration));
-    dec_ffi.struct_instance = Some((struct_buf, field_types));
-    let dec_raw = Box::into_raw(Box::new(dec_ffi));
-    let ext = v8::External::new(scope, dec_raw as *mut c_void);
-
-    // Use property interceptors so that JS writes (e.g. `size.Width = 300`) go
-    // through to the buffer, not just to a detached plain JS property.
-    let tmpl = v8::ObjectTemplate::new(scope);
-    tmpl.set_internal_field_count(1);
-    tmpl.set_named_property_handler(
-        v8::NamedPropertyHandlerConfiguration::new()
-            .getter(crate::ns_proxy::ns_struct_field_getter)
-            .setter(crate::ns_proxy::ns_struct_field_setter)
-            .enumerator(crate::ns_proxy::ns_struct_field_enumerator)
-            .data(ext.into()),
-    );
-    let Some(object) = tmpl.new_instance(scope) else {
-        return fallback;
-    };
-    object.set_internal_field(0, ext.into());
-    object
+    crate::struct_value::from_raw(scope, &declaration, raw_data)
+        .unwrap_or_else(|| v8::Object::new(scope))
 }
 
 #[cfg(feature = "classic")]
@@ -7630,6 +7087,9 @@ fn handle_named_property_setter(
     args: v8::PropertyCallbackArguments,
     mut _rv: v8::ReturnValue<()>,
 ) -> v8::Intercepted {
+    if NS_MEMOIZING.get() {
+        return v8::Intercepted::kNo;
+    }
     let this = args.holder();
     let Some(dec_field) = this.get_internal_field(scope, 0) else {
         return v8::Intercepted::kNo;
@@ -7725,9 +7185,44 @@ fn handle_named_property_setter(
     if !is_reserved {
         store.set(scope, key.into(), value);
         v8::Intercepted::kYes
+    } else if matches!(kind, DeclarationKind::Namespace | DeclarationKind::Enum) {
+        // Read-only, same as once memoized; falling through would shadow the metadata.
+        if args.should_throw_on_error() {
+            let message = format!("Cannot assign to read only property '{name}'");
+            if let Some(message) = v8::String::new(scope, &message) {
+                let error = v8::Exception::type_error(scope, message);
+                scope.throw_exception(error);
+            }
+        }
+        v8::Intercepted::kYes
     } else {
         v8::Intercepted::kNo
     }
+}
+
+#[cfg(feature = "classic")]
+thread_local! {
+    /// Set while `memoize_ns_member` defines a property; the define reaches the setter interceptor.
+    static NS_MEMOIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Caches a resolved namespace/enum member as a read-only own property, so later reads skip
+/// the (non-masking) interceptor. The side store keeps a copy in case the define fails.
+#[cfg(feature = "classic")]
+fn memoize_ns_member<'s>(
+    scope: &v8::PinScope<'s, '_>,
+    holder: Local<v8::Object>,
+    store: &crate::ns_proxy::SideStore<'s>,
+    key: Local<v8::Name>,
+    value: Local<v8::Value>,
+) {
+    let attrs = v8::PropertyAttribute::READ_ONLY
+        | v8::PropertyAttribute::DONT_DELETE
+        | v8::PropertyAttribute::DONT_ENUM;
+    store.set(scope, key.into(), value);
+    NS_MEMOIZING.set(true);
+    holder.define_own_property(scope, key, value, attrs);
+    NS_MEMOIZING.set(false);
 }
 
 #[cfg(feature = "classic")]
@@ -7789,21 +7284,9 @@ fn handle_named_property_getter(
 
                         match lock.kind() {
                             DeclarationKind::Struct => {
-                                let Some(struct_dec) =
-                                    lock.as_any().downcast_ref::<StructDeclaration>()
-                                else {
-                                    return v8::Intercepted::kNo;
-                                };
-                                let name = struct_dec.name().to_string();
                                 drop(lock);
-
-                                let ret = create_ns_struct_ctor_object(
-                                    name.as_str(),
-                                    Arc::clone(&dec),
-                                    scope,
-                                );
-                                let ret: Local<v8::Value> = ret.into();
-                                store.set(scope, key.into(), ret);
+                                let ret = crate::struct_value::constructor(scope, &dec);
+                                memoize_ns_member(scope, this, &store, key, ret);
                                 rv.set(ret);
                             }
                             DeclarationKind::Class => {
@@ -7814,7 +7297,7 @@ fn handle_named_property_getter(
                                     scope,
                                 )
                                 .into();
-                                store.set(scope, key.into(), ret);
+                                memoize_ns_member(scope, this, &store, key, ret);
                                 rv.set(ret);
                             }
                             DeclarationKind::Interface
@@ -7831,13 +7314,13 @@ fn handle_named_property_getter(
                                     scope,
                                 )
                                 .into();
-                                store.set(scope, key.into(), ret);
+                                memoize_ns_member(scope, this, &store, key, ret);
                                 rv.set(ret);
                             }
                             _ => {
                                 let ret: Local<v8::Value> =
                                     create_ns_object(name.as_str(), declaration, scope).into();
-                                store.set(scope, key.into(), ret);
+                                memoize_ns_member(scope, this, &store, key, ret);
                                 rv.set(ret);
                             }
                         }
@@ -7953,14 +7436,14 @@ fn handle_named_property_getter(
                                 // Store as v8::Integer (Smi) so the cached value passes
                                 // v8::Local::<v8::Int32>::try_from when used as a setter arg.
                                 let ret: Local<v8::Value> = v8::Integer::new(scope, value).into();
-                                store.set(scope, key.into(), ret);
+                                memoize_ns_member(scope, this, &store, key, ret);
                                 return v8::Intercepted::kYes;
                             }
                             Value::Uint32(value) => {
                                 rv.set_uint32(value);
                                 let ret: Local<v8::Value> =
                                     v8::Integer::new_from_unsigned(scope, value).into();
-                                store.set(scope, key.into(), ret);
+                                memoize_ns_member(scope, this, &store, key, ret);
                                 return v8::Intercepted::kYes;
                             }
                             _ => {}

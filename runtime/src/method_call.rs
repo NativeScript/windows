@@ -1013,8 +1013,8 @@ impl MethodCall {
                         }
                         PointerPlan::TypeName => {
                             {
-                                    // If the JS argument is a class constructor (instance=None,
-                                    // struct_instance=None) synthesise a TypeName{Name,Kind=Metadata}.
+                                    // If the JS argument is a class constructor (instance=None)
+                                    // synthesise a TypeName{Name,Kind=Metadata}.
                                     let synthesized: Option<*mut c_void> = 'synth: {
                                         if value.is_object() {
                                             let obj = value.to_object(scope).unwrap();
@@ -1023,9 +1023,7 @@ impl MethodCall {
                                                 let dec_ffi = unsafe {
                                                     &*(ext.value() as *mut DeclarationFFI)
                                                 };
-                                                if dec_ffi.struct_instance.is_none()
-                                                    && dec_ffi.instance.is_none()
-                                                {
+                                                if dec_ffi.instance.is_none() {
                                                     let class_name = dec_ffi
                                                         .inner
                                                         .read()
@@ -1056,9 +1054,22 @@ impl MethodCall {
                                     };
                                     if let Some(ptr) = synthesized {
                                         Ok(NativeValue { pointer: ptr })
+                                    } else if let (Some(obj), Some(decl)) = (
+                                        (value.is_object() && !value.is_function())
+                                            .then(|| value.to_object(scope))
+                                            .flatten(),
+                                        crate::struct_value::type_name_declaration(),
+                                    ) {
+                                        // A TypeName value ({ Name, Kind }).
+                                        Ok(NativeValue {
+                                            pointer: crate::struct_value::serialize_into(
+                                                scope,
+                                                &decl,
+                                                obj,
+                                                &mut struct_scratch,
+                                            ),
+                                        })
                                     } else {
-                                        // Already a TypeName struct instance — ffi_parse_pointer_arg
-                                        // extracts struct_instance.buf.as_ptr() via try_get_external_handle.
                                         ffi_parse_pointer_arg(scope, value)
                                     }
                             }
@@ -1658,9 +1669,7 @@ impl MethodCall {
                                             if let Ok(dec_ffi) =
                                                 env.unwrap::<crate::DeclarationFFI>(&obj)
                                             {
-                                                if dec_ffi.struct_instance.is_none()
-                                                    && dec_ffi.instance.is_none()
-                                                {
+                                                if dec_ffi.instance.is_none() {
                                                     let class_name = dec_ffi
                                                         .inner
                                                         .read()
