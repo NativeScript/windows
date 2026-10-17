@@ -521,8 +521,23 @@ fn try_unbox_property_value<'a>(
             let g = pv.GetGuid().ok()?;
             v8::String::new(scope, &format!("{g:?}")).map(Into::into)
         }
+        PropertyType::Point => boxed_struct(scope, "Windows.Foundation.Point", &pv.GetPoint().ok()?),
+        PropertyType::Size => boxed_struct(scope, "Windows.Foundation.Size", &pv.GetSize().ok()?),
+        PropertyType::Rect => boxed_struct(scope, "Windows.Foundation.Rect", &pv.GetRect().ok()?),
+        PropertyType::TimeSpan => boxed_struct(scope, "Windows.Foundation.TimeSpan", &pv.GetTimeSpan().ok()?),
+        PropertyType::DateTime => boxed_struct(scope, "Windows.Foundation.DateTime", &pv.GetDateTime().ok()?),
         _ => None,
     }
+}
+
+/// A boxed struct value (`IReference<Point>` etc.) as the same object a struct return gives.
+fn boxed_struct<'a, T>(
+    scope: &mut v8::PinScope<'a, '_>,
+    type_name: &str,
+    value: &T,
+) -> Option<v8::Local<'a, v8::Value>> {
+    let decl = MetadataReader::find_by_name(type_name)?;
+    Some(crate::create_struct_object_from_raw(decl, value as *const T as *mut c_void, scope).into())
 }
 
 /// Sets a method/property return value, resolving `Object`/IInspectable returns to a full typed

@@ -618,9 +618,47 @@ fn resolve_member(env: &Env, full_name: &str) -> napi::Result<JsUnknown> {
             create_ctor_proxy(env, full_name, declaration)?,
         )),
         DeclarationKind::Enum => Ok(as_unknown(env, create_enum_object(env, &declaration)?)),
-        // Interfaces / structs arrive with later slices.
+        DeclarationKind::Struct => Ok(as_unknown(env, create_struct_ctor(env, full_name, declaration)?)),
+        // Interfaces arrive with later slices.
         _ => undefined_js(env),
     }
+}
+
+/// `new Rect({ X, Y, Width, Height })`, `new Rect(x, y, w, h)` or `new Rect()`: a plain struct
+/// value, round-tripped through the struct's bytes so missing fields are zero and values match
+/// what native receives.
+fn create_struct_ctor(env: &Env, full_name: &str, declaration: Decl) -> napi::Result<JsFunction> {
+    use metadata::declarations::struct_declaration::StructDeclaration;
+
+    let simple_name = full_name.rsplit('.').next().unwrap_or(full_name);
+    env.create_function_from_closure(simple_name, move |ctx: CallContext| {
+        let env = &ctx.env;
+        let first = if ctx.length > 0 { Some(ctx.get::<JsUnknown>(0)?) } else { None };
+        let named = ctx.length == 1
+            && first.as_ref().is_some_and(|v| matches!(v.get_type(), Ok(ValueType::Object)));
+        let mut buf = Vec::new();
+        {
+            let lock = declaration.read();
+            let Some(sd) = lock.as_any().downcast_ref::<StructDeclaration>() else {
+                return undefined_js(env);
+            };
+            let source: JsObject = if named {
+                unsafe { first.unwrap().cast() }
+            } else {
+                let mut positional = env.create_object()?;
+                for (i, field) in sd.fields().iter().enumerate().take(ctx.length) {
+                    positional.set_named_property(field.name(), ctx.get::<JsUnknown>(i)?)?;
+                }
+                positional
+            };
+            crate::property_call::append_struct_object_bytes_napi(env, &mut buf, &source, sd);
+        }
+        if buf.is_empty() {
+            buf.push(0);
+        }
+        let value = create_struct_object_from_raw(env, &declaration, buf.as_ptr())?;
+        Ok(as_unknown(env, value))
+    })
 }
 
 /// A WinRT enum as a plain JS object of name → numeric value (Int32/UInt32, same
