@@ -1248,6 +1248,17 @@ pub fn ffi_parse_pointer_arg(
         }
     }
 
+    if let Some(inspectable) = arg
+        .is_object()
+        .then(|| arg.to_object(scope))
+        .flatten()
+        .and_then(|obj| box_struct_shape(scope, obj))
+    {
+        let ptr = inspectable.as_raw() as *mut c_void;
+        std::mem::forget(inspectable);
+        return Ok(NativeValue { pointer: ptr });
+    }
+
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
         value.value()
     } else if arg.is_null_or_undefined() {
@@ -1398,6 +1409,62 @@ pub fn ffi_parse_struct_arg(
     Ok(NativeValue { pointer })
 }
 
+/// Boxes a plain object shaped like one of the struct types `IPropertyValue` supports
+/// (`{X,Y}`, `{Width,Height}`, `{X,Y,Width,Height}`, `{Duration}`, `{UniversalTime}`).
+#[cfg(feature = "classic")]
+fn box_struct_shape(
+    scope: &mut v8::PinScope<'_, '_>,
+    obj: v8::Local<v8::Object>,
+) -> Option<windows::core::IInspectable> {
+    use windows::Foundation::{DateTime, Point, Rect, Size, TimeSpan};
+    let names = obj.get_own_property_names(scope, Default::default())?;
+    let mut keys: Vec<String> = (0..names.length())
+        .filter_map(|i| names.get_index(scope, i))
+        .map(|k| k.to_rust_string_lossy(scope))
+        .collect();
+    keys.sort();
+    let mut get = |name: &str| -> v8::Local<v8::Value> {
+        v8::String::new(scope, name)
+            .and_then(|k| obj.get(scope, k.into()))
+            .unwrap_or_else(|| v8::undefined(scope).into())
+    };
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let boxed = match keys.as_slice() {
+        ["X", "Y"] => {
+            let (x, y) = (get("X"), get("Y"));
+            PropertyValue::CreatePoint(Point { X: f32_of(scope, x), Y: f32_of(scope, y) })
+        }
+        ["Height", "Width"] => {
+            let (w, h) = (get("Width"), get("Height"));
+            PropertyValue::CreateSize(Size { Width: f32_of(scope, w), Height: f32_of(scope, h) })
+        }
+        ["Height", "Width", "X", "Y"] => {
+            let (x, y, w, h) = (get("X"), get("Y"), get("Width"), get("Height"));
+            PropertyValue::CreateRect(Rect {
+                X: f32_of(scope, x),
+                Y: f32_of(scope, y),
+                Width: f32_of(scope, w),
+                Height: f32_of(scope, h),
+            })
+        }
+        ["Duration"] => {
+            let d = get("Duration");
+            PropertyValue::CreateTimeSpan(TimeSpan { Duration: v8_to_i64(scope, d) })
+        }
+        ["UniversalTime"] => {
+            let t = get("UniversalTime");
+            PropertyValue::CreateDateTime(DateTime { UniversalTime: v8_to_i64(scope, t) })
+        }
+        _ => return None,
+    };
+    boxed.ok()?.cast().ok()
+}
+
+#[cfg(feature = "classic")]
+fn f32_of(scope: &mut v8::PinScope<'_, '_>, v: v8::Local<v8::Value>) -> f32 {
+    v.number_value(scope).filter(|n| !n.is_nan()).unwrap_or(0.0) as f32
+}
+
 /// Write a single struct field value (from a V8 value) into a byte buffer in little-endian order.
 /// Used when converting a plain JS object like `{A:255, R:0, G:0, B:0}` to WinRT struct bytes.
 #[cfg(feature = "classic")]
@@ -1407,7 +1474,11 @@ pub(crate) fn append_struct_field_bytes(
     value: v8::Local<v8::Value>,
     native_type: &NativeType,
 ) {
-    let num = value.number_value(scope).unwrap_or(0.0);
+    let num = if value.is_null_or_undefined() {
+        0.0
+    } else {
+        value.number_value(scope).unwrap_or(0.0)
+    };
     match native_type {
         NativeType::F64 => buf.extend_from_slice(&num.to_le_bytes()),
         NativeType::F32 => buf.extend_from_slice(&(num as f32).to_le_bytes()),

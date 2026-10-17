@@ -892,6 +892,43 @@ pub fn box_as_ireference(
 
 // 
 
+/// Boxes a plain object shaped like one of the struct types `IPropertyValue` supports
+/// (`{X,Y}`, `{Width,Height}`, `{X,Y,Width,Height}`, `{Duration}`, `{UniversalTime}`).
+fn box_struct_shape(env: &Env, obj: &JsObject) -> Option<windows::core::IInspectable> {
+    use windows::Foundation::{DateTime, Point, Rect, Size, TimeSpan};
+    let names = obj.get_property_names().ok()?;
+    let len = names.get_array_length().ok()?;
+    let mut keys: Vec<String> = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let k: JsString = names.get_element(i).ok()?;
+        keys.push(k.into_utf8().ok()?.as_str().ok()?.to_owned());
+    }
+    keys.sort();
+    let get = |name: &str| obj.get_named_property::<JsUnknown>(name).ok();
+    let f = |name: &str| {
+        get(name)
+            .and_then(|v| coerce_f64(env, &v))
+            .filter(|n| !n.is_nan())
+            .unwrap_or(0.0) as f32
+    };
+    let i = |name: &str| get(name).map(|v| js_to_i64(env, &v)).unwrap_or(0);
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let boxed = match keys.as_slice() {
+        ["X", "Y"] => PropertyValue::CreatePoint(Point { X: f("X"), Y: f("Y") }),
+        ["Height", "Width"] => PropertyValue::CreateSize(Size { Width: f("Width"), Height: f("Height") }),
+        ["Height", "Width", "X", "Y"] => PropertyValue::CreateRect(Rect {
+            X: f("X"),
+            Y: f("Y"),
+            Width: f("Width"),
+            Height: f("Height"),
+        }),
+        ["Duration"] => PropertyValue::CreateTimeSpan(TimeSpan { Duration: i("Duration") }),
+        ["UniversalTime"] => PropertyValue::CreateDateTime(DateTime { UniversalTime: i("UniversalTime") }),
+        _ => return None,
+    };
+    boxed.ok()?.cast().ok()
+}
+
 pub fn napi_parse_pointer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, AnyError> {
     let vt = value_type(arg)?;
 
@@ -935,6 +972,15 @@ pub fn napi_parse_pointer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, Any
     if vt == ValueType::Boolean {
         let b: JsBoolean = unsafe { arg.cast() };
         if let Ok(inspectable) = PropertyValue::CreateBoolean(b.get_value().unwrap_or(false)) {
+            let ptr = inspectable.as_raw() as *mut c_void;
+            std::mem::forget(inspectable);
+            return Ok(NativeValue { pointer: ptr });
+        }
+    }
+
+    if vt == ValueType::Object {
+        let obj: JsObject = unsafe { arg.cast() };
+        if let Some(inspectable) = box_struct_shape(env, &obj) {
             let ptr = inspectable.as_raw() as *mut c_void;
             std::mem::forget(inspectable);
             return Ok(NativeValue { pointer: ptr });
@@ -1143,7 +1189,10 @@ pub fn append_struct_field_bytes(
     value: &JsUnknown,
     native_type: &NativeType,
 ) {
-    let num = coerce_f64(env, value).unwrap_or(0.0);
+    let num = match value.get_type() {
+        Ok(ValueType::Undefined | ValueType::Null) => 0.0,
+        _ => coerce_f64(env, value).unwrap_or(0.0),
+    };
     match native_type {
         NativeType::F64 => buf.extend_from_slice(&num.to_le_bytes()),
         NativeType::F32 => buf.extend_from_slice(&(num as f32).to_le_bytes()),
@@ -1157,6 +1206,12 @@ pub fn append_struct_field_bytes(
         NativeType::I8 => buf.extend_from_slice(&(num as i8).to_le_bytes()),
         NativeType::U8 => buf.push(num as u8),
         NativeType::Bool => buf.push(if coerce_bool(env, value) { 1u8 } else { 0u8 }),
+        // Ownership moves into the bytes; the struct reader releases it, call args leak it.
+        NativeType::String if matches!(value.get_type(), Ok(ValueType::String)) => {
+            let hstring = ManuallyDrop::new(hstring_from_js_value(env, value));
+            let raw: usize = unsafe { std::mem::transmute_copy(&*hstring) };
+            buf.extend_from_slice(&raw.to_le_bytes());
+        }
         _ => buf.extend(std::iter::repeat(0u8).take(native_type.size())),
     }
 }
@@ -1455,6 +1510,19 @@ pub fn try_unbox_property_value(env: &Env, raw: *mut c_void) -> Option<JsUnknown
             let g = unsafe { pv.GetGuid() }.ok()?;
             env.create_string(&format!("{g:?}")).ok().map(|v| as_unknown(env, v))
         }
+        PropertyType::Point => boxed_struct(env, "Windows.Foundation.Point", &unsafe { pv.GetPoint() }.ok()?),
+        PropertyType::Size => boxed_struct(env, "Windows.Foundation.Size", &unsafe { pv.GetSize() }.ok()?),
+        PropertyType::Rect => boxed_struct(env, "Windows.Foundation.Rect", &unsafe { pv.GetRect() }.ok()?),
+        PropertyType::TimeSpan => boxed_struct(env, "Windows.Foundation.TimeSpan", &unsafe { pv.GetTimeSpan() }.ok()?),
+        PropertyType::DateTime => boxed_struct(env, "Windows.Foundation.DateTime", &unsafe { pv.GetDateTime() }.ok()?),
         _ => None,
     }
+}
+
+/// A boxed struct value (`IReference<Point>` etc.) as the same plain object a struct return gives.
+fn boxed_struct<T>(env: &Env, type_name: &str, value: &T) -> Option<JsUnknown> {
+    let decl = metadata::meta_data_reader::MetadataReader::find_by_name(type_name)?;
+    crate::napi_engine::ns_proxy::create_struct_object_from_raw(env, &decl, value as *const T as *const u8)
+        .ok()
+        .map(|o| as_unknown(env, o))
 }
