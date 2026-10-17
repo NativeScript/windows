@@ -657,11 +657,6 @@ pub(crate) fn try_get_external_handle(env: &Env, obj: &JsObject) -> Option<*mut 
         if let Some(ref instance) = dec.instance {
             return Some(instance.as_raw() as *mut c_void);
         }
-        // Struct objects have no COM instance; return a pointer to the raw byte buffer so
-        // WinRT setters receive the struct data by reference.
-        if let Some((ref buf, _)) = dec.struct_instance {
-            return Some(buf.as_ptr() as *mut c_void);
-        }
         return Some(std::ptr::null_mut());
     }
 

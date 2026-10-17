@@ -782,12 +782,6 @@ fn try_get_external_handle(
             return Some(instance.as_raw() as *mut c_void);
         }
 
-        // Struct objects have no COM instance; return a pointer to the raw
-        // byte buffer so WinRT setters receive the struct data by reference.
-        if let Some((ref buf, _)) = dec.struct_instance {
-            return Some(buf.as_ptr() as *mut c_void);
-        }
-
         return Some(std::ptr::null_mut());
     }
 
@@ -1323,16 +1317,6 @@ pub fn ffi_parse_query_interface_arg(
 
 #[cfg(feature = "classic")]
 #[inline]
-pub fn ffi_parse_buffer_arg(
-    scope: &mut v8::PinScope<'_, '_>,
-    arg: v8::Local<v8::Value>,
-) -> std::result::Result<NativeValue, AnyError> {
-    let (value, _) = ffi_parse_buffer_arg_with_length(scope, arg)?;
-    Ok(value)
-}
-
-#[cfg(feature = "classic")]
-#[inline]
 pub fn ffi_parse_buffer_arg_with_length(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
@@ -1437,6 +1421,12 @@ pub(crate) fn append_struct_field_bytes(
         NativeType::I8 => buf.extend_from_slice(&(num as i8).to_le_bytes()),
         NativeType::U8 => buf.push(num as u8),
         NativeType::Bool => buf.push(if value.boolean_value(scope) { 1u8 } else { 0u8 }),
+        // Leaked: the struct bytes can't own it (same as TypeName synthesis).
+        NativeType::String if value.is_string() => {
+            let hstring = std::mem::ManuallyDrop::new(hstring_from_v8_value(scope, value));
+            let raw: usize = unsafe { std::mem::transmute_copy(&*hstring) };
+            buf.extend_from_slice(&raw.to_le_bytes());
+        }
         _ => buf.extend(std::iter::repeat(0u8).take(native_type.size())),
     }
 }
