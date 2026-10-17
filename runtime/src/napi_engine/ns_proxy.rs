@@ -648,8 +648,32 @@ fn create_enum_object(env: &Env, declaration: &Decl) -> napi::Result<JsObject> {
     Ok(obj)
 }
 
-/// A lazy namespace proxy: `Windows.Data.Json` resolves children through metadata on access.
+/// Defines `name` on `obj` as a read-only, non-enumerable, non-configurable data property.
+fn define_readonly(env: &Env, obj: &JsObject, name: &str, value: &JsUnknown) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    let desc = napi::sys::napi_property_descriptor {
+        utf8name: name.as_ptr(),
+        name: std::ptr::null_mut(),
+        method: None,
+        getter: None,
+        setter: None,
+        value: unsafe { value.raw() },
+        attributes: napi::sys::PropertyAttributes::default,
+        data: std::ptr::null_mut(),
+    };
+    let status = unsafe { napi::sys::napi_define_properties(env.raw(), obj.raw(), 1, &desc) };
+    status == napi::sys::Status::napi_ok
+}
+
+/// A lazy namespace: `Windows.Data.Json` resolves children through metadata on first access.
+/// The object's prototype is the resolving Proxy; each resolved name becomes a read-only own
+/// property, so later reads never reach the Proxy.
 pub fn create_namespace_proxy(env: &Env, full_name: &str) -> napi::Result<JsObject> {
+    let ns = env.create_object()?;
+    define_readonly(env, &ns, "__typeName__", &as_unknown(env, env.create_string(full_name)?));
+
     let mut handler = env.create_object()?;
     let ns_name = full_name.to_string();
 
@@ -659,10 +683,13 @@ pub fn create_namespace_proxy(env: &Env, full_name: &str) -> napi::Result<JsObje
         let Some(prop) = trap_prop(&ctx)? else {
             return undefined_js(env);
         };
-        if prop == "__typeName__" {
-            return Ok(as_unknown(env, env.create_string(&get_ns)?));
+        let value = resolve_member(env, &format!("{}.{}", get_ns, prop))?;
+        if !matches!(value.get_type(), Ok(ValueType::Undefined)) {
+            if let Ok(receiver) = ctx.get::<JsObject>(2) {
+                define_readonly(env, &receiver, &prop, &value);
+            }
         }
-        resolve_member(env, &format!("{}.{}", get_ns, prop))
+        Ok(value)
     })?;
     handler.set_named_property("get", get_fn)?;
 
@@ -678,7 +705,9 @@ pub fn create_namespace_proxy(env: &Env, full_name: &str) -> napi::Result<JsObje
     handler.set_named_property("has", has_fn)?;
 
     let target = as_unknown(env, env.create_object()?);
-    make_proxy(env, target, handler)
+    let proxy = make_proxy(env, target, handler)?;
+    set_prototype_of(env, &as_unknown(env, &ns), &as_unknown(env, proxy))?;
+    Ok(ns)
 }
 
 /// A class constructor proxy: `new` activates an instance; property access resolves statics.
