@@ -20,6 +20,14 @@ check('namespace typeName', Windows.Data.Json.__typeName__, 'Windows.Data.Json')
 check('unknown member', Windows.Data.Json.NoSuchThing, undefined);
 check('has trait', 'Json' in Windows.Data, true);
 
+// Resolved members are cached as read-only own properties (one object per name).
+check('namespace identity', Windows.Data.Json === Windows.Data.Json, true);
+check('enum identity', Windows.UI.Xaml.Visibility === Windows.UI.Xaml.Visibility, true);
+check('cached own property', Object.prototype.hasOwnProperty.call(Windows.Data, 'Json'), true);
+check('not enumerable', Object.keys(Windows.Data).length, 0);
+Windows.Data.Json = 5;
+check('read-only', typeof Windows.Data.Json, 'object');
+
 const { JsonObject, JsonValue } = Windows.Data.Json;
 check('class typeName', JsonObject.__typeName__, 'Windows.Data.Json.JsonObject');
 
