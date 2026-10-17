@@ -47,13 +47,11 @@ fn missing_struct_fields_serialize_as_zero() {
     let mut rt = Runtime::new(".");
     let v = eval(
         &mut rt,
-        "(() => { try {
-            const s = new Windows.Media.Core.TimedTextStyle();
-            s.Padding = { Before: 1, Unit: 1 };
-            return JSON.stringify(s.Padding);
-        } catch (e) { return 'skip'; } })()",
+        "(() => {
+            const r = new Windows.Media.Core.TimedTextRegion();
+            r.Padding = { Before: 1, Unit: 1 };
+            return JSON.stringify(r.Padding);
+        })()",
     );
-    if v != "skip" {
-        assert_eq!(v, r#"{"Before":1,"After":0,"Start":0,"End":0,"Unit":1}"#);
-    }
+    assert_eq!(v, r#"{"Before":1,"After":0,"Start":0,"End":0,"Unit":1}"#);
 }
