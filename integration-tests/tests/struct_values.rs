@@ -82,16 +82,15 @@ fn struct_values_round_trip_through_native() {
     let mut rt = Runtime::new(".");
     let v = eval(
         &mut rt,
-        "(() => { try {
-            const s = new Windows.Media.Core.TimedTextStyle();
-            s.Padding = { Before: 1, After: 2, Start: 3, End: 4, Unit: 1 };
-            const p = s.Padding;
+        "(() => {
+            const r = new Windows.Media.Core.TimedTextRegion();
+            r.Padding = { Before: 1, After: 2, Start: 3, End: 4, Unit: 1 };
+            const p = r.Padding;
             p.End = 9;
-            s.Padding = p;
-            return JSON.stringify(s.Padding);
-        } catch (e) { return 'skip'; } })()",
+            r.Padding = p;
+            // An own property would mean the write never reached native.
+            return JSON.stringify(r.Padding) + ' own=' + r.hasOwnProperty('Padding');
+        })()",
     );
-    if v != "skip" {
-        assert_eq!(v, r#"{"Before":1,"After":2,"Start":3,"End":9,"Unit":1}"#);
-    }
+    assert_eq!(v, r#"{"Before":1,"After":2,"Start":3,"End":9,"Unit":1} own=false"#);
 }
