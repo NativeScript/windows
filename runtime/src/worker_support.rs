@@ -26,6 +26,12 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
                 return { source: input, filename: '[worker:eval]' };
             }
 
+            // A dev server's URL (`new URL('./x.worker.ts', import.meta.url)` under HMR) isn't a
+            // file: the worker's thread imports it, so its own imports resolve against the URL.
+            if (/^https?:\/\//.test(input)) {
+                return { source: '', filename: input };
+            }
+
             if (typeof globalThis.__nsResolveModulePath !== 'function' || typeof globalThis.__nsReadTextFile !== 'function') {
                 throw new Error('Worker file loading is unavailable: missing runtime host hooks');
             }
@@ -89,6 +95,10 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
                 typeof globalThis.__nsWorkerPollMessages === 'function' &&
                 typeof globalThis.__nsWorkerPollMessagesBlocking === 'function' &&
                 typeof globalThis.__nsWorkerTerminate === 'function';
+
+            if (!canUseThreadedHost && /^https?:\/\//.test(resolved.filename)) {
+                throw new Error('Loading a Worker from a URL needs the threaded worker host: ' + resolved.filename);
+            }
 
             var channel    = new MessageChannel();
             var mainPort   = channel.port1;
