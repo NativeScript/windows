@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Windows.ApplicationModel;
 using Microsoft.UI.Dispatching;
@@ -31,7 +32,8 @@ namespace __PROJECT_NAME__
             Shown = 3,
             Hidden = 4,
             UncaughtError = 5,
-            Exit = 6
+            Exit = 6,
+            ExitSupported = 7
         }
 
         public App()
@@ -72,6 +74,8 @@ namespace __PROJECT_NAME__
             try
             {
                 _runtimeHost.RunMainScript();
+                // Tells the app it may end itself (Application.Exit()) once its last window closes.
+                _runtimeHost.NotifyAppEvent((int)AppEventKind.ExitSupported, null);
                 jsError = _runtimeHost.GetLastJsError();
                 if (!string.IsNullOrEmpty(jsError))
                 {
@@ -117,13 +121,35 @@ namespace __PROJECT_NAME__
             }
         }
 
+        // This window is never shown, so it only closes when the app exits. JavaScript ends the app
+        // itself (Application.Exit()) once its last window closes, from inside a callback: the
+        // runtime is still on the stack then, so it is disposed after the current dispatcher work
+        // item has unwound.
         private void OnWindowClosed(object sender, WindowEventArgs e)
         {
             StopPump();
             _runtimeHost.NotifyAppEvent((int)AppEventKind.Exit, null);
             try { ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty; }
             catch (InvalidOperationException) { } // unpackaged: no ApplicationData
+
+            var dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+            if (dispatcherQueue == null || !dispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, Shutdown))
+            {
+                Shutdown();
+            }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern void PostQuitMessage(int exitCode);
+
+        private void Shutdown()
+        {
             _runtimeHost.Dispose();
+
+            // WinUI ignores Application.Exit() while no activated window is open
+            // (microsoft-ui-xaml#5931), which is the case once the app's windows have all closed,
+            // so the message loop is ended directly.
+            PostQuitMessage(0);
         }
 
         private void OnWindowActivated(object sender, WindowActivatedEventArgs e)
