@@ -249,6 +249,24 @@ fn http_import_failures_reject_with_the_cause() {
 }
 
 #[test]
+fn worker_entry_served_over_http() {
+    let server = TestServer::start();
+    let o = server.origin.clone();
+    server.route("/ns/m/echo.worker.js", "text/javascript", "import { add } from './add.js';\nself.onmessage = (event) => self.postMessage(add(event.data));");
+    server.route("/ns/m/add.js", "text/javascript", "export const add = (n) => n + 1;");
+    let mut runtime = Runtime::new(".");
+    runtime.register_delegate_isolate_ptr();
+    let run = |path: &str| {
+        format!(
+            "new Promise((resolve, reject) => {{ const worker = new Worker(new URL('{o}{path}')); worker.onmessage = (event) => {{ worker.terminate(); event.type === 'messageerror' ? reject(event.error) : resolve(event.data); }}; worker.postMessage(41); }})"
+        )
+    };
+    assert_eq!(await_js(&mut runtime, &run("/ns/m/echo.worker.js")), "ok:42");
+    let missing = await_js(&mut runtime, &run("/ns/m/missing.worker.js"));
+    assert!(missing.starts_with("err:") && missing.contains("status=404"), "{missing}");
+}
+
+#[test]
 fn native_websocket_round_trip() {
     let server = TestServer::start();
     let ws = server.origin.replacen("http://", "ws://", 1);

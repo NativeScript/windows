@@ -173,7 +173,11 @@ fn worker_bootstrap_script(source: &str, filename: &str) -> Result<String, Strin
                     }});
                 }};
 
-                if (typeof globalThis.__nsEvalAsModule === 'function') {{
+                if (/^https?:\/\//.test(__workerFilename)) {{
+                    import(__workerFilename).catch(function (error) {{
+                        __queueMessage({{ __workerError: String((error && error.message) || error) }});
+                    }});
+                }} else if (typeof globalThis.__nsEvalAsModule === 'function') {{
                     globalThis.__nsEvalAsModule(__workerSource, __workerFilename || '[worker]');
                 }} else {{
                     const exec = new Function('__filename', __workerSource);
