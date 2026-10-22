@@ -98,6 +98,9 @@ namespace __PROJECT_NAME__
             void ShowMainWindow()
             {
                 StartPump();
+#if DEBUG
+                _runtimeHost.WatchLiveSync(DispatcherQueue.GetForCurrentThread());
+#endif
 
                 try
                 {
