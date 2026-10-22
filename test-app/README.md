@@ -43,6 +43,7 @@ The script prints the log and exits non-zero when any spec failed.
 | `threading.js` | WinRT and .NET callbacks invoked on background threads are delivered on the JS thread that created them (the UI thread or a worker). Return values and exceptions flow back to the native caller. Worker specs are skipped on engines without workers. |
 | `boxing.js` | Values in `Object`-typed members (`Tag`, `PropertySet`) read back as JS primitives. |
 | `lifetime.js` | JS subclass instances that nothing references are collected on both sides. An instance only native code holds keeps working, with its JS object revived. WinRT UI subclasses in the visual tree keep their fields. Needs `gc()`, so it is skipped on engines that don't expose it. |
+| `winrt-async.js` | `NSWinRT.toPromise` on `IAsyncAction`/`IAsyncOperation<T>`: results and rejection. Operations are not thenable, so promises keep the operation itself, and they expose the `IAsyncInfo` members they inherit (`Status`, `Cancel`). |
 | `layout-mutation.js` | Adding, removing and reparenting XAML elements synchronously from `SizeChanged`, `LayoutUpdated` and `CompositionTarget.Rendering`, and from promise continuations scheduled there. |
 
 Each spec asserts behaviour that works the same way on iOS and Android.

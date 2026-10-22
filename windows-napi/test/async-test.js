@@ -34,6 +34,26 @@ async function main() {
   let ran3 = false;
   await toPromise(ThreadPool.RunAsync(() => { ran3 = true; }));
   check('auto-pump transparent await', ran3 === true);
+
+  // IAsyncOperation<T>: toPromise resolves to GetResults() and rejects on failure.
+  const StorageFolder = Windows.Storage.StorageFolder;
+  const folder = await toPromise(StorageFolder.GetFolderFromPathAsync('C:\\Windows'));
+  check('toPromise(IAsyncOperation<T>) resolves to GetResults()', folder && folder.Name === 'Windows');
+
+  let rejected = false;
+  try {
+    await toPromise(StorageFolder.GetFolderFromPathAsync('C:\\ns-does-not-exist-7f3a'));
+  } catch (_) {
+    rejected = true;
+  }
+  check('toPromise of a failing operation rejects', rejected);
+
+  // Operations are not thenable, so they stay operations and can be passed back to native.
+  const op = StorageFolder.GetFolderFromPathAsync('C:\\Windows');
+  check('operation is not thenable', typeof op.then === 'undefined');
+  check('Promise.resolve keeps the operation', (await Promise.resolve(op)) === op);
+  check('operation exposes IAsyncInfo.Status', typeof op.Status === 'number');
+  await toPromise(op);
   disableAutoPump();
 
   console.log(`\n${pass} passed, ${fail} failed`);

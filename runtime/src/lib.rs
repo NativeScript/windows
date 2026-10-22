@@ -2738,6 +2738,31 @@ fn install_interface_prototype_members(
 ) {
     // One prototype slot per name (a repeated descriptor aborts V8 at instantiation).
     let mut seen: AHashSet<String> = AHashSet::new();
+    install_interface_members_into(scope, proto, clazz, iid, type_args, fallback, &mut seen);
+}
+
+/// Names install_interface_members_into puts on the prototype, required interfaces included.
+#[cfg(feature = "classic")]
+fn collect_interface_member_names(clazz: &dyn BaseClassDeclarationImpl, names: &mut AHashSet<String>) {
+    names.extend(clazz.methods().iter().map(|m| m.name().to_string()));
+    names.extend(clazz.properties().iter().map(|p| p.name().to_string()));
+    for iface in clazz.implemented_interfaces() {
+        collect_interface_member_names(iface, names);
+    }
+}
+
+/// Installs `clazz`'s members, then those of the interfaces it requires (IAsyncInfo.Status on
+/// an IAsyncOperation), each called through its own IID. Names already in `seen` win.
+#[cfg(feature = "classic")]
+fn install_interface_members_into(
+    scope: &mut v8::PinScope<'_, '_>,
+    proto: Local<v8::ObjectTemplate>,
+    clazz: &dyn BaseClassDeclarationImpl,
+    iid: GUID,
+    type_args: &[String],
+    fallback: &Option<IUnknown>,
+    seen: &mut AHashSet<String>,
+) {
     for method in clazz.methods().iter() {
         if method.is_static() {
             continue;
@@ -2894,6 +2919,11 @@ fn install_interface_prototype_members(
             setter,
             v8::PropertyAttribute::NONE,
         );
+    }
+
+    for iface in clazz.implemented_interfaces() {
+        let child_args = extract_generic_type_args(iface.full_name());
+        install_interface_members_into(scope, proto, iface, iface.id(), &child_args, fallback, seen);
     }
 }
 
@@ -4322,12 +4352,9 @@ fn create_ns_ctor_instance_object<'a>(
                 // must not shadow them on the prototype, which is how a non-masking wrapper
                 // gives the interface's own members priority.
                 let own_names: AHashSet<String> = if iface_proto.is_some() {
-                    clazz
-                        .methods()
-                        .iter()
-                        .map(|m| m.name().to_string())
-                        .chain(clazz.properties().iter().map(|p| p.name().to_string()))
-                        .collect()
+                    let mut names = AHashSet::new();
+                    collect_interface_member_names(clazz, &mut names);
+                    names
                 } else {
                     AHashSet::new()
                 };

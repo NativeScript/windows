@@ -20,6 +20,7 @@ const specs = [
 	"./tests/boxing.js",
 	"./tests/layout-mutation.js",
 	"./tests/lifetime.js",
+	"./tests/winrt-async.js",
 ];
 
 function env(name) {
