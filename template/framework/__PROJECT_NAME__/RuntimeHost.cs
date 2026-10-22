@@ -123,8 +123,60 @@ namespace __PROJECT_NAME__
         private const string InspectorMarker = "ns-inspector";
         private const string DebugBreakMarker = "ns-debugbreak";
         private const string DebuggerStartedMarker = "ns-debugger-started";
+        // The CLI writes LiveSyncMarker after syncing files into app\ (webpack HMR), but only
+        // while LiveSyncReadyMarker says this host is watching for it.
+        private const string LiveSyncMarker = "ns-livesync";
+        private const string LiveSyncReadyMarker = "ns-livesync-ready";
 
         private bool _waitForDebugger;
+        private FileSystemWatcher _liveSyncWatcher;
+
+        /// Applies CLI file syncs while the app runs, by calling global.__onLiveSync() on the UI
+        /// thread, as the Android and iOS runtimes do after a LiveSync.
+        public void WatchLiveSync(Microsoft.UI.Dispatching.DispatcherQueue dispatcherQueue)
+        {
+            if (!_initialized || _liveSyncWatcher != null || dispatcherQueue == null) return;
+            try
+            {
+                DeleteMarker(LiveSyncMarker);
+                var watcher = new FileSystemWatcher(LocalFolderPath, LiveSyncMarker)
+                {
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
+                };
+                FileSystemEventHandler onMarker = (_, _) => dispatcherQueue.TryEnqueue(ApplyLiveSync);
+                watcher.Created += onMarker;
+                watcher.Changed += onMarker;
+                watcher.EnableRaisingEvents = true;
+                _liveSyncWatcher = watcher;
+                WriteMarker(LiveSyncReadyMarker, "");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[NativeScript LiveSync] Watch failed: {ex.Message}");
+            }
+        }
+
+        private void ApplyLiveSync()
+        {
+            // One write raises several events; the first one consumes the marker.
+            if (!_initialized || !ConsumeMarker(LiveSyncMarker)) return;
+            try
+            {
+                runtime_runscript(_runtime, "typeof __onLiveSync === 'function' && __onLiveSync();", "ns-livesync.js");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[NativeScript LiveSync] Apply failed: {ex.Message}");
+            }
+        }
+
+        private void StopWatchingLiveSync()
+        {
+            if (_liveSyncWatcher == null) return;
+            _liveSyncWatcher.Dispose();
+            _liveSyncWatcher = null;
+            DeleteMarker(LiveSyncReadyMarker);
+        }
 
         public string DevtoolsFrontendUrl { get; private set; }
 
@@ -235,6 +287,7 @@ namespace __PROJECT_NAME__
             }
             catch { }
             DeleteMarker(DebuggerStartedMarker);
+            DeleteMarker(LiveSyncReadyMarker);
             var debugBreak = ConsumeMarker(DebugBreakMarker);
             if (ConsumeMarker(InspectorMarker) || debugBreak)
             {
@@ -476,6 +529,9 @@ namespace __PROJECT_NAME__
         public void Dispose()
         {
             if (!_initialized) return;
+#if DEBUG
+            StopWatchingLiveSync();
+#endif
             runtime_deinit(_runtime);
             _runtime = 0;
             _initialized = false;
