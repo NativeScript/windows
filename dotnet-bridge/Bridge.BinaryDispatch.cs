@@ -147,7 +147,8 @@ public static partial class Bridge
 
             var callbackId = r.ReadI32();
             var ctorArgs = r.HasMore ? r.ReadArgs() : [];
-            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId, interfaceNames, memberNames, ctorArgs);
+            var className = r.HasMore ? r.ReadName16() : "";
+            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId, interfaceNames, memberNames, ctorArgs, className);
         }
 
         if (op == 0x0B) // get CLR-only property by raw IInspectable ptr (CLR reflection fallback)

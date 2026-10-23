@@ -344,6 +344,37 @@ describe("C# subclasses", () => {
 	});
 });
 
+describe("JS classes created by .NET code", () => {
+	class Robot extends I().Shape {
+		init() {
+			this.ready = true;
+		}
+		Draw() {
+			return this.ready ? "robot" : "not ready";
+		}
+	}
+
+	it("gives a JS class a .NET type named after it", () => {
+		const type = NSWinRT.dotnet.typeOf(Robot);
+		expect(type.FullName).toBe("NSWinRTDynamicProxies.Robot");
+		expect(I().Factories.TypeName(new Robot())).toBe("NSWinRTDynamicProxies.Robot");
+	});
+
+	it("makes a JS object for an instance .NET code creates", () => {
+		const made = I().Factories.Create(NSWinRT.dotnet.typeOf(Robot));
+		expect(made instanceof Robot).toBe(true);
+		expect(made.ready).toBe(true);
+		expect(I().Factories.Draw(made)).toBe("robot");
+	});
+
+	it("lets .NET code find the type by name", () => {
+		NSWinRT.dotnet.typeOf(Robot);
+		const made = I().Factories.CreateByName("NSWinRTDynamicProxies.Robot, NSWinRTDynamicProxies");
+		expect(made instanceof Robot).toBe(true);
+		expect(made.Draw()).toBe("robot");
+	});
+});
+
 describe("Loading assemblies", () => {
 	it("loads an assembly at runtime and makes its types reachable", () => {
 		const dir = System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory();

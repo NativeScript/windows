@@ -491,6 +491,7 @@ public static partial class Bridge
         {
             var requested = new AssemblyName(args.Name).Name;
             if (string.IsNullOrEmpty(requested)) return null;
+            if (requested == "NSWinRTDynamicProxies") return s_dynamicAssembly;
 
             if (s_assemblyLoadCache.TryGetValue(requested, out var cached)) return cached;
 

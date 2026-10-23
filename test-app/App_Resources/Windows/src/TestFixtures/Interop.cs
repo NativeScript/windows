@@ -228,6 +228,18 @@ namespace TestFixtures.Interop
         public abstract string Draw();
     }
 
+    // .NET code creating instances of JS classes, by type or by name.
+    public static class Factories
+    {
+        public static object Create(Type type) => Activator.CreateInstance(type)!;
+
+        public static object CreateByName(string name) => Activator.CreateInstance(Type.GetType(name, throwOnError: true)!)!;
+
+        public static string Draw(Shape shape) => shape.Draw();
+
+        public static string TypeName(object value) => value.GetType().FullName!;
+    }
+
     public static class Values
     {
         public static (int, string) Pair() => (1, "one");

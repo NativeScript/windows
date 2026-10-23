@@ -870,11 +870,19 @@ fn native_create_js_subclass(ctx: &CallContext) -> napi::Result<JsUnknown> {
     }
     req.extend_from_slice(&cb_id.to_le_bytes());
     // Constructor arguments (optional 6th argument, an array) for the base constructor.
+    let class_name = if ctx.length > 6 {
+        let v = ctx.get::<JsUnknown>(6)?;
+        matches!(v.get_type(), Ok(ValueType::String)).then(|| js_to_rust_string(env, &v))
+    } else {
+        None
+    };
+    let mut wrote_args = false;
     if ctx.length > 5 {
         let ctor_args = ctx.get::<JsUnknown>(5)?;
         if let Some(len) = napi_array_length(env, &ctor_args) {
             let len = len.min(255);
             req.push(len as u8);
+            wrote_args = true;
             for k in 0..len {
                 match napi_array_get(env, &ctor_args, k) {
                     Some(v) => napi_bin_write_arg(env, &mut req, &v),
@@ -882,6 +890,13 @@ fn native_create_js_subclass(ctx: &CallContext) -> napi::Result<JsUnknown> {
                 }
             }
         }
+    }
+    // The JS class's name (optional 7th argument), which its .NET type is named after.
+    if let Some(name) = class_name {
+        if !wrote_args {
+            req.push(0);
+        }
+        crate::dotnet::bin_write_str16(&mut req, name.as_bytes());
     }
 
     release_collected_js_callbacks();

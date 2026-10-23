@@ -17,7 +17,7 @@ public static partial class Bridge
     // The types behind JS subclasses, emitted at runtime. Keyed by base type PLUS the exact set of
     // interfaces/members a JS class asked for, so different JS subclasses of the same base type
     // (different override sets) get distinct emitted types.
-    private readonly record struct ProxyTypeKey(Type BaseType, string InterfaceKey, string MemberKey);
+    private readonly record struct ProxyTypeKey(Type BaseType, string InterfaceKey, string MemberKey, string ClassName);
     private static readonly ConcurrentDictionary<ProxyTypeKey, Type> s_dynamicProxyCache = new();
     private static int s_dynamicProxyTypeCounter = 0;
     private static readonly AssemblyBuilder? s_dynamicAssembly = CreateDynamicAssembly();
@@ -74,6 +74,46 @@ public static partial class Bridge
         {
             ProxySetProperty(instance, propertyName, value);
         }
+
+        // Called by every emitted constructor. An instance .NET code created (not JS) gets its JS
+        // object from the factory registered for its type.
+        public static void Constructed(object instance)
+        {
+            if (s_pendingProxyCallbackId.Value.HasValue || IsJsBacked(instance)) return;
+            if (!s_nativeFactories.TryGetValue(instance.GetType(), out var factory))
+                throw new InvalidOperationException($"{instance.GetType().FullName} is a JS class: register it with NSWinRT.dotnet.typeOf() before .NET code creates it");
+            CallJsCallback(factory, [new HandleRef(HandleFor(instance))], expectsResult: false);
+            if (!IsJsBacked(instance))
+                throw new InvalidOperationException($"The JS class behind {instance.GetType().FullName} did not create its instance");
+        }
+    }
+
+    // Factory callback per emitted type, for instances .NET code creates.
+    private static readonly ConcurrentDictionary<Type, int> s_nativeFactories = new();
+
+    /// `NSWinRT.dotnet.typeOf(JsClass)`: the class's emitted type, which .NET code can then create;
+    /// `factory` makes the JS object of each such instance.
+    public static Type RegisterJsClass(string baseTypeName, string[] interfaceNames, string[] memberNames, string className, JsFunctionRef factory)
+    {
+        var baseType = ResolveType(null, baseTypeName) ?? throw new TypeLoadException($"Type not found: {baseTypeName}");
+        var interfaces = interfaceNames.ToList();
+        if (baseType.IsInterface)
+        {
+            interfaces.Insert(0, baseType.FullName!);
+            baseType = typeof(object);
+        }
+        var type = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames, className);
+        s_nativeFactories[type] = factory.Id;
+        return type;
+    }
+
+    /// The factory's half: ties the instance behind `handle` to the JS object's dispatcher.
+    public static void AdoptJsInstance(int handle, JsFunctionRef dispatcher)
+    {
+        if (!s_handles.TryGetValue(handle, out var instance) || instance is null)
+            throw new KeyNotFoundException($"Invalid handle {handle}");
+        RegisterJsBacked(instance, dispatcher.Id);
+        if (s_proxyCallbacks.TryGetValue(instance, out var holder)) holder.HandleId = handle;
     }
     // Ties a JS-backed instance to its JS dispatcher (and the handle its JS object holds). Lives as
     // long as the instance (ConditionalWeakTable value); when the instance is collected the runtime
@@ -89,15 +129,32 @@ public static partial class Bridge
     private static readonly ConditionalWeakTable<object, ProxyCallbackHolder> s_proxyCallbacks = new();
     private static readonly ThreadLocal<int?> s_pendingProxyCallbackId = new(() => null);
 
-    private static Type GetOrCreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames)
+    private static Type GetOrCreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames, string className = "")
     {
         var interfaceKey = string.Join(",", interfaceNames.OrderBy(n => n, StringComparer.Ordinal));
         var memberKey = string.Join(",", memberNames.OrderBy(n => n, StringComparer.Ordinal));
-        var key = new ProxyTypeKey(baseType, interfaceKey, memberKey);
-        return s_dynamicProxyCache.GetOrAdd(key, _ => CreateDynamicProxyType(baseType, interfaceNames, memberNames));
+        var key = new ProxyTypeKey(baseType, interfaceKey, memberKey, className);
+        return s_dynamicProxyCache.GetOrAdd(key, _ => CreateDynamicProxyType(baseType, interfaceNames, memberNames, className));
     }
 
-    private static Type CreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames)
+    private static readonly HashSet<string> s_usedProxyNames = new(StringComparer.Ordinal);
+
+    // `NSWinRTDynamicProxies.<ClassName>` (numbered on clashes), so .NET code can find the type by
+    // name. Unnamed classes are named after their base type.
+    private static string ProxyTypeName(Type baseType, string className)
+    {
+        var safe = new string(className.Where(c => char.IsLetterOrDigit(c) || c == '_').ToArray());
+        if (safe.Length == 0 || char.IsDigit(safe[0]))
+            return $"NSWinRTDynamicProxies.{(baseType.FullName ?? "Type").Replace('.', '_').Replace('+', '_')}_JsProxy_{Interlocked.Increment(ref s_dynamicProxyTypeCounter)}";
+        lock (s_usedProxyNames)
+        {
+            var name = "NSWinRTDynamicProxies." + safe;
+            for (int n = 2; !s_usedProxyNames.Add(name); n++) name = $"NSWinRTDynamicProxies.{safe}{n}";
+            return name;
+        }
+    }
+
+    private static Type CreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames, string className)
     {
 
         if (s_dynamicModule == null)
@@ -115,9 +172,7 @@ public static partial class Bridge
         // the vtable (no "call base" IL needed, the base method was simply never touched).
         var memberSet = new HashSet<string>(memberNames, StringComparer.Ordinal);
 
-        var safeName = (baseType.FullName ?? Guid.NewGuid().ToString()).Replace('.', '_');
-        var uniqueSuffix = Interlocked.Increment(ref s_dynamicProxyTypeCounter);
-        var typeName = $"NSWinRTDynamicProxies.{safeName}_JsProxy_{uniqueSuffix}";
+        var typeName = ProxyTypeName(baseType, className);
 
         var tb = s_dynamicModule.DefineType(typeName, TypeAttributes.Public | TypeAttributes.Class, baseType);
 
@@ -152,6 +207,8 @@ public static partial class Bridge
                 }
             }
             ilg.Emit(OpCodes.Call, bc);
+            ilg.Emit(OpCodes.Ldarg_0);
+            ilg.Emit(OpCodes.Call, typeof(ProxyRuntime).GetMethod(nameof(ProxyRuntime.Constructed))!);
             ilg.Emit(OpCodes.Ret);
         }
 
@@ -390,14 +447,14 @@ public static partial class Bridge
 
     private static DispatchResult CreateJsSubclass(
         string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames)
-        => CreateJsSubclass(assemblyName, typeName, callbackId, interfaceNames, memberNames, []);
+        => CreateJsSubclass(assemblyName, typeName, callbackId, interfaceNames, memberNames, [], "");
 
     // Creates an instance of a JS subclass: a dynamic subclass of the base type (or of System.Object
     // when the "base" is an interface being implemented) whose overridden virtuals and interface
     // members call the JS object registered under `callbackId`. `ctorArgs` select and feed the
     // base constructor, as `super(...)` arguments do on Android/iOS.
     private static DispatchResult CreateJsSubclass(
-        string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames, object?[] ctorArgs)
+        string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames, object?[] ctorArgs, string className)
     {
         // `typeName` is the base type; older runtimes passed an auto-generated proxy name there and
         // the base type in `assemblyName`.
@@ -414,7 +471,7 @@ public static partial class Bridge
         if (baseType.IsSealed)
             throw new InvalidOperationException($"{baseType.FullName} is sealed and can't be extended.");
 
-        var proxyType = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames);
+        var proxyType = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames, className);
 
         // Pick the constructor by argument count, preferring one whose parameters the arguments
         // convert to.

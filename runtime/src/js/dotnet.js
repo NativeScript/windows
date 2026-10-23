@@ -875,9 +875,35 @@
         var self = Object.create(proto);
         // A virtual the base constructor calls reaches `self` before it has its handle.
         var entry = { proto: proto, baseProto: baseProto, typeName: path, overrides: info.overrides, winrt: false, ref: self };
-        var raw = globalThis.__nsDotNetCreateJsSubclass('', path, info.interfaces, info.members, _makeDispatcher(entry), args.map(_unwrap));
+        var raw = globalThis.__nsDotNetCreateJsSubclass('', path, info.interfaces, info.members, _makeDispatcher(entry), args.map(_unwrap), _className(proto));
         if (!raw || typeof raw.__handle !== 'number') throw new Error('Could not create an instance of a subclass of ' + path);
         return _adopt(entry, self, raw);
+    }
+
+    // The name of the JS class `proto` belongs to (its .NET type is named after it), or ''.
+    function _className(proto) {
+        var ctor = proto && Object.prototype.hasOwnProperty.call(proto, 'constructor') ? proto.constructor : null;
+        return ctor && typeof ctor.name === 'string' ? ctor.name : '';
+    }
+
+    // The .NET type of a JS class extending a .NET type, named NSWinRTDynamicProxies.<ClassName>.
+    // .NET code can create it; each such instance gets a JS object whose `init()` runs (not its
+    // constructor).
+    function _typeOf(Cls) {
+        var base = typeof Cls === 'function' ? Object.getPrototypeOf(Cls) : null;
+        while (base && typeof base.__dotnetType__ !== 'string') base = Object.getPrototypeOf(base);
+        if (!base) throw new TypeError('NSWinRT.dotnet.typeOf: expected a JS class extending a .NET type');
+        var path = base.__dotnetType__;
+        var baseProto = _typePrototype(path);
+        var info = _subclassInfo(Cls.prototype, baseProto);
+        var factory = function (raw) {
+            var self = Object.create(Cls.prototype);
+            var entry = { proto: Cls.prototype, baseProto: baseProto, typeName: path, overrides: info.overrides, winrt: false, ref: self };
+            _bridgeCall('AdoptJsInstance', [raw.__handle, _makeDispatcher(entry)]);
+            _adopt(entry, self, raw);
+            if (typeof self.init === 'function') self.init();
+        };
+        return _wrap(_bridgeCall('RegisterJsClass', [path, info.interfaces, info.members, _className(Cls.prototype), factory]));
     }
 
     // `new SomeInterface({ ... })`: an object implementing the interface with the given members.
@@ -1053,7 +1079,7 @@
         var baseProto = base ? base.prototype : null;
         var info = _subclassInfo(proto, baseProto);
         var entry = { proto: proto, baseProto: baseProto, typeName: typeName, overrides: info.overrides, winrt: true, constructing: true };
-        var raw = globalThis.__nsDotNetCreateJsSubclass('', typeName, info.interfaces, info.members, _makeDispatcher(entry), (args || []).map(_unwrap));
+        var raw = globalThis.__nsDotNetCreateJsSubclass('', typeName, info.interfaces, info.members, _makeDispatcher(entry), (args || []).map(_unwrap), _className(proto));
         entry.constructing = false;
         if (!raw || raw.__native_ptr === undefined || raw.__native_ptr === null)
             throw new Error('Could not create a WinRT object for a subclass of ' + typeName);
@@ -1066,6 +1092,7 @@
     };
 
     globalThis.NSWinRT.extendClass = _extendClass;
+    globalThis.NSWinRT.dotnet.typeOf = _typeOf;
 
     // System.Diagnostics.Stopwatch.StartNew()    →  static method call
     // System.Environment.MachineName             →  static property get

@@ -3230,6 +3230,7 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     req.extend_from_slice(&cb_id.to_le_bytes());
     // Constructor arguments (optional 6th argument, an array): forwarded to the matching base
     // constructor, as `super(...)` arguments are on Android/iOS.
+    let class_name = args.get(6).is_string().then(|| args.get(6).to_rust_string_lossy(scope));
     if let Ok(ctor_args) = v8::Local::<v8::Array>::try_from(args.get(5)) {
         let count = ctor_args.length().min(255);
         req.push(count as u8);
@@ -3237,6 +3238,12 @@ pub(crate) fn handle_dotnet_create_js_subclass(
             let value = ctor_args.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
             bin_write_v8_arg(&mut req, scope, value);
         }
+    } else if class_name.is_some() {
+        req.push(0);
+    }
+    // The JS class's name (optional 7th argument), which its .NET type is named after.
+    if let Some(name) = class_name {
+        bin_write_str16(&mut req, name.as_bytes());
     }
 
     release_collected_js_callbacks();
