@@ -159,6 +159,22 @@
   <ItemGroup>
     <_DotNetBridgeSources Include="$(NSWindowsRoot)\dotnet-bridge\*.cs" />
   </ItemGroup>
+
+  <!--
+    @nativescript/windows-hermes: Release builds compile the app's JavaScript to Hermes bytecode
+    (tools\hermes-precompile.ps1), so a launch doesn't compile the bundle again. Only that
+    framework ships tools\hermesc.exe.
+  -->
+  <Target Name="PrecompileHermesBytecode"
+          BeforeTargets="AssignTargetPaths"
+          Condition="'$(Configuration)' == 'Release' and Exists('$(NSWindowsRoot)\tools\hermesc.exe') and Exists('app') and !Exists('app.nsbundle')">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(NSWindowsRoot)\tools\hermes-precompile.ps1&quot; -AppDir &quot;$(MSBuildProjectDirectory)\app&quot; -Hermesc &quot;$(NSWindowsRoot)\tools\hermesc.exe&quot; -Optimize" />
+    <ItemGroup>
+      <Content Include="app\**\*.hbc" Exclude="@(Content)">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+  </Target>
   <Target Name="PublishDotNetBridge"
           BeforeTargets="Build"
           Inputs="$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj;

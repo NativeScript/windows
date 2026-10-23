@@ -26,6 +26,11 @@ and what that trades off.
 | `hermes.lib` | ~72 KB | Import library for `hermes.dll` |
 | `napi_symbols.txt` | — | Same export list as the `icu` variant (diffed identical, byte-for-byte after filtering the one regex false-positive below) |
 
+### `x64/tools/` — from the same package's `tools/native/release/x64`
+| File | Size | Purpose |
+|---|---|---|
+| `hermesc.exe` | ~3.6 MB | Hermes bytecode compiler. `build.rs` copies it beside the engine DLLs and `template/build.ps1 -Engine hermes` stages it in the framework's `tools/`, where Release app builds run it (`tools/hermes-precompile.ps1`) so a launch runs `<file>.hbc` instead of compiling the bundle. It must come from the same package version as `hermes.dll`: bytecode is version-specific. |
+
 `include/` (shared by both variants) holds the matching headers (`hermes/js_runtime_api.h`,
 `node-api/js_native_api.h`) for reference; the host declares the `jsr_*` FFI directly.
 
@@ -51,6 +56,10 @@ llvm-objdump -p x64/icu/hermes.dll | grep -oE 'napi_[a-z0-9_]+' | sort -u > x64/
 unzip -o hermes.nupkg 'build/native/uwp/x64/*'
 cp build/native/uwp/x64/{hermes.dll,hermes.lib} x64/no-icu/
 llvm-objdump -p x64/no-icu/hermes.dll | grep -oE 'napi_[a-z0-9_]+' | sort -u > x64/no-icu/napi_symbols.txt
+
+# bytecode compiler:
+unzip -o hermes.nupkg 'tools/native/release/x64/hermesc.exe'
+cp tools/native/release/x64/hermesc.exe x64/tools/
 ```
 
 `napi_symbols.txt` is the list of `napi_*` exports that `build.rs` forward-exports from the host exe

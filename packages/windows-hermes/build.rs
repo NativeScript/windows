@@ -42,6 +42,8 @@ fn main() {
         for dll in dlls {
             let _ = std::fs::copy(libdir.join(dll), profile_dir.join(dll));
         }
+        // The bytecode compiler the app build runs (template/framework/tools/hermes-precompile.ps1).
+        let _ = std::fs::copy("vendor/x64/tools/hermesc.exe", profile_dir.join("hermesc.exe"));
     }
 
     println!("cargo:rerun-if-changed=vendor/x64/icu/napi_symbols.txt");

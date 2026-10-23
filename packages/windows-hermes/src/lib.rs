@@ -34,6 +34,15 @@ pub mod ffi {
             result: *mut napi_value,
         ) -> i32;
         pub fn jsr_drain_microtasks(env: napi_env, max_count_hint: i32, result: *mut bool) -> i32;
+        pub fn jsr_run_script_buffer(
+            env: napi_env,
+            script_data: *const u8,
+            script_length: usize,
+            script_delete_cb: Option<DataDelete>,
+            deleter_data: *mut c_void,
+            source_url: *const c_char,
+            result: *mut napi_value,
+        ) -> i32;
         pub fn jsr_config_set_script_cache(
             config: *mut c_void,
             script_cache_data: *mut c_void,
@@ -100,7 +109,7 @@ mod script_cache {
         Some(PathBuf::from(dir).join("hermes-cache").join(format!("{name}.{hash:016x}.{version:x}.{tag}.hbc")))
     }
 
-    unsafe extern "C" fn free_bytes(data: *mut c_void, deleter_data: *mut c_void) {
+    pub(crate) unsafe extern "C" fn free_bytes(data: *mut c_void, deleter_data: *mut c_void) {
         let _ = data;
         drop(Box::from_raw(deleter_data as *mut Vec<u8>));
     }
@@ -200,10 +209,84 @@ pub unsafe fn create_runtime_env() -> Option<(*mut c_void, napi_env, *mut c_void
     Some((runtime, env_raw, scope))
 }
 
+/// What the prelude's `require` wraps a CommonJS module in (see `__nsCompileScript`).
+const CJS_WRAPPER_HEAD: &str = "(function (module, exports, require, __filename, __dirname) {";
+
+/// Bytecode the app build made with hermesc for `source_path`, unless older than the script:
+/// `<file>.hbc` for a script run as is, `<file>.cjs.hbc` for one compiled in the CommonJS wrapper.
+/// Hermes's own cache skips large scripts, which it compiles lazily.
+fn precompiled(source_path: &str, suffix: &str) -> Option<Vec<u8>> {
+    if source_path.is_empty() {
+        return None;
+    }
+    let hbc = format!("{source_path}{suffix}");
+    let hbc_time = std::fs::metadata(&hbc).and_then(|m| m.modified()).ok()?;
+    let source_time = std::fs::metadata(source_path).and_then(|m| m.modified()).ok()?;
+    if hbc_time < source_time {
+        return None;
+    }
+    std::fs::read(hbc).ok().filter(|b| !b.is_empty())
+}
+
+/// Runs Hermes bytecode as the script `url`.
+unsafe fn run_bytecode(env: napi_env, bytecode: Vec<u8>, url: &std::ffi::CStr, result: *mut napi_value) -> i32 {
+    let boxed = Box::new(bytecode);
+    let (data, len) = (boxed.as_ptr(), boxed.len());
+    ffi::jsr_run_script_buffer(
+        env,
+        data,
+        len,
+        Some(script_cache::free_bytes),
+        Box::into_raw(boxed) as *mut c_void,
+        url.as_ptr(),
+        result,
+    )
+}
+
+/// Run the app's entry script: its precompiled bytecode when the build made it, else `code`.
+pub fn run_entry_script(env: &napi::Env, code: &str, filename: &str) -> Result<String, String> {
+    use napi::NapiRaw;
+    if let (Some(bytecode), Ok(url)) = (precompiled(filename, ".hbc"), std::ffi::CString::new(filename)) {
+        let mut result: napi_value = std::ptr::null_mut();
+        let status = unsafe { run_bytecode(env.raw(), bytecode, &url, &mut result) };
+        if status == napi::sys::Status::napi_ok {
+            return Ok(String::new());
+        }
+        return Err(pending_exception_message(env).unwrap_or_else(|| format!("jsr_run_script_buffer status {status}")));
+    }
+    run_script(env, code)
+}
+
+fn pending_exception_message(env: &napi::Env) -> Option<String> {
+    use napi::{JsUnknown, NapiRaw, NapiValue};
+    let mut is_pending = false;
+    unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut is_pending) };
+    if !is_pending {
+        return None;
+    }
+    let mut err: napi_value = std::ptr::null_mut();
+    unsafe { napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut err) };
+    unsafe { JsUnknown::from_raw_unchecked(env.raw(), err) }
+        .coerce_to_string()
+        .and_then(|s| s.into_utf8())
+        .and_then(|s| Ok(format!("JS exception: {}", s.as_str()?)))
+        .ok()
+}
+
 /// Evaluate `code` as a script named `filename` for the module runner, returning its completion
 /// value. On failure Hermes's exception is left pending.
 pub fn eval_named(env: &napi::Env, code: &str, filename: &str) -> Result<napi_value, ()> {
     use napi::NapiRaw;
+    if code.starts_with(CJS_WRAPPER_HEAD) {
+        if let (Some(bytecode), Ok(url)) = (precompiled(filename, ".cjs.hbc"), std::ffi::CString::new(filename)) {
+            let mut result: napi_value = std::ptr::null_mut();
+            let status = unsafe { run_bytecode(env.raw(), bytecode, &url, &mut result) };
+            if status != napi::sys::Status::napi_ok || result.is_null() {
+                return Err(());
+            }
+            return Ok(result);
+        }
+    }
     let (Ok(source), Ok(url)) = (env.create_string(code), std::ffi::CString::new(filename)) else {
         return Err(());
     };
