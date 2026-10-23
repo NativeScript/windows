@@ -11,6 +11,7 @@
     // __nsDotNetInvokeBin(handle, typeName, assembly, method, ...args)
     // throws on error, returns the result value directly.
     function _invoke(req) {
+        _maybeSweep();
         var handle = (req.handle !== undefined && req.handle !== null) ? req.handle : -1;
         var args   = req.args;
         var typeName = req.typeName || '', assembly = req.assembly || '', method = req.method || '';
@@ -26,6 +27,7 @@
     // _invoke with a function's own `arguments`, unwrapped straight into the native call (no
     // request object or intermediate arrays).
     function _invokeWith(handle, typeName, assembly, method, args) {
+        _maybeSweep();
         var invoke = globalThis.__nsDotNetInvokeBin;
         try {
             for (var s = 0; s < args.length; s++) {
@@ -197,6 +199,30 @@
             if (seen < 0) globalThis.__nsDotNetInvokeBin(entry.handle, '', '', '__release');
             else globalThis.__nsDotNetInvokeBin(entry.handle, '', '', '__release', seen);
         } catch (e) {}
+    }
+
+    // Hermes and JSC never run FinalizationRegistry callbacks here, though their WeakRefs clear.
+    // So every 250 ms at most, a bridge call releases the handles of collected proxies and subclass
+    // instances.
+    var _lastSweep = Date.now();
+    function _maybeSweep() {
+        if (!_canWeakRefProxies) return;
+        var now = Date.now();
+        if (now - _lastSweep < 250) return;
+        _lastSweep = now;
+        _proxyByHandle.forEach(function (entry) {
+            if (entry.ref && entry.ref.deref() === undefined) _releaseEntry(entry);
+        });
+        if (!_jsSelfByHandle) return;
+        _justAdopted.forEach(function (held, handle) {
+            if (now - held.at > 1000) _justAdopted.delete(handle);
+        });
+        if (_jsSelfByHandle.size === 0) return;
+        _jsSelfByHandle.forEach(function (ref, handle) {
+            if (_deref(ref)) return;
+            _jsSelfByHandle.delete(handle);
+            try { globalThis.__nsDotNetInvokeBin(handle, '', '', '__release'); } catch (_) {}
+        });
     }
 
     // Registers `proxy` as the proxy of `handle`; seen < 0 releases the handle outright.
@@ -498,12 +524,12 @@
         if (Array.isArray(value)) return value.map(_wrap);
         if (typeof value === 'object' && typeof value.__handle === 'number') {
             var typeName = value.__type || '';
-            var jsSelf = _jsSelfByHandle && _deref(_jsSelfByHandle.get(value.__handle));
+            var jsSelf = _jsSelfByHandle && _jsSelfOf(value.__handle);
             if (jsSelf) return jsSelf;
             // A JS subclass instance whose JS object was collected: its dispatcher revives one.
             if (typeName.indexOf('NSWinRTDynamicProxies.') === 0) {
                 try { _invoke({ handle: value.__handle, method: '__ns_js_self', args: [] }); } catch (_) {}
-                jsSelf = _deref(_jsSelfByHandle.get(value.__handle));
+                jsSelf = _jsSelfOf(value.__handle);
                 if (jsSelf) return jsSelf;
             }
             var entry = _proxyByHandle.get(value.__handle);
@@ -631,6 +657,20 @@
         : null;
 
     function _weak(obj) { return _canWeakRef ? new WeakRef(obj) : obj; }
+
+    // A JS object made for an instance only native code holds (revived, or created by .NET) is
+    // held until handed out: QuickJS frees a weakly held object at once. Unclaimed ones go after a
+    // second.
+    var _justAdopted = new Map();
+    function _holdUntilHandedOut(handle, self) {
+        _justAdopted.set(handle, { self: self, at: Date.now() });
+    }
+
+    function _jsSelfOf(handle) {
+        var held = _justAdopted.get(handle);
+        if (held) _justAdopted.delete(handle);
+        return _deref(_jsSelfByHandle.get(handle)) || (held && held.self);
+    }
     function _deref(ref) { return ref && _canWeakRef && ref instanceof WeakRef ? ref.deref() : ref; }
 
     // Gives `self` the bridge identity in `raw` and registers it as the JS object of `entry`'s instance.
@@ -664,6 +704,7 @@
         } else {
             self = Object.create(entry.proto);
         }
+        _holdUntilHandedOut(raw.__handle, self);
         return _adopt(entry, self, raw);
     }
 
@@ -900,6 +941,7 @@
             var self = Object.create(Cls.prototype);
             var entry = { proto: Cls.prototype, baseProto: baseProto, typeName: path, overrides: info.overrides, winrt: false, ref: self };
             _bridgeCall('AdoptJsInstance', [raw.__handle, _makeDispatcher(entry)]);
+            _holdUntilHandedOut(raw.__handle, self);
             _adopt(entry, self, raw);
             if (typeof self.init === 'function') self.init();
         };
