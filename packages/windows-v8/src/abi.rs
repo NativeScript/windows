@@ -67,6 +67,9 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
         if let Err(e) = crate::esm::install_ns_module(&env) {
             runtime::store_last_js_error(format!("[ns:module] {e}"));
         }
+        if let Err(e) = runtime::napi_engine::module_natives::install_script_compiler(&env, crate::eval_named) {
+            runtime::store_last_js_error(format!("[__nsCompileScript] {e}"));
+        }
         // Engine-specific JS setup that needs the engine's own eval: URL polyfill + runtime prelude
         // (queueMicrotask + NSWinRT.toPromise over the loop keep-alive natives).
         if let Err(e) = host::run_script_checked(raw, ns_windows_common::url_polyfill::POLYFILL) {

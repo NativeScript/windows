@@ -4428,6 +4428,132 @@ napi_status qjs_execute_script(napi_env env,
 }
 
 
+// Bytecode cache under `cache_dir`\qjs-cache, keyed by script name, source and engine build. Each
+// file starts with a checksum; a damaged or foreign one is ignored and replaced.
+#ifdef _WIN32
+#include <windows.h>
+
+#define QJS_CACHE_MIN_SOURCE 4096
+
+static uint64_t qjs_fnv1a(uint64_t h, const unsigned char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static FILE *qjs_cache_open(const char *path, const wchar_t *mode) {
+    wchar_t wide[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, 1024)) return NULL;
+    return _wfopen(wide, mode);
+}
+
+static void qjs_cache_store(const char *dir, const char *path, const uint8_t *bytecode, size_t size) {
+    char tmp[1100];
+    wchar_t wdir[1024], wtmp[1100], wpath[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (!MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1024)
+        || !MultiByteToWideChar(CP_UTF8, 0, tmp, -1, wtmp, 1100)
+        || !MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024)) return;
+    CreateDirectoryW(wdir, NULL);
+    FILE *f = _wfopen(wtmp, L"wb");
+    if (!f) return;
+    uint64_t sum = qjs_fnv1a(0xcbf29ce484222325ULL, bytecode, size);
+    int ok = fwrite(&sum, sizeof sum, 1, f) == 1 && fwrite(bytecode, 1, size, f) == size;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || !MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(wtmp);
+}
+
+// The cached function for this script, or JS_UNDEFINED.
+static JSValue qjs_cache_load(JSContext *ctx, const char *path) {
+    FILE *f = qjs_cache_open(path, L"rb");
+    if (!f) return JS_UNDEFINED;
+    JSValue fn = JS_UNDEFINED;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long n = ftell(f);
+        if (n > (long) sizeof(uint64_t) && fseek(f, 0, SEEK_SET) == 0) {
+            uint8_t *buf = mi_malloc((size_t) n);
+            if (buf && fread(buf, 1, (size_t) n, f) == (size_t) n) {
+                uint64_t sum;
+                memcpy(&sum, buf, sizeof sum);
+                size_t size = (size_t) n - sizeof sum;
+                if (sum == qjs_fnv1a(0xcbf29ce484222325ULL, buf + sizeof sum, size)) {
+                    fn = JS_ReadObject(ctx, buf + sizeof sum, size, JS_READ_OBJ_BYTECODE);
+                    if (JS_IsException(fn)) {
+                        JS_FreeValue(ctx, JS_GetException(ctx));
+                        fn = JS_UNDEFINED;
+                    }
+                }
+            }
+            if (buf) mi_free(buf);
+        }
+    }
+    fclose(f);
+    return fn;
+}
+
+napi_status qjs_execute_script_cached(napi_env env,
+                                      napi_value script,
+                                      const char *file,
+                                      const char *cache_dir,
+                                      napi_value *result) {
+    CHECK_ARG(env)
+    CHECK_ARG(script)
+    if (!cache_dir || !*cache_dir) return qjs_execute_script(env, script, file, result);
+
+    size_t len = 0;
+    const char *source = JS_ToCStringLen(env->context, &len, *((JSValue *) script));
+    if (!source) return qjs_execute_script(env, script, file, result);
+    if (len < QJS_CACHE_MIN_SOURCE) {
+        JS_FreeCString(env->context, source);
+        return qjs_execute_script(env, script, file, result);
+    }
+
+    const char *name = file ? file : "<script>";
+    uint64_t key = qjs_fnv1a(0xcbf29ce484222325ULL, (const unsigned char *) source, len);
+    key = qjs_fnv1a(key, (const unsigned char *) name, strlen(name));
+    // This build of the engine: bytecode from another one may not load.
+    static const char build[] = __DATE__ " " __TIME__;
+    key = qjs_fnv1a(key, (const unsigned char *) build, sizeof build);
+    key = qjs_fnv1a(key, (const unsigned char *) JS_GetVersion(), strlen(JS_GetVersion()));
+    char dir[1024], path[1024];
+    snprintf(dir, sizeof dir, "%s\\qjs-cache", cache_dir);
+    snprintf(path, sizeof path, "%s\\%016llx.qbc", dir, (unsigned long long) key);
+
+    js_enter(env);
+    JSValue fn = qjs_cache_load(env->context, path);
+    if (JS_IsUndefined(fn)) {
+        fn = JS_Eval(env->context, source, len, name, JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(fn)) {
+            size_t size = 0;
+            uint8_t *bytecode = JS_WriteObject(env->context, &size, fn, JS_WRITE_OBJ_BYTECODE);
+            if (bytecode) {
+                qjs_cache_store(dir, path, bytecode, size);
+                js_free(env->context, bytecode);
+            }
+        }
+    }
+    JS_FreeCString(env->context, source);
+    JSValue eval_result = JS_IsException(fn) ? fn : JS_EvalFunction(env->context, fn);
+    js_exit(env);
+    if (JS_IsException(eval_result)) {
+        JSValue exceptionValue = JS_GetException(env->context);
+        const char *exceptionMessage = JS_ToCString(env->context, exceptionValue);
+        napi_set_last_error(env, napi_cannot_run_js, exceptionMessage, 0, NULL);
+        JS_FreeCString(env->context, exceptionMessage);
+        JS_Throw(env->context, exceptionValue);
+        return napi_cannot_run_js;
+    }
+    if (result) {
+        CreateScopedResult(env, eval_result, result);
+    } else {
+        JS_FreeValue(env->context, eval_result);
+    }
+    return napi_clear_last_error(env);
+}
+#endif
+
 napi_status qjs_runtime_before_gc_callback(napi_env env, napi_finalize cb, void *data) {
     CHECK_ARG(env)
     CHECK_ARG(cb)

@@ -248,7 +248,10 @@ pub const PRELUDE: &str = r#"
       var childRequire = makeRequire(resolved);
 
       try {
-        var factory = new Function('module', 'exports', 'require', '__filename', '__dirname', content);
+        // A named script, so engines cache its compiled code. The module starts on line 1.
+        var factory = typeof g.__nsCompileScript === 'function'
+          ? g.__nsCompileScript('(function (module, exports, require, __filename, __dirname) {' + content + '\n})', resolved)
+          : new Function('module', 'exports', 'require', '__filename', '__dirname', content);
         factory(mod, mod.exports, childRequire, resolved, dirName);
       } catch (e) {
         cjsCache.delete(key);

@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use napi::{CallContext, Env, JsUnknown, ValueType};
+use napi::{CallContext, Env, JsUnknown, NapiRaw, NapiValue, ValueType};
 
 use crate::napi_engine::value::as_unknown;
 
@@ -27,6 +27,31 @@ fn arg_string(ctx: &CallContext, index: usize) -> napi::Result<Option<String>> {
     }
     let s = v.coerce_to_string()?.into_utf8()?.as_str()?.to_owned();
     Ok(Some(s))
+}
+
+/// Evaluates `code` as a script named `filename`, returning its completion value (on failure the
+/// engine's exception is left pending).
+pub type ScriptEval = fn(env: &Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()>;
+
+thread_local! {
+    static SCRIPT_EVAL: std::cell::Cell<Option<ScriptEval>> = const { std::cell::Cell::new(None) };
+}
+
+/// Installs `__nsCompileScript(code, filename)`, which runs `code` as a script named `filename`.
+/// `require` compiles modules through it instead of `new Function`, so engines cache them.
+pub fn install_script_compiler(env: &Env, eval: ScriptEval) -> napi::Result<()> {
+    SCRIPT_EVAL.with(|e| e.set(Some(eval)));
+    let compile = env.create_function_from_closure("__nsCompileScript", |ctx: CallContext| {
+        let code = arg_string(&ctx, 0)?.unwrap_or_default();
+        let filename = arg_string(&ctx, 1)?.unwrap_or_default();
+        let Some(eval) = SCRIPT_EVAL.with(std::cell::Cell::get) else {
+            return Err(napi::Error::from_reason("no script compiler installed"));
+        };
+        let value = eval(ctx.env, &code, &filename)
+            .map_err(|()| napi::Error::new(napi::Status::PendingException, String::new()))?;
+        Ok(unsafe { JsUnknown::from_raw_unchecked(ctx.env.raw(), value) })
+    })?;
+    env.get_global()?.set_named_property("__nsCompileScript", compile)
 }
 
 /// Install `__nsAppRoot` (read-only string), `__nsReadTextFile`, `__nsResolveModulePath` —
