@@ -10,6 +10,9 @@
 #include "libplatform/libplatform.h"
 #include "SimpleAllocator.h"
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -373,6 +376,79 @@ napi_status js_execute_script(napi_env env,
                               const char* file,
                               napi_value* result) {
     return napi_run_script_source(env, script, file, result);
+}
+
+// js_execute_script with V8's code cache in `cache_dir`\v8-codecache. The cache is made after the
+// first run, so it covers the functions run at startup; V8 rejects a stale one and it is rewritten.
+napi_status js_execute_script_cached(napi_env env,
+                                     napi_value script,
+                                     const char* file,
+                                     const char* cache_dir,
+                                     napi_value* result) {
+    NAPI_PREAMBLE(env);
+    CHECK_ARG(env, script);
+    CHECK_ARG(env, result);
+    v8::Isolate* iso = env->isolate;
+    v8::Local<v8::Context> ctx = env->context();
+    v8::Local<v8::Value> value = v8impl::V8LocalValueFromJsValue(script);
+    if (!value->IsString()) return napi_set_last_error(env, napi_string_expected);
+    v8::Local<v8::String> source = value.As<v8::String>();
+    if (!cache_dir || !*cache_dir || source->Length() < 4096)
+        return napi_run_script_source(env, script, file, result);
+
+    namespace fs = std::filesystem;
+    std::string name = file ? file : "<script>";
+    std::string base = name.substr(name.find_last_of("/\\") + 1);
+    for (char& c : base) if (!isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != '_') c = '_';
+    if (base.size() > 64) base.resize(64);
+    char suffix[32];
+    snprintf(suffix, sizeof suffix, ".%08x.v8c", static_cast<unsigned>(source->Length()));
+    fs::path dir = fs::u8path(cache_dir) / "v8-codecache";
+    fs::path path = dir / (base + suffix);
+
+    v8::ScriptCompiler::CachedData* cached = nullptr;
+    if (FILE* f = _wfopen(path.c_str(), L"rb")) {
+        if (fseek(f, 0, SEEK_END) == 0) {
+            long n = ftell(f);
+            if (n > 0 && fseek(f, 0, SEEK_SET) == 0) {
+                auto* buf = new uint8_t[n];
+                if (fread(buf, 1, static_cast<size_t>(n), f) == static_cast<size_t>(n))
+                    cached = new v8::ScriptCompiler::CachedData(buf, static_cast<int>(n), v8::ScriptCompiler::CachedData::BufferOwned);
+                else
+                    delete[] buf;
+            }
+        }
+        fclose(f);
+    }
+
+    v8::Local<v8::String> origin_name = v8::String::NewFromUtf8(iso, name.c_str()).ToLocalChecked();
+    v8::ScriptOrigin origin(origin_name);
+    v8::ScriptCompiler::Source compile_source(source, origin, cached);
+    auto compiled = v8::ScriptCompiler::Compile(ctx, &compile_source,
+        cached ? v8::ScriptCompiler::kConsumeCodeCache : v8::ScriptCompiler::kNoCompileOptions);
+    bool stale = !cached || compile_source.GetCachedData()->rejected;
+    CHECK_MAYBE_EMPTY(env, compiled, napi_generic_failure);
+    v8::Local<v8::Script> compiled_script = compiled.ToLocalChecked();
+    auto run = compiled_script->Run(ctx);
+    CHECK_MAYBE_EMPTY(env, run, napi_generic_failure);
+    if (stale) {
+        std::unique_ptr<v8::ScriptCompiler::CachedData> data(
+            v8::ScriptCompiler::CreateCodeCache(compiled_script->GetUnboundScript()));
+        if (data && data->length > 0) {
+            std::error_code ec;
+            fs::create_directories(dir, ec);
+            fs::path tmp = path;
+            tmp += ".tmp";
+            if (FILE* f = _wfopen(tmp.c_str(), L"wb")) {
+                bool ok = fwrite(data->data, 1, static_cast<size_t>(data->length), f) == static_cast<size_t>(data->length);
+                ok = fclose(f) == 0 && ok;
+                if (ok) fs::rename(tmp, path, ec);
+                if (!ok || ec) fs::remove(tmp, ec);
+            }
+        }
+    }
+    *result = v8impl::JsValueFromV8LocalValue(run.ToLocalChecked());
+    return GET_RETURN_STATUS(env);
 }
 
 napi_status js_execute_pending_jobs(napi_env env) {

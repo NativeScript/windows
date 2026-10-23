@@ -154,12 +154,31 @@
   <!--
     Publishes DotNetBridge.dll before the app build.
     Inputs/Outputs make this incremental: MSBuild skips the Exec when DotNetBridge.dll
-    is already newer than both source files.
+    is already newer than the project and every bridge source file.
   -->
+  <ItemGroup>
+    <_DotNetBridgeSources Include="$(NSWindowsRoot)\dotnet-bridge\*.cs" />
+  </ItemGroup>
+
+  <!--
+    @nativescript/windows-hermes: Release builds compile the app's JavaScript to Hermes bytecode
+    (tools\hermes-precompile.ps1), so a launch doesn't compile the bundle again. Only that
+    framework ships tools\hermesc.exe.
+  -->
+  <Target Name="PrecompileHermesBytecode"
+          BeforeTargets="AssignTargetPaths"
+          Condition="'$(Configuration)' == 'Release' and Exists('$(NSWindowsRoot)\tools\hermesc.exe') and Exists('app') and !Exists('app.nsbundle')">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(NSWindowsRoot)\tools\hermes-precompile.ps1&quot; -AppDir &quot;$(MSBuildProjectDirectory)\app&quot; -Hermesc &quot;$(NSWindowsRoot)\tools\hermesc.exe&quot; -Optimize" />
+    <ItemGroup>
+      <Content Include="app\**\*.hbc" Exclude="@(Content)">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+  </Target>
   <Target Name="PublishDotNetBridge"
           BeforeTargets="Build"
           Inputs="$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj;
-                  $(NSWindowsRoot)\dotnet-bridge\Bridge.cs"
+                  @(_DotNetBridgeSources)"
           Outputs="$(NSWindowsRoot)\dotnet-bridge\publish\DotNetBridge.dll"
           Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj')">
     <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="low" />

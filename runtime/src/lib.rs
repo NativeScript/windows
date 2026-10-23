@@ -1670,6 +1670,12 @@ pub(crate) fn log_dir_for_tests() -> Option<String> {
     LOG_DIR.get().cloned()
 }
 
+/// The app's writable local folder (see [`set_log_dir`]), once the host has set it. Engines keep
+/// their compiled-script caches there.
+pub fn local_folder() -> Option<&'static str> {
+    LOG_DIR.get().map(String::as_str)
+}
+
 /// Disk path for a chunk's V8 bytecode cache, keyed by filename + a hash of the source. A livesync
 /// edit changes the source → different hash → cache miss → recompile (never stale bytecode). Lives
 /// under the app's writable local folder (LOG_DIR). Returns None before that folder is known.

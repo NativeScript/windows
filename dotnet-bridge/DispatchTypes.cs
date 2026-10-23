@@ -46,7 +46,7 @@ internal readonly struct CtorEntry(ConstructorInfo? ctor, ParameterInfo[] parame
     public readonly ParameterInfo[]  Parameters = parameters;
 }
 
-internal enum DispatchKind : byte { Void, Primitive, Handle, Collection, Members, TaskHandle }
+internal enum DispatchKind : byte { Void, Primitive, Handle, Collection, Members, TaskHandle, Bytes }
 
 internal readonly struct DispatchResult
 {
@@ -66,18 +66,22 @@ internal readonly struct DispatchResult
     private readonly string[]?    _readonlyStaticProperties;
     private readonly string[]?    _writeonlyProperties;
     private readonly string[]?    _writeonlyStaticProperties;
+    // Member lists added after the first eight, by name (events, nested types, ...).
+    private readonly (string Key, string[] Names)[]? _extraLists;
 
     private DispatchResult(DispatchKind kind, object? value, Type? type, int handle,
         string? typeName, string[]? methods, string[]? props,
         string[]? staticMethods, string[]? staticProps,
         string[]? readonlyProps = null, string[]? readonlyStaticProps = null,
-        string[]? writeonlyProps = null, string[]? writeonlyStaticProps = null)
+        string[]? writeonlyProps = null, string[]? writeonlyStaticProps = null,
+        (string Key, string[] Names)[]? extraLists = null)
     {
         _kind = kind; _value = value; _type = type; _handle = handle;
         _typeName = typeName; _methods = methods; _properties = props;
         _staticMethods = staticMethods; _staticProperties = staticProps;
         _readonlyProperties = readonlyProps; _readonlyStaticProperties = readonlyStaticProps;
         _writeonlyProperties = writeonlyProps; _writeonlyStaticProperties = writeonlyStaticProps;
+        _extraLists = extraLists;
     }
 
     public static DispatchResult Primitive(object value, Type type)
@@ -92,13 +96,18 @@ internal readonly struct DispatchResult
     public static DispatchResult Collection(IEnumerable items)
         => new(DispatchKind.Collection, items, null, 0, null, null, null, null, null);
 
+    // byte[], Memory<byte>, ArraySegment<byte>: a Uint8Array in JS.
+    public static DispatchResult Bytes(object value)
+        => new(DispatchKind.Bytes, value, null, 0, null, null, null, null, null);
+
     public static DispatchResult Members(
         string[] methods, string[] props, string[] staticMethods, string[] staticProps,
         string[] readonlyProps, string[] readonlyStaticProps,
-        string[] writeonlyProps, string[] writeonlyStaticProps)
+        string[] writeonlyProps, string[] writeonlyStaticProps,
+        (string Key, string[] Names)[]? extras = null)
         => new(DispatchKind.Members, null, null, 0, null,
                methods, props, staticMethods, staticProps,
-               readonlyProps, readonlyStaticProps, writeonlyProps, writeonlyStaticProps);
+               readonlyProps, readonlyStaticProps, writeonlyProps, writeonlyStaticProps, extras);
 
     internal int HandleId() => _handle;
 
@@ -142,6 +151,11 @@ internal readonly struct DispatchResult
                 w.WriteEndObject();
                 break;
 
+            case DispatchKind.Bytes:
+                Bridge.TryGetBytes(_value!, out var jsonBytes, out _);
+                w.WriteBase64StringValue(jsonBytes);
+                break;
+
             case DispatchKind.Collection:
                 w.WriteStartArray();
                 foreach (var item in (IEnumerable)_value!)
@@ -159,6 +173,8 @@ internal readonly struct DispatchResult
                 WriteStringArray(w, "readonlyStaticProperties"u8, _readonlyStaticProperties!);
                 WriteStringArray(w, "writeonlyProperties"u8,      _writeonlyProperties!);
                 WriteStringArray(w, "writeonlyStaticProperties"u8,_writeonlyStaticProperties!);
+                foreach (var (key, names) in _extraLists ?? [])
+                    WriteStringArray(w, System.Text.Encoding.UTF8.GetBytes(key), names);
                 w.WriteEndObject();
                 break;
         }
@@ -177,7 +193,7 @@ internal readonly struct DispatchResult
     //   0x03 = i32[4]   0x04 = f64[8]   0x05 = string[u32+utf8]
     //   0x06 = handle[i32 + u16+utf8 type]
     //   0x07 = array[u32 count + N tagged items]
-    //   0x08 = members{ methods, props, staticMethods, staticProps }
+    //   0x08 = members{ 8 name lists, then u16 count + (u16+utf8 key, name list) per extra list }
     //   0xFF = error[u32+utf8]
 
     public void WriteAsBin(ArrayBufferWriter<byte> outBuf)
@@ -220,6 +236,11 @@ internal readonly struct DispatchResult
                 }
                 break;
 
+            case DispatchKind.Bytes:
+                Bridge.TryGetBytes(_value!, out var bytes, out var kind);
+                Bridge.WriteTypedArray(ref w, bytes, kind);
+                break;
+
             case DispatchKind.Collection:
                 var items = new List<object?>();
                 foreach (var item in (IEnumerable)_value!) items.Add(item);
@@ -238,6 +259,13 @@ internal readonly struct DispatchResult
                 WriteStringArrayBin(ref w, _readonlyStaticProperties!);
                 WriteStringArrayBin(ref w, _writeonlyProperties!);
                 WriteStringArrayBin(ref w, _writeonlyStaticProperties!);
+                var extras = _extraLists ?? [];
+                w.WriteU16((ushort)extras.Length);
+                foreach (var (key, names) in extras)
+                {
+                    w.WriteString16(key);
+                    WriteStringArrayBin(ref w, names);
+                }
                 break;
         }
     }
@@ -253,8 +281,10 @@ internal readonly struct DispatchResult
             case ushort  v: w.WriteByte(0x03); w.WriteI32(v); break;
             case int     v: w.WriteByte(0x03); w.WriteI32(v); break;
             case uint    v: w.WriteByte(0x04); w.WriteF64(v); break;
-            case long    v: w.WriteByte(0x04); w.WriteF64(v); break;
-            case ulong   v: w.WriteByte(0x04); w.WriteF64(v); break;
+            case long    v: Bridge.WriteInt64(ref w, v); break;
+            case ulong   v: Bridge.WriteUInt64(ref w, v); break;
+            case nint    v: Bridge.WriteInt64(ref w, v); break;
+            case nuint   v: Bridge.WriteUInt64(ref w, v); break;
             case float   v: w.WriteByte(0x04); w.WriteF64(v); break;
             case double  v: w.WriteByte(0x04); w.WriteF64(v); break;
             case decimal v: w.WriteByte(0x04); w.WriteF64((double)v); break;
@@ -272,6 +302,11 @@ internal readonly struct DispatchResult
             WritePrimitiveBin(ref w, value);
             return;
         }
+        if (Bridge.TryGetBytes(value, out var bytes, out var kind))
+        {
+            Bridge.WriteTypedArray(ref w, bytes, kind);
+            return;
+        }
         if (value is Array enumerable)
         {
             var items = new List<object?>();
@@ -281,8 +316,7 @@ internal readonly struct DispatchResult
             foreach (var item in items) WriteValueBin(ref w, item);
             return;
         }
-        var id = Interlocked.Increment(ref Bridge.s_nextHandle);
-        Bridge.s_handles[id] = value;
+        var id = Bridge.HandleFor(value);
         w.WriteByte(0x06);
         w.WriteI32(id);
         w.WriteString16(t.FullName ?? t.Name);

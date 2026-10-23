@@ -169,6 +169,8 @@ pub fn install(env: &Env, eval: EvalScript) -> napi::Result<()> {
     EVAL.with(|e| e.set(Some(eval)));
     let mut global = env.get_global()?;
 
+    crate::napi_engine::module_natives::install_script_compiler(env, eval)?;
+
     let load_fn = env.create_function_from_closure("__nsEsmLoad", load)?;
     global.set_named_property("__nsEsmLoad", load_fn)?;
 

@@ -14,6 +14,7 @@ Object.assign(globalThis, api);
 
 const specs = [
 	"./tests/csharp-sources.js",
+	"./tests/csharp-interop.js",
 	"./tests/extend-dotnet.js",
 	"./tests/extend-winrt.js",
 	"./tests/threading.js",

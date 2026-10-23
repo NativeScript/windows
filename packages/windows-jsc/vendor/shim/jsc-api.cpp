@@ -585,37 +585,6 @@ class ExternalInfo: public BaseInfoT<ExternalInfo, NativeType::External> {
         }
 };
 
-class ReferenceInfo : public BaseInfoT<ReferenceInfo, NativeType::Reference> {
-        public:
-        static napi_status Initialize(napi_env env, napi_value object, FinalizerT finalizer) {
-
-            napi_valuetype type;
-            napi_typeof(env, object, &type);
-
-            if (type == napi_object || type == napi_function) {
-                ReferenceInfo* info = new ReferenceInfo(env);
-                if (info == nullptr) {
-                    return napi_set_last_error(env, napi_generic_failure);
-                }
-
-                // JSObjectRef ref{JSObjectMake(env->context, info->_class, info)};
-                // JSObjectSetPrototype(env->context, prototype, JSObjectGetPrototype(env->context, ToJSObject(env, object)));
-               // JSObjectSetPrototype(env->context, ToJSObject(env, object), prototype);
-
-                NativeInfo::SetNativeInfo(env->context, ToJSObject(env, object), info->_class, "[[jsc_reference_info]]", info);
-
-                info->AddFinalizer(finalizer);
-            }
-
-            return napi_ok;
-        }
-
-        private:
-        ReferenceInfo(napi_env env)
-        : BaseInfoT{env, "Native (Reference)"} {
-        }
-};
-
 class WrapperInfo : public BaseInfoT<WrapperInfo, NativeType::Wrapper> {
         public:
         static napi_status Wrap(napi_env env, napi_value object, WrapperInfo** result) {
@@ -703,6 +672,16 @@ class ExternalArrayBufferInfo {
 };
 }
 
+// JavaScriptCore's weak handles (JSWeakPrivate.h, exported by the bundled JavaScriptCore.dll).
+extern "C" {
+typedef const struct OpaqueJSWeak* JSWeakRef;
+JS_EXPORT JSWeakRef JSWeakCreate(JSContextGroupRef group, JSObjectRef object);
+JS_EXPORT void JSWeakRelease(JSContextGroupRef group, JSWeakRef weak);
+JS_EXPORT JSObjectRef JSWeakGetObject(JSWeakRef weak);
+}
+
+// While its count is 0 a reference holds its object through a JSWeak, which the collector clears
+// before the object's memory can be reused.
 struct napi_ref__ {
     napi_ref__(napi_value value, uint32_t count)
     : _value{value}
@@ -710,12 +689,9 @@ struct napi_ref__ {
     }
 
     napi_status init(napi_env env) {
-        // track the ref values to support weak refs
-        auto pair{env->active_ref_values.insert(_value)};
-        if (pair.second) {
-            CHECK_NAPI(ReferenceInfo::Initialize(env, _value, [value = _value](ReferenceInfo* info) {
-                info->Env()->active_ref_values.erase(value);
-            }));
+        if (JSValueIsObject(env->context, ToJSValue(_value))) {
+            _group = JSContextGetGroup(env->context);
+            _weak = JSWeakCreate(_group, ToJSObject(env, _value));
         }
 
         if (_count != 0) {
@@ -728,6 +704,10 @@ struct napi_ref__ {
     void deinit(napi_env env) {
         if (_count != 0) {
             unprotect(env);
+        }
+        if (_weak != nullptr) {
+            JSWeakRelease(_group, _weak);
+            _weak = nullptr;
         }
 
         _value = nullptr;
@@ -751,11 +731,11 @@ struct napi_ref__ {
     }
 
     napi_value value(napi_env env) const {
-        if (env->active_ref_values.find(_value) == env->active_ref_values.end()) {
-            return nullptr;
+        if (_count != 0 || _weak == nullptr) {
+            return _value;
         }
-
-        return _value;
+        JSObjectRef object = JSWeakGetObject(_weak);
+        return object != nullptr ? ToNapi(object) : nullptr;
     }
 
     private:
@@ -773,6 +753,8 @@ struct napi_ref__ {
     napi_value _value{};
     uint32_t _count{};
     std::list<napi_ref>::iterator _iter{};
+    JSContextGroupRef _group{};
+    JSWeakRef _weak{};
 };
 
 void napi_env__::deinit_refs() {
@@ -1480,13 +1462,33 @@ napi_status napi_create_range_error(napi_env env,
     return napi_ok;
 }
 
+// JavaScriptCore's BigInt C API (exported by the bundled JavaScriptCore.dll; the vendored headers
+// predate it).
+extern "C" {
+JS_EXPORT JSValueRef JSBigIntCreateWithInt64(JSContextRef ctx, int64_t integer, JSValueRef* exception);
+JS_EXPORT JSValueRef JSBigIntCreateWithUInt64(JSContextRef ctx, uint64_t integer, JSValueRef* exception);
+JS_EXPORT JSValueRef JSBigIntCreateWithString(JSContextRef ctx, JSStringRef string, JSValueRef* exception);
+JS_EXPORT bool JSValueIsBigInt(JSContextRef ctx, JSValueRef value);
+JS_EXPORT int64_t JSValueToInt64(JSContextRef ctx, JSValueRef value, JSValueRef* exception);
+JS_EXPORT uint64_t JSValueToUInt64(JSContextRef ctx, JSValueRef value, JSValueRef* exception);
+typedef enum { kJSRelationConditionUndefined, kJSRelationConditionEqual, kJSRelationConditionGreaterThan, kJSRelationConditionLessThan } JSRelationCondition;
+JS_EXPORT JSRelationCondition JSValueCompareInt64(JSContextRef ctx, JSValueRef left, int64_t right, JSValueRef* exception);
+JS_EXPORT JSRelationCondition JSValueCompareUInt64(JSContextRef ctx, JSValueRef left, uint64_t right, JSValueRef* exception);
+}
+
+// JSType's BigInt member, after kJSTypeSymbol in newer headers.
+static constexpr int kJSTypeBigIntValue = 7;
+
 napi_status napi_typeof(napi_env env, napi_value value, napi_valuetype* result) {
     CHECK_ENV(env);
     CHECK_ARG(env, value);
     CHECK_ARG(env, result);
 
-    // JSC does not support BigInt
     JSType valueType = JSValueGetType(env->context, ToJSValue(value));
+    if (static_cast<int>(valueType) == kJSTypeBigIntValue) {
+        *result = napi_bigint;
+        return napi_ok;
+    }
     switch (valueType) {
         case kJSTypeUndefined: *result = napi_undefined; break;
         case kJSTypeNull: *result = napi_null; break;
@@ -1733,6 +1735,110 @@ napi_status napi_get_value_int64(napi_env env, napi_value value, int64_t* result
         *result = 0;
     }
 
+    return napi_ok;
+}
+
+napi_status napi_create_bigint_int64(napi_env env, int64_t value, napi_value* result) {
+    CHECK_ENV(env);
+    CHECK_ARG(env, result);
+    JSValueRef exception{};
+    JSValueRef big = JSBigIntCreateWithInt64(env->context, value, &exception);
+    CHECK_JSC(env, exception);
+    *result = ToNapi(big);
+    return napi_ok;
+}
+
+napi_status napi_create_bigint_uint64(napi_env env, uint64_t value, napi_value* result) {
+    CHECK_ENV(env);
+    CHECK_ARG(env, result);
+    JSValueRef exception{};
+    JSValueRef big = JSBigIntCreateWithUInt64(env->context, value, &exception);
+    CHECK_JSC(env, exception);
+    *result = ToNapi(big);
+    return napi_ok;
+}
+
+// Built from a hex string: the C API has no words constructor.
+napi_status napi_create_bigint_words(napi_env env, int sign_bit, size_t word_count, const uint64_t* words, napi_value* result) {
+    CHECK_ENV(env);
+    CHECK_ARG(env, result);
+    if (word_count > 0) CHECK_ARG(env, words);
+    std::string text = sign_bit ? "-0x" : "0x";
+    bool leading = true;
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = word_count; i-- > 0;) {
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            int nibble = static_cast<int>((words[i] >> shift) & 0xF);
+            if (leading && nibble == 0) continue;
+            leading = false;
+            text.push_back(digits[nibble]);
+        }
+    }
+    if (leading) text = "0";
+    JSStringRef string = JSStringCreateWithUTF8CString(text.c_str());
+    JSValueRef exception{};
+    JSValueRef big = JSBigIntCreateWithString(env->context, string, &exception);
+    JSStringRelease(string);
+    CHECK_JSC(env, exception);
+    *result = ToNapi(big);
+    return napi_ok;
+}
+
+napi_status napi_get_value_bigint_int64(napi_env env, napi_value value, int64_t* result, bool* lossless) {
+    CHECK_ENV(env);
+    CHECK_ARG(env, value);
+    CHECK_ARG(env, result);
+    JSValueRef v = ToJSValue(value);
+    if (!JSValueIsBigInt(env->context, v)) return napi_set_last_error(env, napi_bigint_expected);
+    JSValueRef exception{};
+    *result = JSValueToInt64(env->context, v, &exception);
+    CHECK_JSC(env, exception);
+    if (lossless) *lossless = JSValueCompareInt64(env->context, v, *result, &exception) == kJSRelationConditionEqual;
+    return napi_ok;
+}
+
+napi_status napi_get_value_bigint_uint64(napi_env env, napi_value value, uint64_t* result, bool* lossless) {
+    CHECK_ENV(env);
+    CHECK_ARG(env, value);
+    CHECK_ARG(env, result);
+    JSValueRef v = ToJSValue(value);
+    if (!JSValueIsBigInt(env->context, v)) return napi_set_last_error(env, napi_bigint_expected);
+    JSValueRef exception{};
+    *result = JSValueToUInt64(env->context, v, &exception);
+    CHECK_JSC(env, exception);
+    if (lossless) *lossless = JSValueCompareUInt64(env->context, v, *result, &exception) == kJSRelationConditionEqual;
+    return napi_ok;
+}
+
+// Sign and the low 64 bits; a wider value reports word_count 2 with a zero high word.
+napi_status napi_get_value_bigint_words(napi_env env, napi_value value, int* sign_bit, size_t* word_count, uint64_t* words) {
+    CHECK_ENV(env);
+    CHECK_ARG(env, value);
+    CHECK_ARG(env, word_count);
+    JSValueRef v = ToJSValue(value);
+    if (!JSValueIsBigInt(env->context, v)) return napi_set_last_error(env, napi_bigint_expected);
+    JSValueRef exception{};
+    bool negative = JSValueCompareInt64(env->context, v, 0, &exception) == kJSRelationConditionLessThan;
+    uint64_t magnitude;
+    bool fits;
+    if (negative) {
+        int64_t s = JSValueToInt64(env->context, v, &exception);
+        fits = JSValueCompareInt64(env->context, v, s, &exception) == kJSRelationConditionEqual;
+        magnitude = 0 - static_cast<uint64_t>(s);
+    } else {
+        magnitude = JSValueToUInt64(env->context, v, &exception);
+        fits = JSValueCompareUInt64(env->context, v, magnitude, &exception) == kJSRelationConditionEqual;
+    }
+    CHECK_JSC(env, exception);
+    size_t needed = magnitude == 0 && fits ? 0 : (fits ? 1 : 2);
+    if (words == nullptr) {
+        *word_count = needed;
+        return napi_ok;
+    }
+    if (sign_bit) *sign_bit = negative ? 1 : 0;
+    if (*word_count > 0) words[0] = magnitude;
+    if (*word_count > 1) words[1] = 0;
+    *word_count = needed;
     return napi_ok;
 }
 

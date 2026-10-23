@@ -28,14 +28,15 @@ public static partial class Bridge
         {
             try
             {
+                // Rejections pass the exception; JS makes an Error of it.
                 if (completed.IsFaulted)
                 {
-                    var ex = completed.Exception?.InnerException ?? completed.Exception;
-                    CallJsCallback(rejectId, [ex?.Message ?? "Task faulted"]);
+                    var ex = (Exception?)completed.Exception?.InnerException ?? completed.Exception;
+                    CallJsCallback(rejectId, [ex ?? new InvalidOperationException("Task faulted")]);
                 }
                 else if (completed.IsCanceled)
                 {
-                    CallJsCallback(rejectId, ["Task cancelled"]);
+                    CallJsCallback(rejectId, [new TaskCanceledException(completed)]);
                 }
                 else
                 {
@@ -44,7 +45,7 @@ public static partial class Bridge
             }
             catch (Exception ex)
             {
-                CallJsCallback(rejectId, [ex.Message]);
+                CallJsCallback(rejectId, [ex]);
             }
         }, TaskScheduler.Default);
     }

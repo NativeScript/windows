@@ -34,7 +34,7 @@ public static partial class Bridge
     // Keyed by (assembly name or "", type name): no key string is built per lookup.
     private static readonly ConcurrentDictionary<(string Assembly, string Type), Type?> s_typeCache = new();
     private static readonly ConcurrentDictionary<MethodKey, DispatchEntry> s_methodCache = new();
-    private static readonly ConcurrentDictionary<PropKey, PropertyInfo?> s_propCache = new();
+    private static readonly ConcurrentDictionary<PropKey, DataMember?> s_propCache = new();
     private static readonly ConcurrentDictionary<CtorKey, CtorEntry> s_ctorCache = new();
     // Cache of attempted assembly loads (simple name -> Assembly or null if not found).
     private static readonly ConcurrentDictionary<string, Assembly?> s_assemblyLoadCache
@@ -50,6 +50,7 @@ public static partial class Bridge
     internal static void ClearCaches()
     {
         s_typeCache.Clear();
+        s_missingTypes.Clear();
         s_methodCache.Clear();
         s_propCache.Clear();
         s_ctorCache.Clear();
@@ -58,7 +59,7 @@ public static partial class Bridge
         s_boxInfo.Clear();
         s_paramsCache.Clear();
         s_collectionInfo.Clear();
-        s_handles.Clear();
+        ClearHandles();
         s_nativePtrs.Clear();
         s_nativePtrsReverse.Clear();
         s_nextHandle = 0;
@@ -106,55 +107,74 @@ public static partial class Bridge
     // on a coarse top-level root such as Microsoft.
     public static string GetNamespaceAssemblyMapJson()
     {
+        // Metadata only: loading each DLL to list its types is slow.
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var entryPath = Assembly.GetEntryAssembly()?.Location;
         try
         {
             foreach (var dir in s_assemblySearchDirs.Where(Directory.Exists))
             {
-                try
+                IEnumerable<string> files;
+                try { files = Directory.EnumerateFiles(dir, "*.dll", SearchOption.TopDirectoryOnly); }
+                catch { continue; }
+                foreach (var file in files)
                 {
-                    foreach (var file in Directory.EnumerateFiles(dir, "*.dll", SearchOption.TopDirectoryOnly))
+                    try
                     {
-                        try
-                        {
-                            var simple = Path.GetFileNameWithoutExtension(file);
-                            if (string.IsNullOrEmpty(simple)) continue;
-
-                            Assembly? asm = AppDomain.CurrentDomain.GetAssemblies()
-                                .FirstOrDefault(a => string.Equals(a.GetName().Name, simple, StringComparison.OrdinalIgnoreCase));
-                            if (asm is null)
-                            {
-                                try { asm = AssemblyLoadContext.Default.LoadFromAssemblyPath(file); }
-                                catch { continue; }
-                            }
-
-                            // The app's own assembly (C# sources compiled into the app) contributes
-                            // its internal types too: they are reachable from JS (type resolution
-                            // finds non-public types), so their namespaces must be as well.
-                            Type[] types;
-                            try { types = asm == Assembly.GetEntryAssembly() ? asm.GetTypes() : asm.GetExportedTypes(); }
-                            catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
-                            catch { types = Array.Empty<Type>(); }
-
-                            var assemblyName = asm.GetName().Name;
-                            if (string.IsNullOrEmpty(assemblyName)) continue;
-
-                            foreach (var t in types)
-                            {
-                                if (string.IsNullOrEmpty(t.Namespace) || t.Name.StartsWith('<')) continue;
-                                map[t.Namespace] = assemblyName;
-                                var root = t.Namespace.Split('.')[0];
-                                if (!map.ContainsKey(root)) map[root] = assemblyName;
-                            }
-                        }
-                        catch { }
+                        // The app's own assembly counts its internal types too: JS reaches them.
+                        var includeInternal = entryPath is not null && string.Equals(Path.GetFullPath(file), entryPath, StringComparison.OrdinalIgnoreCase);
+                        AddNamespaces(file, includeInternal, map);
                     }
+                    catch { }
                 }
-                catch { }
             }
         }
         catch { }
         try { return JsonSerializer.Serialize(map); } catch { return "{}"; }
+    }
+
+    // Maps the namespaces of an assembly's top-level types (and their roots) to its name.
+    private static void AddNamespaces(string file, bool includeInternal, Dictionary<string, string> map)
+    {
+        using var stream = File.OpenRead(file);
+        using var pe = new System.Reflection.PortableExecutable.PEReader(stream);
+        if (!pe.HasMetadata) return;
+        var md = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(pe);
+        if (!md.IsAssembly) return;
+        var assemblyName = md.GetString(md.GetAssemblyDefinition().Name);
+        if (string.IsNullOrEmpty(assemblyName)) return;
+        var seen = new HashSet<System.Reflection.Metadata.StringHandle>();
+        foreach (var h in md.TypeDefinitions)
+        {
+            var td = md.GetTypeDefinition(h);
+            var visibility = td.Attributes & TypeAttributes.VisibilityMask;
+            if (visibility != TypeAttributes.Public && !(includeInternal && visibility == TypeAttributes.NotPublic)) continue;
+            if (td.Namespace.IsNil || !seen.Add(td.Namespace)) continue;
+            if (md.GetString(td.Name).StartsWith('<')) continue;
+            var ns = md.GetString(td.Namespace);
+            map[ns] = assemblyName;
+            map.TryAdd(ns.Split('.')[0], assemblyName);
+        }
+    }
+
+    /// Loads the assembly at `path` (relative to the app directory unless absolute) and returns its
+    /// namespace map, as GetNamespaceAssemblyMapJson does.
+    public static string LoadAssembly(string path)
+    {
+        var full = Path.IsPathRooted(path) ? path : Path.Combine(AppContext.BaseDirectory, path);
+        var asm = AssemblyLoadContext.Default.LoadFromAssemblyPath(Path.GetFullPath(full));
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        Type[] types;
+        try { types = asm.GetExportedTypes(); }
+        catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
+        var name = asm.GetName().Name ?? "";
+        foreach (var t in types)
+        {
+            if (string.IsNullOrEmpty(t.Namespace)) continue;
+            map[t.Namespace] = name;
+            map.TryAdd(t.Namespace.Split('.')[0], name);
+        }
+        return JsonSerializer.Serialize(map);
     }
 
     static Bridge()
@@ -212,6 +232,7 @@ public static partial class Bridge
 
             s_assemblySearchDirs = dirs.Where(d => !string.IsNullOrEmpty(d)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             AppDomain.CurrentDomain.AssemblyResolve += OnAssemblyResolve;
+            AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
         }
         catch
         {
@@ -470,6 +491,7 @@ public static partial class Bridge
         {
             var requested = new AssemblyName(args.Name).Name;
             if (string.IsNullOrEmpty(requested)) return null;
+            if (requested == "NSWinRTDynamicProxies") return s_dynamicAssembly;
 
             if (s_assemblyLoadCache.TryGetValue(requested, out var cached)) return cached;
 
@@ -514,52 +536,6 @@ public static partial class Bridge
         delegate* unmanaged[Cdecl]<int, byte*, int, byte**, int*, void> callback)
     {
         s_jsInvoker = callback;
-        return 0;
-    }
-
-    // Callback id registered by the runtime/JS that should receive unhandled
-    // managed exceptions and unobserved task exceptions.
-    private static int s_unhandledExceptionCallbackId = -1;
-
-    // Called from JS/Rust to request that managed unhandled exceptions be
-    // forwarded to the registered JS callback id.  The callback id must have
-    // been created on the Rust side and point to a JS function stored in the
-    // runtime's `DOTNET_JS_CALLBACKS` map.
-    public static int RegisterUnhandledExceptionCallback(int callbackId)
-    {
-        s_unhandledExceptionCallbackId = callbackId;
-
-        // Subscribe once (idempotent).
-        try
-        {
-            AppDomain.CurrentDomain.UnhandledException -= OnAppDomainUnhandledException;
-            AppDomain.CurrentDomain.UnhandledException += OnAppDomainUnhandledException;
-
-            TaskScheduler.UnobservedTaskException -= OnUnobservedTaskException;
-            TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
-
-            // Try to subscribe to Windows.CoreApplication.UnhandledErrorDetected if available
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                var coreAppType = asm.GetType("Windows.ApplicationModel.Core.CoreApplication");
-                if (coreAppType == null) continue;
-                var ev = coreAppType.GetEvent("UnhandledErrorDetected");
-                if (ev == null) continue;
-                try
-                {
-                    var handlerType = ev.EventHandlerType;
-                    var method = typeof(Bridge).GetMethod(nameof(CoreApplicationUnhandledErrorHandler), BindingFlags.NonPublic | BindingFlags.Static);
-                    if (handlerType != null && method != null)
-                    {
-                        var del = Delegate.CreateDelegate(handlerType, method);
-                        ev.AddEventHandler(null, del);
-                    }
-                }
-                catch { }
-            }
-        }
-        catch { }
-
         return 0;
     }
 
@@ -691,56 +667,6 @@ public static partial class Bridge
         {
             return null;
         }
-    }
-
-    private static void OnAppDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)
-    {
-        try
-        {
-            var ex = e.ExceptionObject as Exception;
-            var msg = ex?.ToString() ?? e.ExceptionObject?.ToString() ?? "(unknown)";
-            SendUnhandledToJs("unhandled", msg);
-        }
-        catch { }
-    }
-
-    private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
-    {
-        try
-        {
-            var msg = e.Exception?.ToString() ?? "(unobserved task exception)";
-            SendUnhandledToJs("unobservedTask", msg);
-        }
-        catch { }
-    }
-
-    // Fallback handler for platform-specific CoreApplication unhandled events.
-    private static void CoreApplicationUnhandledErrorHandler(object? sender, object? args)
-    {
-        try
-        {
-            var msg = args?.ToString() ?? "(core unhandled)";
-            SendUnhandledToJs("coreUnhandled", msg);
-        }
-        catch { }
-    }
-
-    private static unsafe void SendUnhandledToJs(string kind, string message)
-    {
-        try
-        {
-            if (s_jsInvoker == null || s_unhandledExceptionCallbackId <= 0) return;
-            var payload = JsonSerializer.Serialize(new { kind = kind, message = message });
-            var bytes = System.Text.Encoding.UTF8.GetBytes(payload);
-            fixed (byte* p = bytes)
-            {
-                byte* respPtr = null;
-                int respLen = 0;
-                s_jsInvoker(s_unhandledExceptionCallbackId, p, bytes.Length, &respPtr, &respLen);
-                if (respPtr != null && respLen > 0) Marshal.FreeHGlobal((IntPtr)respPtr);
-            }
-        }
-        catch { }
     }
 
     [UnmanagedCallersOnly(EntryPoint = "Invoke",

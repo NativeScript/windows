@@ -34,6 +34,140 @@ pub mod ffi {
             result: *mut napi_value,
         ) -> i32;
         pub fn jsr_drain_microtasks(env: napi_env, max_count_hint: i32, result: *mut bool) -> i32;
+        pub fn jsr_run_script_buffer(
+            env: napi_env,
+            script_data: *const u8,
+            script_length: usize,
+            script_delete_cb: Option<DataDelete>,
+            deleter_data: *mut c_void,
+            source_url: *const c_char,
+            result: *mut napi_value,
+        ) -> i32;
+        pub fn jsr_config_set_script_cache(
+            config: *mut c_void,
+            script_cache_data: *mut c_void,
+            load: Option<ScriptCacheLoad>,
+            store: Option<ScriptCacheStore>,
+            data_delete: Option<DataDelete>,
+            deleter_data: *mut c_void,
+        ) -> i32;
+    }
+
+    pub type DataDelete = unsafe extern "C" fn(data: *mut c_void, deleter_data: *mut c_void);
+
+    pub type ScriptCacheLoad = unsafe extern "C" fn(
+        script_cache_data: *mut c_void,
+        source_url: *const c_char,
+        source_hash: u64,
+        runtime_name: *const c_char,
+        runtime_version: u64,
+        cache_tag: *const c_char,
+        buffer: *mut *const u8,
+        buffer_size: *mut usize,
+        buffer_delete_cb: *mut Option<DataDelete>,
+        deleter_data: *mut *mut c_void,
+    );
+
+    pub type ScriptCacheStore = unsafe extern "C" fn(
+        script_cache_data: *mut c_void,
+        source_url: *const c_char,
+        source_hash: u64,
+        runtime_name: *const c_char,
+        runtime_version: u64,
+        cache_tag: *const c_char,
+        buffer: *const u8,
+        buffer_size: usize,
+        buffer_delete_cb: Option<DataDelete>,
+        deleter_data: *mut c_void,
+    );
+}
+
+/// Hermes's script cache, in the app's local folder. Files are keyed by script name, source hash,
+/// Hermes version and cache tag, so an edited script or a new Hermes compiles again.
+mod script_cache {
+    use std::ffi::{c_char, c_void, CStr};
+    use std::path::PathBuf;
+
+    use super::ffi::DataDelete;
+
+    unsafe fn text(s: *const c_char) -> String {
+        if s.is_null() { String::new() } else { CStr::from_ptr(s).to_string_lossy().into_owned() }
+    }
+
+    unsafe fn cache_path(url: *const c_char, hash: u64, version: u64, tag: *const c_char) -> Option<PathBuf> {
+        let dir = runtime::local_folder()?;
+        let url = text(url);
+        let name: String = url
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("script")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+            .take(64)
+            .collect();
+        let tag: String = text(tag).chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect();
+        Some(PathBuf::from(dir).join("hermes-cache").join(format!("{name}.{hash:016x}.{version:x}.{tag}.hbc")))
+    }
+
+    pub(crate) unsafe extern "C" fn free_bytes(data: *mut c_void, deleter_data: *mut c_void) {
+        let _ = data;
+        drop(Box::from_raw(deleter_data as *mut Vec<u8>));
+    }
+
+    pub unsafe extern "C" fn load(
+        _data: *mut c_void,
+        source_url: *const c_char,
+        source_hash: u64,
+        _runtime_name: *const c_char,
+        runtime_version: u64,
+        cache_tag: *const c_char,
+        buffer: *mut *const u8,
+        buffer_size: *mut usize,
+        buffer_delete_cb: *mut Option<DataDelete>,
+        deleter_data: *mut *mut c_void,
+    ) {
+        *buffer = std::ptr::null();
+        *buffer_size = 0;
+        let Some(path) = cache_path(source_url, source_hash, runtime_version, cache_tag) else { return };
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        if bytes.is_empty() {
+            return;
+        }
+        let boxed = Box::new(bytes);
+        *buffer = boxed.as_ptr();
+        *buffer_size = boxed.len();
+        *buffer_delete_cb = Some(free_bytes);
+        *deleter_data = Box::into_raw(boxed) as *mut c_void;
+    }
+
+    pub unsafe extern "C" fn store(
+        _data: *mut c_void,
+        source_url: *const c_char,
+        source_hash: u64,
+        _runtime_name: *const c_char,
+        runtime_version: u64,
+        cache_tag: *const c_char,
+        buffer: *const u8,
+        buffer_size: usize,
+        buffer_delete_cb: Option<DataDelete>,
+        deleter_data: *mut c_void,
+    ) {
+        if let Some(path) = cache_path(source_url, source_hash, runtime_version, cache_tag) {
+            if !buffer.is_null() && buffer_size > 0 {
+                let bytes = std::slice::from_raw_parts(buffer, buffer_size);
+                // Written beside the final name first, so a crash never leaves a partial cache file.
+                let tmp = path.with_extension("tmp");
+                let written = path.parent().map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|_| std::fs::write(&tmp, bytes))
+                    .and_then(|_| std::fs::rename(&tmp, &path));
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+        }
+        if let Some(delete) = buffer_delete_cb {
+            delete(buffer as *mut c_void, deleter_data);
+        }
     }
 }
 
@@ -54,6 +188,14 @@ pub unsafe fn create_runtime_env() -> Option<(*mut c_void, napi_env, *mut c_void
     let mut env_raw: napi_env = std::ptr::null_mut();
     if ffi::jsr_create_config(&mut config) != 0
         || ffi::jsr_config_set_explicit_microtasks(config, true) != 0
+        || ffi::jsr_config_set_script_cache(
+            config,
+            std::ptr::null_mut(),
+            Some(script_cache::load),
+            Some(script_cache::store),
+            None,
+            std::ptr::null_mut(),
+        ) != 0
         || ffi::jsr_create_runtime(config, &mut runtime) != 0
         || ffi::jsr_runtime_get_node_api_env(runtime, &mut env_raw) != 0
         || env_raw.is_null()
@@ -67,10 +209,84 @@ pub unsafe fn create_runtime_env() -> Option<(*mut c_void, napi_env, *mut c_void
     Some((runtime, env_raw, scope))
 }
 
+/// What the prelude's `require` wraps a CommonJS module in (see `__nsCompileScript`).
+const CJS_WRAPPER_HEAD: &str = "(function (module, exports, require, __filename, __dirname) {";
+
+/// Bytecode the app build made with hermesc for `source_path`, unless older than the script:
+/// `<file>.hbc` for a script run as is, `<file>.cjs.hbc` for one compiled in the CommonJS wrapper.
+/// Hermes's own cache skips large scripts, which it compiles lazily.
+fn precompiled(source_path: &str, suffix: &str) -> Option<Vec<u8>> {
+    if source_path.is_empty() {
+        return None;
+    }
+    let hbc = format!("{source_path}{suffix}");
+    let hbc_time = std::fs::metadata(&hbc).and_then(|m| m.modified()).ok()?;
+    let source_time = std::fs::metadata(source_path).and_then(|m| m.modified()).ok()?;
+    if hbc_time < source_time {
+        return None;
+    }
+    std::fs::read(hbc).ok().filter(|b| !b.is_empty())
+}
+
+/// Runs Hermes bytecode as the script `url`.
+unsafe fn run_bytecode(env: napi_env, bytecode: Vec<u8>, url: &std::ffi::CStr, result: *mut napi_value) -> i32 {
+    let boxed = Box::new(bytecode);
+    let (data, len) = (boxed.as_ptr(), boxed.len());
+    ffi::jsr_run_script_buffer(
+        env,
+        data,
+        len,
+        Some(script_cache::free_bytes),
+        Box::into_raw(boxed) as *mut c_void,
+        url.as_ptr(),
+        result,
+    )
+}
+
+/// Run the app's entry script: its precompiled bytecode when the build made it, else `code`.
+pub fn run_entry_script(env: &napi::Env, code: &str, filename: &str) -> Result<String, String> {
+    use napi::NapiRaw;
+    if let (Some(bytecode), Ok(url)) = (precompiled(filename, ".hbc"), std::ffi::CString::new(filename)) {
+        let mut result: napi_value = std::ptr::null_mut();
+        let status = unsafe { run_bytecode(env.raw(), bytecode, &url, &mut result) };
+        if status == napi::sys::Status::napi_ok {
+            return Ok(String::new());
+        }
+        return Err(pending_exception_message(env).unwrap_or_else(|| format!("jsr_run_script_buffer status {status}")));
+    }
+    run_script(env, code)
+}
+
+fn pending_exception_message(env: &napi::Env) -> Option<String> {
+    use napi::{JsUnknown, NapiRaw, NapiValue};
+    let mut is_pending = false;
+    unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut is_pending) };
+    if !is_pending {
+        return None;
+    }
+    let mut err: napi_value = std::ptr::null_mut();
+    unsafe { napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut err) };
+    unsafe { JsUnknown::from_raw_unchecked(env.raw(), err) }
+        .coerce_to_string()
+        .and_then(|s| s.into_utf8())
+        .and_then(|s| Ok(format!("JS exception: {}", s.as_str()?)))
+        .ok()
+}
+
 /// Evaluate `code` as a script named `filename` for the module runner, returning its completion
 /// value. On failure Hermes's exception is left pending.
 pub fn eval_named(env: &napi::Env, code: &str, filename: &str) -> Result<napi_value, ()> {
     use napi::NapiRaw;
+    if code.starts_with(CJS_WRAPPER_HEAD) {
+        if let (Some(bytecode), Ok(url)) = (precompiled(filename, ".cjs.hbc"), std::ffi::CString::new(filename)) {
+            let mut result: napi_value = std::ptr::null_mut();
+            let status = unsafe { run_bytecode(env.raw(), bytecode, &url, &mut result) };
+            if status != napi::sys::Status::napi_ok || result.is_null() {
+                return Err(());
+            }
+            return Ok(result);
+        }
+    }
     let (Ok(source), Ok(url)) = (env.create_string(code), std::ffi::CString::new(filename)) else {
         return Err(());
     };

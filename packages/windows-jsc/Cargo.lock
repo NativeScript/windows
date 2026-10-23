@@ -726,10 +726,15 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "dyn-clone",
+ "metadata-filter",
  "parking_lot",
  "sha1",
  "windows",
 ]
+
+[[package]]
+name = "metadata-filter"
+version = "0.1.0"
 
 [[package]]
 name = "mimalloc"

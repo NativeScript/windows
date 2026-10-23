@@ -65,7 +65,7 @@ $EngineMap = @{
     classic = @{ Package = 'nativescript'; NpmName = '@nativescript/windows' }
     v8       = @{ Dir = 'windows-v8';      Lib = 'windows_v8';      Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-v8' }
     quickjs  = @{ Dir = 'windows-quickjs'; Lib = 'windows_quickjs'; Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-quickjs' }
-    hermes   = @{ Dir = 'windows-hermes';  Lib = 'windows_hermes';  Dlls = @('hermes.dll', 'hermes-icu.dll');                                  Features = @('host_dll'); NpmName = '@nativescript/windows-hermes' }
+    hermes   = @{ Dir = 'windows-hermes';  Lib = 'windows_hermes';  Dlls = @('hermes.dll', 'hermes-icu.dll');                                  Features = @('host_dll'); NpmName = '@nativescript/windows-hermes'; Tools = @('hermesc.exe') }
     jsc      = @{ Dir = 'windows-jsc';      Lib = 'windows_jsc';     Dlls = @('JavaScriptCore.dll', 'icuin77.dll', 'icuuc77.dll', 'icudt77.dll'); Features = @('host_dll', 'jsc_link'); NpmName = '@nativescript/windows-jsc' }
 }
 $EngineInfo = $EngineMap[$Engine]
@@ -163,6 +163,15 @@ if ($Engine -ne 'classic') {
             Copy-Dll -Src $extraSrc -Dest (Join-Path $FrameworkLibs "x64\$extra")
         } else {
             Write-Host "  WARN: expected engine DLL not found: $extra" -ForegroundColor Yellow
+        }
+    }
+    # Engine build tools the app build runs (Hermes: hermesc.exe for bytecode precompilation).
+    foreach ($tool in @($EngineInfo.Tools | Where-Object { $_ })) {
+        $toolSrc = Join-Path $engineOut $tool
+        if (Test-Path $toolSrc) {
+            Copy-Item -Force $toolSrc (Join-Path $FrameworkRoot "tools\$tool")
+        } else {
+            Write-Host "  WARN: expected engine tool not found: $tool" -ForegroundColor Yellow
         }
     }
 

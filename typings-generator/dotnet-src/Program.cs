@@ -83,7 +83,7 @@ static class Generator
                 if (td.BaseType.IsNil) continue;
                 if (Helpers.ResolveEntityName(er, td.BaseType) != "System.Enum") continue;
                 TsTypeDecoder.EnumNames.Add(
-                    Helpers.StripArity(Helpers.FullName(er.GetString(td.Namespace), er.GetString(td.Name))));
+                    Helpers.StripArity(Helpers.FullName(Helpers.NamespaceOf(er, td) ?? "", er.GetString(td.Name))));
             }
         }
 
@@ -109,7 +109,8 @@ static class Generator
                 var vis     = typeDef.Attributes & TypeAttributes.VisibilityMask;
                 if (vis != TypeAttributes.Public && vis != TypeAttributes.NestedPublic) continue;
 
-                var ns       = reader.GetString(typeDef.Namespace);
+                var ns       = Helpers.NamespaceOf(reader, typeDef);
+                if (ns == null) continue; // nested in a type that isn't public
                 var name     = Helpers.StripArity(reader.GetString(typeDef.Name));
                 var fullName = Helpers.FullName(ns, name);
 
@@ -236,7 +237,7 @@ static class Generator
         if (!isIface && !typeDef.BaseType.IsNil)
         {
             string baseName = Helpers.ResolveEntityName(reader, typeDef.BaseType);
-            if (!string.IsNullOrEmpty(baseName) && baseName != "System.Object")
+            if (!string.IsNullOrEmpty(baseName) && !baseName.StartsWith("System.", StringComparison.Ordinal))
                 extendsClause = $" extends {Helpers.MapBuiltinType(baseName)}";
         }
 
@@ -257,7 +258,15 @@ static class Generator
             : (isIface ? (string.IsNullOrEmpty(extendsClause) ? " extends " : ", ") : " implements ") + string.Join(", ", ifaces);
 
         var sb = new StringBuilder();
-        sb.AppendLine($"    {kw} {simpleName}{extendsClause}{implementsClause} {{");
+        // Abstract classes, not static ones (abstract and sealed).
+        if (!isIface && (typeDef.Attributes & (TypeAttributes.Abstract | TypeAttributes.Sealed)) == TypeAttributes.Abstract)
+            kw = "abstract class";
+        var typeParams = typeDef.GetGenericParameters().Count;
+        var typeParamList = typeParams == 0 ? "" : "<" + string.Join(", ", Enumerable.Range(0, typeParams).Select(i => "T" + i)) + ">";
+        sb.AppendLine($"    {kw} {simpleName}{typeParamList}{extendsClause}{implementsClause} {{");
+        // `Box.of(System.Int32)`: the closed generic type, constructed like the class itself.
+        if (typeParams > 0 && !isIface)
+            sb.AppendLine($"      static of(...typeArguments: any[]): typeof {simpleName};");
 
         // Member names emitted on THIS type, so inlined collection members below don't duplicate them.
         var emitted = new HashSet<string>(StringComparer.Ordinal);
@@ -279,7 +288,7 @@ static class Generator
             bool evStatic = (adder.Attributes & MethodAttributes.Static) != 0;
             string evName = reader.GetString(ev.Name);
             string handler = Helpers.MapBuiltinType(Helpers.ResolveTypeName(reader, dec, ev.Type));
-            sb.AppendLine($"      {(evStatic ? "static " : "")}{evName}: {handler} | null;");
+            sb.AppendLine($"      {(evStatic ? "static " : "")}{evName}: {Helpers.Ts(handler, false)} | null;");
             emitted.Add(evName);
         }
 
@@ -288,12 +297,13 @@ static class Generator
         {
             var field = reader.GetFieldDefinition(fieldHandle);
             if ((field.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Public) continue;
+            if ((field.Attributes & FieldAttributes.SpecialName) != 0) continue; // an enum's value__
 
             string fName  = reader.GetString(field.Name);
             bool   fStat  = (field.Attributes & FieldAttributes.Static) != 0;
-            bool   fRo    = (field.Attributes & FieldAttributes.InitOnly) != 0;
+            bool   fRo    = (field.Attributes & (FieldAttributes.InitOnly | FieldAttributes.Literal)) != 0;
             string fType;
-            try   { fType = field.DecodeSignature(dec, null); }
+            try   { fType = Helpers.Ts(field.DecodeSignature(dec, null), false); }
             catch { continue; }
 
             sb.AppendLine($"      {(fStat ? "static " : "")}{(fRo ? "readonly " : "")}{fName}: {fType};");
@@ -308,8 +318,10 @@ static class Generator
             if (acc.Getter.IsNil) continue;
 
             var getter = reader.GetMethodDefinition(acc.Getter);
-            // Skip non-public properties (e.g. private helper properties)
-            if ((getter.Attributes & MethodAttributes.MemberAccessMask) != MethodAttributes.Public) continue;
+            // Public and protected properties (JS subclasses reach protected ones).
+            var getterAccess = getter.Attributes & MethodAttributes.MemberAccessMask;
+            bool prot = getterAccess is MethodAttributes.Family or MethodAttributes.FamORAssem;
+            if (getterAccess != MethodAttributes.Public && !prot) continue;
 
             bool stat    = (getter.Attributes & MethodAttributes.Static) != 0;
             bool ro      = acc.Setter.IsNil;
@@ -318,7 +330,16 @@ static class Generator
             try   { sig = prop.DecodeSignature(dec, null); }
             catch { continue; }
 
-            sb.AppendLine($"      {(stat ? "static " : "")}{(ro ? "readonly " : "")}{pName}: {sig.ReturnType};");
+            var mods = (prot ? "protected " : "") + (stat ? "static " : "");
+            var pType = Helpers.Ts(sig.ReturnType, false);
+            // Virtual properties as accessors, so a JS subclass can override them with get/set.
+            if ((getter.Attributes & MethodAttributes.Virtual) != 0 && (getter.Attributes & MethodAttributes.Final) == 0)
+            {
+                sb.AppendLine($"      {mods}get {pName}(): {pType};");
+                if (!ro) sb.AppendLine($"      {mods}set {pName}(value: {pType});");
+            }
+            else
+                sb.AppendLine($"      {mods}{(ro ? "readonly " : "")}{pName}: {pType};");
             emitted.Add(pName);
         }
 
@@ -326,7 +347,9 @@ static class Generator
         {
             if (accessors.Contains(methodHandle) || eventAccessors.Contains(methodHandle)) continue;
             var method = reader.GetMethodDefinition(methodHandle);
-            if ((method.Attributes & MethodAttributes.MemberAccessMask) != MethodAttributes.Public) continue;
+            var access = method.Attributes & MethodAttributes.MemberAccessMask;
+            bool isProtected = access is MethodAttributes.Family or MethodAttributes.FamORAssem;
+            if (access != MethodAttributes.Public && !isProtected) continue;
 
             string mName = reader.GetString(method.Name);
             bool isCtor = mName == ".ctor";
@@ -337,24 +360,68 @@ static class Generator
             try   { sig = method.DecodeSignature(dec, null); }
             catch { continue; }
 
-            var paramHandles = method.GetParameters().ToArray();
-            var paramStrs    = new List<string>();
+            // Parameter rows by position (sequence 0, when present, is the return value).
+            var paramRows = new Dictionary<int, Parameter>();
+            foreach (var ph in method.GetParameters())
+            {
+                var p = reader.GetParameter(ph);
+                if (p.SequenceNumber > 0) paramRows[p.SequenceNumber - 1] = p;
+            }
+            var paramStrs = new List<string>();
+            var outTypes  = new List<string>();
+            int firstTrailingOut = sig.ParameterTypes.Length;
+            for (int i = sig.ParameterTypes.Length - 1; i >= 0; i--)
+            {
+                if (!paramRows.TryGetValue(i, out var row) || (row.Attributes & ParameterAttributes.Out) == 0) break;
+                firstTrailingOut = i;
+            }
+            // Optional (`?`) only where every later parameter can be left off too.
+            var canOmit = new bool[sig.ParameterTypes.Length + 1];
+            canOmit[sig.ParameterTypes.Length] = true;
+            for (int i = sig.ParameterTypes.Length - 1; i >= 0; i--)
+            {
+                paramRows.TryGetValue(i, out var row);
+                var optional = (row.Attributes & (ParameterAttributes.Optional | ParameterAttributes.HasDefault | ParameterAttributes.Out)) != 0
+                    || Helpers.IsParamArray(reader, row);
+                canOmit[i] = canOmit[i + 1] && optional;
+            }
             for (int i = 0; i < sig.ParameterTypes.Length; i++)
             {
                 string pn = "p" + i;
-                if (i < paramHandles.Length)
+                paramRows.TryGetValue(i, out var row);
+                if (paramRows.ContainsKey(i))
                 {
-                    var candidate = reader.GetString(reader.GetParameter(paramHandles[i]).Name);
-                    if (!string.IsNullOrWhiteSpace(candidate)) pn = candidate;
+                    var candidate = reader.GetString(row.Name);
+                    if (!string.IsNullOrWhiteSpace(candidate)) pn = Helpers.SafeName(candidate);
                 }
-                paramStrs.Add($"{pn}: {sig.ParameterTypes[i]}");
+                var raw = sig.ParameterTypes[i];
+                var byRef = raw.StartsWith(Helpers.RefMark, StringComparison.Ordinal);
+                var type = Helpers.Ts(byRef ? raw[Helpers.RefMark.Length..] : raw, true);
+                var isOut = (row.Attributes & ParameterAttributes.Out) != 0;
+                if (isOut) outTypes.Add(Helpers.Ts(raw[(byRef ? Helpers.RefMark.Length : 0)..], false));
+                if (paramRows.ContainsKey(i) && Helpers.IsParamArray(reader, row) && i == sig.ParameterTypes.Length - 1)
+                    paramStrs.Add($"...{pn}: {type}");
+                else if (byRef)
+                    paramStrs.Add($"{pn}{(canOmit[i] ? "?" : "")}: {(isOut ? "" : type + " | ")}{{ value?: {type} }}");
+                else
+                    paramStrs.Add($"{pn}{(canOmit[i] ? "?" : "")}: {type}");
             }
 
+            string typeArgs = method.GetGenericParameters().Count is var n and > 0
+                ? "<" + string.Join(", ", Enumerable.Range(0, n).Select(k => "M" + k)) + ">" : "";
             if (isCtor)
                 sb.AppendLine($"      constructor({string.Join(", ", paramStrs)});");
             else
             {
-                sb.AppendLine($"      {(isStatic ? "static " : "")}{mName}({string.Join(", ", paramStrs)}): {sig.ReturnType};");
+                var prefix = (isProtected ? "protected " : "") + (isStatic ? "static " : "");
+                var ret = Helpers.Ts(sig.ReturnType, false);
+                // Out parameters left off come back with the result: [result, ...outs].
+                if (firstTrailingOut < sig.ParameterTypes.Length && outTypes.Count > 0)
+                {
+                    var tuple = (ret == "void" ? outTypes : new[] { ret }.Concat(outTypes.TakeLast(sig.ParameterTypes.Length - firstTrailingOut))).ToList();
+                    sb.AppendLine($"      {prefix}{mName}{typeArgs}({string.Join(", ", paramStrs.Take(firstTrailingOut))}): [{string.Join(", ", tuple)}];");
+                }
+                sb.AppendLine($"      {prefix}{mName}{typeArgs}({string.Join(", ", paramStrs)}): {ret};");
                 emitted.Add(mName);
             }
         }
@@ -464,6 +531,51 @@ static class Helpers
         return tick >= 0 ? name.Substring(0, tick) : name;
     }
 
+    public const string RefMark = "$ref$";
+
+    // The namespace a type is declared in, with outer types for a nested one (`Ns.Outer`); null when
+    // an outer type isn't public.
+    public static string? NamespaceOf(MetadataReader reader, TypeDefinition typeDef)
+    {
+        if (!typeDef.IsNested) return reader.GetString(typeDef.Namespace);
+        var outer = reader.GetTypeDefinition(typeDef.GetDeclaringType());
+        var vis = outer.Attributes & TypeAttributes.VisibilityMask;
+        if (vis != TypeAttributes.Public && vis != TypeAttributes.NestedPublic) return null;
+        var outerNs = NamespaceOf(reader, outer);
+        return outerNs == null ? null : FullName(outerNs, reader.GetString(outer.Name));
+    }
+
+    public static bool IsParamArray(MetadataReader reader, Parameter row)
+    {
+        foreach (var ah in row.GetCustomAttributes())
+        {
+            var ctor = reader.GetCustomAttribute(ah).Constructor;
+            EntityHandle owner = ctor.Kind == HandleKind.MemberReference
+                ? reader.GetMemberReference((MemberReferenceHandle)ctor).Parent
+                : ctor.Kind == HandleKind.MethodDefinition ? reader.GetMethodDefinition((MethodDefinitionHandle)ctor).GetDeclaringType() : default;
+            if (!owner.IsNil && ResolveEntityName(reader, owner) == "System.ParamArrayAttribute") return true;
+        }
+        return false;
+    }
+
+    static readonly HashSet<string> Reserved = new(StringComparer.Ordinal)
+    {
+        "function", "var", "let", "const", "class", "default", "delete", "in", "new", "this", "typeof",
+        "void", "with", "yield", "enum", "export", "import", "super", "switch", "case", "catch", "finally",
+        "for", "if", "return", "throw", "try", "while", "do", "else", "break", "continue", "debugger",
+        "instanceof", "extends", "null", "true", "false",
+    };
+
+    public static string SafeName(string name) => Reserved.Contains(name) ? name + "_" : name;
+
+    // A decoded type as TypeScript, for a parameter (what JS may pass) or a result (what JS gets).
+    public static string Ts(string type, bool parameter) => type
+        .Replace("$bytes$", parameter ? "Uint8Array | ArrayBuffer | number[]" : "Uint8Array")
+        .Replace("$long$[]", "(number | bigint)[]")
+        .Replace("$long$", "number | bigint")
+        .Replace("$byte$", "number")
+        .Replace(RefMark, "");
+
     public static string FullName(string ns, string name)
     {
         name = StripArity(name);
@@ -533,43 +645,87 @@ class TsTypeDecoder : ISignatureTypeProvider<string, object?>
         PrimitiveTypeCode.Char    => "string",
         PrimitiveTypeCode.String  => "string",
         PrimitiveTypeCode.Object  => "any",
-        PrimitiveTypeCode.SByte   or PrimitiveTypeCode.Byte
+        // Markers finished by Helpers.Ts: byte[] is a Uint8Array, longs may be BigInts.
+        PrimitiveTypeCode.Byte    => "$byte$",
+        PrimitiveTypeCode.Int64   or PrimitiveTypeCode.UInt64 => "$long$",
+        PrimitiveTypeCode.SByte
             or PrimitiveTypeCode.Int16  or PrimitiveTypeCode.UInt16
             or PrimitiveTypeCode.Int32  or PrimitiveTypeCode.UInt32
-            or PrimitiveTypeCode.Int64  or PrimitiveTypeCode.UInt64
             or PrimitiveTypeCode.Single or PrimitiveTypeCode.Double
             or PrimitiveTypeCode.IntPtr or PrimitiveTypeCode.UIntPtr => "number",
         _ => "any",
     };
 
+    // Non-generic BCL types as JS sees them; other System types (not declared here) are `any`.
+    static string MapSystem(string fn) => fn switch
+    {
+        "System.Threading.Tasks.Task" or "System.Threading.Tasks.ValueTask" => "PromiseLike<void>",
+        "System.Action" => "(() => void)",
+        "System.EventHandler" => "((sender: any, e: any) => void)",
+        "System.Byte" => "$byte$",
+        "System.Int64" or "System.UInt64" => "$long$",
+        _ when fn.StartsWith("System.", StringComparison.Ordinal) && Helpers.MapBuiltinType(fn) == fn => "any",
+        _ => Helpers.MapBuiltinType(fn),
+    };
+
     public string GetTypeFromDefinition(MetadataReader r, TypeDefinitionHandle h, byte _)
     {
         var td = r.GetTypeDefinition(h);
-        var fn = Helpers.FullName(r.GetString(td.Namespace), r.GetString(td.Name));
+        var raw = r.GetString(td.Name);
+        if (raw.Contains('`')) return Helpers.FullName(Helpers.NamespaceOf(r, td) ?? "", raw) + "`";
+        var fn = Helpers.FullName(Helpers.NamespaceOf(r, td) ?? "", raw);
         if (EnumNames.Contains(Helpers.StripArity(fn))) return "number";
-        return Helpers.MapBuiltinType(fn);
+        return MapSystem(fn);
     }
 
     public string GetTypeFromReference(MetadataReader r, TypeReferenceHandle h, byte _)
     {
         var tr = r.GetTypeReference(h);
-        var fn = Helpers.FullName(r.GetString(tr.Namespace), r.GetString(tr.Name));
+        var raw = r.GetString(tr.Name);
+        // A nested type's reference is scoped by its outer type's.
+        var ns = tr.ResolutionScope.Kind == HandleKind.TypeReference
+            ? Helpers.ResolveEntityName(r, (TypeReferenceHandle)tr.ResolutionScope) : r.GetString(tr.Namespace);
+        if (raw.Contains('`')) return Helpers.FullName(ns, raw) + "`";
+        var fn = Helpers.FullName(ns, raw);
         if (EnumNames.Contains(Helpers.StripArity(fn))) return "number";
-        return Helpers.MapBuiltinType(fn);
+        return MapSystem(fn);
     }
 
     public string GetTypeFromSpecification(MetadataReader r, object? ctx, TypeSpecificationHandle h, byte _)
         => r.GetTypeSpecification(h).DecodeSignature(this, ctx);
 
-    public string GetSZArrayType(string elem)                           => $"{elem}[]";
-    public string GetArrayType(string elem, ArrayShape _)               => $"{elem}[]";
-    public string GetByReferenceType(string elem)                       => elem;
+    public string GetSZArrayType(string elem)                           => elem == "$byte$" ? "$bytes$" : Array(elem);
+    public string GetArrayType(string elem, ArrayShape _)               => Array(elem);
+    public string GetByReferenceType(string elem)                       => Helpers.RefMark + elem;
+    static string Array(string elem) => elem.Contains(' ') && !elem.StartsWith('(') ? $"({elem})[]" : $"{elem}[]";
     public string GetPointerType(string _)                              => "any";
     public string GetPinnedType(string elem)                            => elem;
     public string GetModifiedType(string _, string unmodified, bool __) => unmodified;
     public string GetFunctionPointerType(MethodSignature<string> _)     => "Function";
-    public string GetGenericMethodParameter(object? _, int index)       => $"T{index}";
+    public string GetGenericMethodParameter(object? _, int index)       => $"M{index}";
     public string GetGenericTypeParameter(object? _, int index)         => $"T{index}";
+
+    // BCL delegates as JS functions, tasks as promises (results are awaitable), Nullable<T> as
+    // `T | null`; other BCL generics are `any`.
     public string GetGenericInstantiation(string generic, ImmutableArray<string> typeArgs)
-        => $"{generic}<{string.Join(", ", typeArgs)}>";
+    {
+        // A generic definition comes back from GetTypeFrom* with a trailing backtick.
+        generic = generic.TrimEnd('`');
+        string Params(IEnumerable<string> types) => string.Join(", ", types.Select((t, i) => $"arg{i}: {Helpers.Ts(t, false)}"));
+        switch (generic)
+        {
+            case "System.Action": return $"(({Params(typeArgs)}) => void)";
+            case "System.Func": return $"(({Params(typeArgs.Take(typeArgs.Length - 1))}) => {Helpers.Ts(typeArgs[^1], true)})";
+            case "System.EventHandler": return $"((sender: any, e: {typeArgs[0]}) => void)";
+            case "System.Nullable": return $"{typeArgs[0]} | null";
+            case "System.Threading.Tasks.Task":
+            case "System.Threading.Tasks.ValueTask": return $"PromiseLike<{typeArgs[0]}>";
+            case "System.Predicate": return $"(({Params(typeArgs)}) => boolean)";
+            case "System.Memory":
+            case "System.ReadOnlyMemory":
+            case "System.ArraySegment": return typeArgs[0] == "$byte$" ? "$bytes$" : "any";
+        }
+        if (generic == "any" || generic.StartsWith("System.", StringComparison.Ordinal)) return "any";
+        return $"{generic}<{string.Join(", ", typeArgs)}>";
+    }
 }

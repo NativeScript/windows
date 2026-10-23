@@ -65,6 +65,13 @@ pub mod shim {
             file: *const c_char,
             result: *mut NapiValue,
         ) -> NapiStatus;
+        fn qjs_execute_script_cached(
+            env: NapiEnv,
+            script: NapiValue,
+            file: *const c_char,
+            cache_dir: *const c_char,
+            result: *mut NapiValue,
+        ) -> NapiStatus;
         fn qjs_free_napi_env(env: NapiEnv) -> NapiStatus;
         fn qjs_free_runtime(rt: NapiRuntime) -> NapiStatus;
         fn qjs_execute_pending_jobs(env: NapiEnv) -> NapiStatus;
@@ -117,7 +124,11 @@ pub mod shim {
             napi_create_string_utf8(env, c.as_ptr(), NAPI_AUTO_LENGTH, &mut script);
             let file = CString::new("<script>").unwrap();
             let mut result: NapiValue = std::ptr::null_mut();
-            let st = qjs_execute_script(env, script, file.as_ptr(), &mut result);
+            let cache_dir = runtime::local_folder().and_then(|d| CString::new(d).ok());
+            let st = match &cache_dir {
+                Some(dir) => qjs_execute_script_cached(env, script, file.as_ptr(), dir.as_ptr(), &mut result),
+                None => qjs_execute_script(env, script, file.as_ptr(), &mut result),
+            };
             runtime::debug_output(&format!(
                 "[NativeScript] run_script_checked: qjs_execute_script status={st} result_null={}\n",
                 result.is_null()
@@ -146,8 +157,19 @@ pub mod shim {
             return Err(());
         };
         let mut result: NapiValue = std::ptr::null_mut();
+        // Compiled bytecode is cached in the app's local folder once the host has set it.
+        let cache_dir = runtime::local_folder().and_then(|d| CString::new(d).ok());
         let status = unsafe {
-            qjs_execute_script(env.raw() as NapiEnv, source.raw() as NapiValue, file.as_ptr(), &mut result)
+            match &cache_dir {
+                Some(dir) => qjs_execute_script_cached(
+                    env.raw() as NapiEnv,
+                    source.raw() as NapiValue,
+                    file.as_ptr(),
+                    dir.as_ptr(),
+                    &mut result,
+                ),
+                None => qjs_execute_script(env.raw() as NapiEnv, source.raw() as NapiValue, file.as_ptr(), &mut result),
+            }
         };
         if status != 0 || result.is_null() {
             return Err(());

@@ -1,5 +1,8 @@
 #include "jsr.h"
 
+// Collects now; JSGarbageCollect only hints that a collection would help.
+extern "C" JS_EXPORT void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
+
 napi_status js_create_runtime(napi_runtime *runtime) {
     if (!runtime) return napi_invalid_arg;
     *runtime = (napi_runtime) JSGlobalContextCreateInGroup(nullptr, nullptr);
@@ -14,7 +17,7 @@ napi_status js_create_napi_env(napi_env* env, napi_runtime runtime) {
 
     napi_value gc;
     napi_create_function(*env, "gc", strlen("gc"), [](napi_env env, napi_callback_info info) -> napi_value {
-        JSGarbageCollect(env->context);
+        JSSynchronousGarbageCollectForDebugging(env->context);
         napi_value undefined;
         napi_get_undefined(env, &undefined);
         return undefined;

@@ -20,24 +20,11 @@ public static partial class Bridge
     {
         var method = req.Method ?? throw new ArgumentException("Method is required");
 
-            if (method == "__release" && req.Handle.HasValue)
-            {
-                var id = req.Handle.Value;
-                s_handles.TryRemove(id, out _);
-                if (s_nativePtrs.TryRemove(id, out var nativePtr))
-                {
-                    RemoveNativePtr(id, nativePtr);
-                    try
-                    {
-                        Marshal.Release(nativePtr);
-                    }
-                    catch
-                    {
-                    }
-                }
-
-                return DispatchResult.Void;
-            }
+        if (method == "__release" && req.Handle.HasValue)
+        {
+            ReleaseHandle(req.Handle.Value, -1);
+            return DispatchResult.Void;
+        }
 
         object? target = null;
         Type type;
@@ -112,7 +99,11 @@ public static partial class Bridge
             foreach (var m in candidates)
             {
                 var parameters = m.GetParameters();
-                var built = BuildArgs(args, parameters);
+                // MethodInfo.Invoke takes exactly as many arguments as the method has parameters.
+                if (parameters.Length != args.Length) continue;
+                object?[] built;
+                try { built = BuildArgsExact(args, parameters); }
+                catch { continue; }
                 try
                 {
                     var res = (m.Invoke(target, built));
@@ -126,7 +117,7 @@ public static partial class Bridge
                         var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
                         return Box(res);
                     }
-                    catch { /* retry failed — try next candidate */ }
+                    catch { /* retry failed: try the next candidate */ }
                 }
                 catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
                 {
@@ -136,9 +127,8 @@ public static partial class Bridge
                         var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
                         return Box(res);
                     }
-                    catch { /* retry failed — try next candidate */ }
+                    catch { /* retry failed: try the next candidate */ }
                 }
-                finally { if (built.Length > 0) ReturnArgs(built); }
             }
             throw new MissingMethodException(
                 $"Method '{method}' ({args.Length} args) not found on {type.FullName}");
@@ -181,7 +171,41 @@ public static partial class Bridge
     internal static DispatchEntry BuildDispatchEntry(Type type, MethodInfo mi)
     {
         var parameters = mi.GetParameters();
+        if (parameters.Any(p => p.ParameterType.IsByRef || p.ParameterType.IsByRefLike) || mi.ReturnType.IsByRefLike)
+            return new DispatchEntry(CompileInvoker(type, mi, parameters), parameters);
+        return new DispatchEntry(new TieredInvoker(type, mi, parameters).Invoke, parameters);
+    }
 
+    // MethodInvoker (cheap to create) until the method is called often enough to pay for a compiled
+    // delegate (~80 us to build, a few ns per call).
+    private sealed class TieredInvoker(Type type, MethodInfo mi, ParameterInfo[] parameters)
+    {
+        private const int CompileAfter = 32;
+        private readonly MethodInvoker _invoker = MethodInvoker.Create(mi);
+        private Func<object?, object?[], object?>? _compiled;
+        private int _calls;
+
+        public object? Invoke(object? target, object?[] args)
+        {
+            var compiled = _compiled;
+            if (compiled is not null) return compiled(target, args);
+            if (Interlocked.Increment(ref _calls) == CompileAfter)
+                _compiled = CompileInvoker(type, mi, parameters);
+            try
+            {
+                return _invoker.Invoke(target, new Span<object?>(args, 0, parameters.Length));
+            }
+            catch (TargetInvocationException tie) when (tie.InnerException is not null)
+            {
+                // Throw what the method threw, as the compiled delegate does.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+                throw;
+            }
+        }
+    }
+
+    private static Func<object?, object?[], object?> CompileInvoker(Type type, MethodInfo mi, ParameterInfo[] parameters)
+    {
         try
         {
             var targetParam = Expression.Parameter(typeof(object), "t");
@@ -201,18 +225,14 @@ public static partial class Bridge
             else if (body.Type != typeof(object))
                 body = Expression.Convert(body, typeof(object));
 
-            var fn = Expression.Lambda<Func<object?, object?[], object?>>(
+            return Expression.Lambda<Func<object?, object?[], object?>>(
                 body, targetParam, argsParam).Compile();
-
-            return new DispatchEntry(fn, parameters);
         }
         catch
         {
             // mi.Invoke validates args.Length == paramCount; slice the rented buffer if needed.
             int pc = parameters.Length;
-            return new DispatchEntry(
-                (t, a) => mi.Invoke(t, a.Length == pc ? a : a[..pc]),
-                parameters);
+            return (t, a) => mi.Invoke(t, a.Length == pc ? a : a[..pc]);
         }
     }
 
@@ -227,10 +247,10 @@ public static partial class Bridge
 
     // Keyed by the accessor name as called ("get_Length") plus the prefix length, so a warm lookup
     // allocates no property-name substring.
-    private static PropertyInfo? GetCachedProp(Type type, string method, int prefixLen, BindingFlags flags)
+    private static DataMember? GetCachedProp(Type type, string method, int prefixLen, BindingFlags flags)
         => s_propCache.GetOrAdd(
             new PropKey(type, method, prefixLen, flags),
-            static k => k.Type.GetProperty(k.Name[k.PrefixLen..], k.Flags));
+            static k => DataMember.Find(k.Type, k.Name[k.PrefixLen..], k.Flags));
 
     // Pooled: rented array passed to the compiled delegate (which accesses by index,
     // not by Length). Caller must return via ReturnArgs immediately after invoke.
@@ -278,6 +298,8 @@ public static partial class Bridge
         if (value is UIntPtr up)
             return DispatchResult.Primitive(unchecked((long)up.ToUInt64()), typeof(long));
 
+        if (TryGetBytes(value, out _, out _)) return DispatchResult.Bytes(value);
+
         var t = value.GetType();
         var info = GetBoxInfo(t);
 
@@ -302,9 +324,8 @@ public static partial class Bridge
 
 
 
-            var id = Interlocked.Increment(ref s_nextHandle);
-            s_handles[id] = value;
-            if (jsHolder is not null) jsHolder.HandleId = id;
+        var id = HandleFor(value);
+        if (jsHolder is not null) jsHolder.HandleId = id;
 
             // Try to obtain a canonical IInspectable/IUnknown pointer for COM/WinRT objects
             // so the runtime can call native vtable methods directly.
@@ -317,7 +338,7 @@ public static partial class Bridge
             // (GetNativePtrForHandle): making a COM wrapper costs more than the rest of the call.
             try
             {
-                if (info.WinRTNativeObject is not null || jsHolder is not null)
+                if ((info.WinRTNativeObject is not null || jsHolder is not null) && !s_nativePtrs.ContainsKey(id))
                 {
                     var p = ObtainNativePtr(value);
                     if (p != IntPtr.Zero)
@@ -401,12 +422,30 @@ public static partial class Bridge
     }
 
     // What a .NET collection supports, for the JS side to make it array-like: 1 = enumerable
-    // (for...of, map, ...), 2 = has a count (length), 4 = indexed by position (list[0]).
+    // (for...of, map, ...), 2 = has a count (length), 4 = indexed by position (list[0]),
+    // 8 = keyed by string (dict.key / dict['key']).
     public static int CollectionKind(object? value)
     {
         if (value is null or string || value is not System.Collections.IEnumerable) return 0;
         var info = GetCollectionInfo(value.GetType());
-        return 1 | (info.Count is not null ? 2 : 0) | (info.Indexer is not null ? 4 : 0);
+        return 1 | (info.Count is not null ? 2 : 0) | (info.Indexer is not null ? 4 : 0) | (info.KeyIndexer is not null ? 8 : 0);
+    }
+
+    // [found, value] for `key` of a string-keyed dictionary.
+    public static object?[] DictionaryTryGet(object? value, string key)
+    {
+        var info = value is null ? null : GetCollectionInfo(value.GetType());
+        if (info?.KeyIndexer is null || info.ContainsKey is null) return [false, null];
+        if (info.ContainsKey.Invoke(value, [key]) is not true) return [false, null];
+        return [true, info.KeyIndexer.GetValue(value, [key])];
+    }
+
+    public static void DictionarySet(object? value, string key, object? item)
+    {
+        var info = value is null ? null : GetCollectionInfo(value.GetType());
+        if (info?.KeyIndexer is not { CanWrite: true } indexer)
+            throw new NotSupportedException($"{value?.GetType().FullName} has no settable string keys");
+        indexer.SetValue(value, CoerceBin(item, indexer.PropertyType), [key]);
     }
 
     // A collection's items, as an array the runtime copies into a JS array.
@@ -449,6 +488,9 @@ public static partial class Bridge
     {
         public PropertyInfo? Count;
         public PropertyInfo? Indexer;
+        // The `this[string]` of an IDictionary<string, T> / IReadOnlyDictionary<string, T>.
+        public PropertyInfo? KeyIndexer;
+        public MethodInfo? ContainsKey;
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, CollectionInfo> s_collectionInfo = new();
@@ -464,6 +506,13 @@ public static partial class Bridge
                 info.Indexer = i.GetProperty("Item");
             if (info.Count is null && (definition == typeof(ICollection<>) || definition == typeof(IReadOnlyCollection<>) || definition == typeof(System.Collections.ICollection)))
                 info.Count = i.GetProperty("Count");
+            if ((info.KeyIndexer is null || !info.KeyIndexer.CanWrite)
+                && (definition == typeof(IDictionary<,>) || definition == typeof(IReadOnlyDictionary<,>))
+                && i.GetGenericArguments()[0] == typeof(string))
+            {
+                info.KeyIndexer = i.GetProperty("Item");
+                info.ContainsKey = i.GetMethod("ContainsKey");
+            }
         }
         // A writable IList<T> indexer beats a read-only IReadOnlyList<T> one.
         if (info.Indexer is { CanWrite: false })
@@ -481,31 +530,45 @@ public static partial class Bridge
         return t is not null && t.IsInstanceOfType(value);
     }
 
-    internal static DispatchResult BuildMembersResult(Type t)
-    {
-        const BindingFlags inst = BindingFlags.Public | BindingFlags.Instance;
-        const BindingFlags stat = BindingFlags.Public | BindingFlags.Static;
-
-        var instProps = Array.FindAll(t.GetProperties(inst), p => p.GetIndexParameters().Length == 0);
-        var statProps = Array.FindAll(t.GetProperties(stat), p => p.GetIndexParameters().Length == 0);
-
-        return DispatchResult.Members(
-            methods:               t.GetMethods(inst).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
-            props:                 instProps.Where(p => p.GetGetMethod() != null).Select(p => p.Name).Distinct().ToArray(),
-            staticMethods:         t.GetMethods(stat).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
-            staticProps:           statProps.Where(p => p.GetGetMethod() != null).Select(p => p.Name).Distinct().ToArray(),
-            readonlyProps:         instProps.Where(p => p.GetGetMethod() != null && p.GetSetMethod() == null).Select(p => p.Name).Distinct().ToArray(),
-            readonlyStaticProps:   statProps.Where(p => p.GetGetMethod() != null && p.GetSetMethod() == null).Select(p => p.Name).Distinct().ToArray(),
-            writeonlyProps:        instProps.Where(p => p.GetGetMethod() == null && p.GetSetMethod() != null).Select(p => p.Name).Distinct().ToArray(),
-            writeonlyStaticProps:  statProps.Where(p => p.GetGetMethod() == null && p.GetSetMethod() != null).Select(p => p.Name).Distinct().ToArray()
-        );
-    }
-
     internal static Type? ResolveType(string? assemblyName, string? typeName)
     {
         if (string.IsNullOrEmpty(typeName)) return null;
-        return s_typeCache.GetOrAdd((assemblyName ?? "", typeName),
-            static k => ResolveTypeCore(k.Assembly.Length == 0 ? null : k.Assembly, k.Type));
+        var key = (assemblyName ?? "", typeName);
+        if (s_typeCache.TryGetValue(key, out var cached)) return cached;
+        var generation = Volatile.Read(ref s_assemblyGeneration);
+        if (s_missingTypes.TryGetValue(key, out var missedAt) && missedAt == generation) return null;
+        var t = ResolveTypeCore(key.Item1.Length == 0 ? null : key.Item1, typeName)
+            ?? ResolveNestedType(key.Item1.Length == 0 ? null : key.Item1, typeName)
+            ?? ResolveGenericType(key.Item1.Length == 0 ? null : key.Item1, typeName);
+        if (t is not null) s_typeCache[key] = t;
+        else s_missingTypes[key] = generation;
+        return t;
+    }
+
+    // Type lookups that failed, with the assembly-load generation they failed in.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, string), int> s_missingTypes = new();
+    private static int s_assemblyGeneration;
+
+    private static void OnAssemblyLoad(object? sender, AssemblyLoadEventArgs args) =>
+        Interlocked.Increment(ref s_assemblyGeneration);
+
+    // `Outer.Inner` as JS spells a nested type: CLR names it `Outer+Inner`.
+    private static Type? ResolveNestedType(string? assemblyName, string typeName)
+    {
+        if (typeName.IndexOf('[') >= 0) return null;
+        for (var dot = typeName.LastIndexOf('.'); dot > 0; dot = typeName.LastIndexOf('.', dot - 1))
+        {
+            var outer = ResolveType(assemblyName, typeName[..dot]);
+            if (outer is null) continue;
+            Type? t = outer;
+            foreach (var part in typeName[(dot + 1)..].Split('.'))
+            {
+                t = t.GetNestedType(part, BindingFlags.Public | BindingFlags.NonPublic);
+                if (t is null) break;
+            }
+            return t;
+        }
+        return null;
     }
 
     private static Type? ResolveTypeInAssembly(Assembly asm, string typeName, int lastDot, string shortName)

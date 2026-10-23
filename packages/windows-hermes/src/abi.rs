@@ -104,12 +104,29 @@ pub extern "C" fn runtime_runscript(
             if run_module_entry(raw, filename, &code) {
                 return;
             }
-            if let Err(e) = host::run_script_checked(raw, &code) {
+            let name = if filename.is_null() { String::new() } else { CStr::from_ptr(filename).to_string_lossy().into_owned() };
+            let path = APP_ROOT.with(|r| entry_script_path(&r.borrow(), &name));
+            if let Err(e) = crate::run_entry_script(&Env::from_raw(raw as napi::sys::napi_env), &code, &path) {
                 eprintln!("[NativeScript] script error: {e}");
                 runtime::store_last_js_error(e);
             }
         }
     });
+}
+
+/// The path of an entry script the host names by file name (`vendor.js`): in `app/` under the app
+/// root, or in the root.
+fn entry_script_path(app_root: &str, name: &str) -> String {
+    let path = std::path::Path::new(name);
+    if path.is_absolute() || app_root.is_empty() {
+        return name.to_string();
+    }
+    let root = std::path::Path::new(app_root);
+    [root.join("app").join(path), root.join(path)]
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// Hermes's script evaluator for the module runner (`runtime::napi_engine::module_runner`).

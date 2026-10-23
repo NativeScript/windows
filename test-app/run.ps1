@@ -130,6 +130,12 @@ if ($EngineDll) {
 # The ManifestMerger task ships prebuilt; dotnet-tool runs from source (cargo) because the
 # template's tools\*.exe are not copied, which makes the csproj fall back to `cargo run`.
 Copy-Tree (Join-Path $Framework "tools\ManifestMerger") (Join-Path $PlatformsDir "tools\ManifestMerger")
+# Hermes: its bytecode compiler sits beside the engine DLL; Release builds precompile the app.
+$hermesc = if ($EngineDll) { Join-Path (Split-Path $runtimeDll) "hermesc.exe" } else { "" }
+if ($hermesc -and (Test-Path $hermesc)) {
+    Copy-Item -Force $hermesc (Join-Path $PlatformsDir "tools\hermesc.exe")
+    Copy-Item -Force (Join-Path $Framework "tools\hermes-precompile.ps1") (Join-Path $PlatformsDir "tools\hermes-precompile.ps1")
+}
 
 # ── 3. prepare (app, App_Resources, plugins) ─────────────────────────────────
 Step "Preparing app, App_Resources and plugins"

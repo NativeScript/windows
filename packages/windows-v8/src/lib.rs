@@ -20,6 +20,13 @@ pub mod ffi {
     extern "C" {
         pub fn js_create_runtime(runtime: *mut NapiRuntime) -> i32;
         pub fn js_create_napi_env(env: *mut napi_env, runtime: NapiRuntime) -> i32;
+        pub fn js_execute_script_cached(
+            env: napi_env,
+            script: napi_value,
+            file: *const c_char,
+            cache_dir: *const c_char,
+            result: *mut napi_value,
+        ) -> i32;
         pub fn js_execute_script(
             env: napi_env,
             script: napi_value,
@@ -41,9 +48,28 @@ pub mod ffi {
 /// The module loader's Rust callbacks (see `csrc/win_jsr.cpp`).
 pub mod esm;
 
-/// V8's fatal/OOM error handler (registered by `win_jsr.cpp`): logs to the trace log before the
-/// process goes down, since a packaged app has no visible stdout/stderr for V8's own CHECK-failure
-/// aborts (which bypass Rust's panic machinery entirely).
+/// Runs a script named `file`, through the code cache once the app's local folder is known.
+unsafe fn execute(env: napi::sys::napi_env, source: napi::sys::napi_value, file: &std::ffi::CStr, result: *mut napi::sys::napi_value) -> i32 {
+    match runtime::local_folder().and_then(|d| std::ffi::CString::new(d).ok()) {
+        Some(dir) => ffi::js_execute_script_cached(env, source, file.as_ptr(), dir.as_ptr(), result),
+        None => ffi::js_execute_script(env, source, file.as_ptr(), result),
+    }
+}
+
+/// `__nsCompileScript`'s evaluator: CommonJS modules compile through the code cache too.
+pub fn eval_named(env: &napi::Env, code: &str, filename: &str) -> Result<napi::sys::napi_value, ()> {
+    use napi::NapiRaw;
+    let (Ok(source), Ok(file)) = (env.create_string(code), std::ffi::CString::new(filename)) else {
+        return Err(());
+    };
+    let mut result: napi::sys::napi_value = std::ptr::null_mut();
+    let status = unsafe { execute(env.raw(), source.raw(), &file, &mut result) };
+    if status != 0 || result.is_null() {
+        return Err(());
+    }
+    Ok(result)
+}
+
 #[no_mangle]
 pub extern "C" fn ns_v8_fatal_error(
     location: *const std::os::raw::c_char,
@@ -122,8 +148,7 @@ pub mod host {
             let source = env.create_string(code).map_err(|e| e.to_string())?;
             let file = CString::new("<script>").unwrap();
             let mut result: napi::sys::napi_value = std::ptr::null_mut();
-            let status =
-                ffi::js_execute_script(env.raw(), source.raw(), file.as_ptr(), &mut result);
+            let status = super::execute(env.raw(), source.raw(), &file, &mut result);
             if status != 0 || result.is_null() {
                 let mut pending = false;
                 napi::sys::napi_is_exception_pending(env.raw(), &mut pending);

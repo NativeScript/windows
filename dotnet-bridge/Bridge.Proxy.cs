@@ -17,7 +17,7 @@ public static partial class Bridge
     // The types behind JS subclasses, emitted at runtime. Keyed by base type PLUS the exact set of
     // interfaces/members a JS class asked for, so different JS subclasses of the same base type
     // (different override sets) get distinct emitted types.
-    private readonly record struct ProxyTypeKey(Type BaseType, string InterfaceKey, string MemberKey);
+    private readonly record struct ProxyTypeKey(Type BaseType, string InterfaceKey, string MemberKey, string ClassName);
     private static readonly ConcurrentDictionary<ProxyTypeKey, Type> s_dynamicProxyCache = new();
     private static int s_dynamicProxyTypeCounter = 0;
     private static readonly AssemblyBuilder? s_dynamicAssembly = CreateDynamicAssembly();
@@ -74,6 +74,46 @@ public static partial class Bridge
         {
             ProxySetProperty(instance, propertyName, value);
         }
+
+        // Called by every emitted constructor. An instance .NET code created (not JS) gets its JS
+        // object from the factory registered for its type.
+        public static void Constructed(object instance)
+        {
+            if (s_pendingProxyCallbackId.Value.HasValue || IsJsBacked(instance)) return;
+            if (!s_nativeFactories.TryGetValue(instance.GetType(), out var factory))
+                throw new InvalidOperationException($"{instance.GetType().FullName} is a JS class: register it with NSWinRT.dotnet.typeOf() before .NET code creates it");
+            CallJsCallback(factory, [new HandleRef(HandleFor(instance))], expectsResult: false);
+            if (!IsJsBacked(instance))
+                throw new InvalidOperationException($"The JS class behind {instance.GetType().FullName} did not create its instance");
+        }
+    }
+
+    // Factory callback per emitted type, for instances .NET code creates.
+    private static readonly ConcurrentDictionary<Type, int> s_nativeFactories = new();
+
+    /// `NSWinRT.dotnet.typeOf(JsClass)`: the class's emitted type, which .NET code can then create;
+    /// `factory` makes the JS object of each such instance.
+    public static Type RegisterJsClass(string baseTypeName, string[] interfaceNames, string[] memberNames, string className, JsFunctionRef factory)
+    {
+        var baseType = ResolveType(null, baseTypeName) ?? throw new TypeLoadException($"Type not found: {baseTypeName}");
+        var interfaces = interfaceNames.ToList();
+        if (baseType.IsInterface)
+        {
+            interfaces.Insert(0, baseType.FullName!);
+            baseType = typeof(object);
+        }
+        var type = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames, className);
+        s_nativeFactories[type] = factory.Id;
+        return type;
+    }
+
+    /// The factory's half: ties the instance behind `handle` to the JS object's dispatcher.
+    public static void AdoptJsInstance(int handle, JsFunctionRef dispatcher)
+    {
+        if (!s_handles.TryGetValue(handle, out var instance) || instance is null)
+            throw new KeyNotFoundException($"Invalid handle {handle}");
+        RegisterJsBacked(instance, dispatcher.Id);
+        if (s_proxyCallbacks.TryGetValue(instance, out var holder)) holder.HandleId = handle;
     }
     // Ties a JS-backed instance to its JS dispatcher (and the handle its JS object holds). Lives as
     // long as the instance (ConditionalWeakTable value); when the instance is collected the runtime
@@ -89,15 +129,32 @@ public static partial class Bridge
     private static readonly ConditionalWeakTable<object, ProxyCallbackHolder> s_proxyCallbacks = new();
     private static readonly ThreadLocal<int?> s_pendingProxyCallbackId = new(() => null);
 
-    private static Type GetOrCreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames)
+    private static Type GetOrCreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames, string className = "")
     {
         var interfaceKey = string.Join(",", interfaceNames.OrderBy(n => n, StringComparer.Ordinal));
         var memberKey = string.Join(",", memberNames.OrderBy(n => n, StringComparer.Ordinal));
-        var key = new ProxyTypeKey(baseType, interfaceKey, memberKey);
-        return s_dynamicProxyCache.GetOrAdd(key, _ => CreateDynamicProxyType(baseType, interfaceNames, memberNames));
+        var key = new ProxyTypeKey(baseType, interfaceKey, memberKey, className);
+        return s_dynamicProxyCache.GetOrAdd(key, _ => CreateDynamicProxyType(baseType, interfaceNames, memberNames, className));
     }
 
-    private static Type CreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames)
+    private static readonly HashSet<string> s_usedProxyNames = new(StringComparer.Ordinal);
+
+    // `NSWinRTDynamicProxies.<ClassName>` (numbered on clashes), so .NET code can find the type by
+    // name. Unnamed classes are named after their base type.
+    private static string ProxyTypeName(Type baseType, string className)
+    {
+        var safe = new string(className.Where(c => char.IsLetterOrDigit(c) || c == '_').ToArray());
+        if (safe.Length == 0 || char.IsDigit(safe[0]))
+            return $"NSWinRTDynamicProxies.{(baseType.FullName ?? "Type").Replace('.', '_').Replace('+', '_')}_JsProxy_{Interlocked.Increment(ref s_dynamicProxyTypeCounter)}";
+        lock (s_usedProxyNames)
+        {
+            var name = "NSWinRTDynamicProxies." + safe;
+            for (int n = 2; !s_usedProxyNames.Add(name); n++) name = $"NSWinRTDynamicProxies.{safe}{n}";
+            return name;
+        }
+    }
+
+    private static Type CreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames, string className)
     {
 
         if (s_dynamicModule == null)
@@ -115,9 +172,7 @@ public static partial class Bridge
         // the vtable (no "call base" IL needed, the base method was simply never touched).
         var memberSet = new HashSet<string>(memberNames, StringComparer.Ordinal);
 
-        var safeName = (baseType.FullName ?? Guid.NewGuid().ToString()).Replace('.', '_');
-        var uniqueSuffix = Interlocked.Increment(ref s_dynamicProxyTypeCounter);
-        var typeName = $"NSWinRTDynamicProxies.{safeName}_JsProxy_{uniqueSuffix}";
+        var typeName = ProxyTypeName(baseType, className);
 
         var tb = s_dynamicModule.DefineType(typeName, TypeAttributes.Public | TypeAttributes.Class, baseType);
 
@@ -152,6 +207,8 @@ public static partial class Bridge
                 }
             }
             ilg.Emit(OpCodes.Call, bc);
+            ilg.Emit(OpCodes.Ldarg_0);
+            ilg.Emit(OpCodes.Call, typeof(ProxyRuntime).GetMethod(nameof(ProxyRuntime.Constructed))!);
             ilg.Emit(OpCodes.Ret);
         }
 
@@ -164,12 +221,12 @@ public static partial class Bridge
             name + "(" + string.Join(",", paramTypes.Select(p => p.FullName)) + ")";
 
         // Override only the base virtuals JS actually asked for (memberSet). Anything not in
-        // that set is simply never touched, so the base implementation stays live in the vtable —
-        // no "call base" IL needed. (Skip ref/out and generic methods — unsupported.)
+        // that set is simply never touched, so the base implementation stays live in the vtable:
+        // no "call base" IL needed. (ref/out methods are skipped.)
         // Abstract members are always implemented (dispatching to JS, which reports a missing
         // implementation as an error) — a type with an unimplemented abstract member can't be created.
         var virtualMethods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsGenericMethod && !m.IsConstructor
+            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsConstructor
                 && (m.IsPublic || m.IsFamily || m.IsFamilyOrAssembly)
                 && (memberSet.Contains(m.Name) || m.IsAbstract))
             .ToArray();
@@ -178,6 +235,11 @@ public static partial class Bridge
         {
             var parameters = mi.GetParameters();
             if (parameters.Any(p => p.ParameterType.IsByRef)) continue;
+            if (mi.IsGenericMethodDefinition)
+            {
+                EmitGenericOverride(tb, mi);
+                continue;
+            }
 
             var paramTypes = parameters.Select(p => p.ParameterType).ToArray();
             var sigKey = SignatureKey(mi.Name, paramTypes);
@@ -239,6 +301,88 @@ public static partial class Bridge
         }
 
         return tb.CreateTypeInfo()!.AsType();
+    }
+
+    // Overrides a generic virtual (`T Convert<T>(object)`) with a generic method that calls JS and
+    // converts the result to T.
+    private static void EmitGenericOverride(TypeBuilder tb, MethodInfo mi)
+    {
+        var mb = tb.DefineMethod(mi.Name, MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig, mi.CallingConvention);
+        var baseArgs = mi.GetGenericArguments();
+        var gps = mb.DefineGenericParameters(baseArgs.Select(a => a.Name).ToArray());
+
+        Type Sub(Type t)
+        {
+            if (t.IsGenericParameter && t.DeclaringMethod is not null) return gps[t.GenericParameterPosition];
+            if (t.IsArray) return t.GetArrayRank() == 1 ? Sub(t.GetElementType()!).MakeArrayType() : Sub(t.GetElementType()!).MakeArrayType(t.GetArrayRank());
+            if (t.IsByRef) return Sub(t.GetElementType()!).MakeByRefType();
+            if (t.IsGenericType && t.ContainsGenericParameters)
+                return t.GetGenericTypeDefinition().MakeGenericType(t.GetGenericArguments().Select(Sub).ToArray());
+            return t;
+        }
+
+        for (int i = 0; i < gps.Length; i++)
+        {
+            gps[i].SetGenericParameterAttributes(baseArgs[i].GenericParameterAttributes);
+            var constraints = baseArgs[i].GetGenericParameterConstraints().Select(Sub).ToArray();
+            var baseConstraint = constraints.FirstOrDefault(c => !c.IsInterface);
+            if (baseConstraint is not null) gps[i].SetBaseTypeConstraint(baseConstraint);
+            var interfaces = constraints.Where(c => c.IsInterface).ToArray();
+            if (interfaces.Length > 0) gps[i].SetInterfaceConstraints(interfaces);
+        }
+
+        var paramTypes = mi.GetParameters().Select(p => Sub(p.ParameterType)).ToArray();
+        var returnType = Sub(mi.ReturnType);
+        mb.SetReturnType(returnType);
+        mb.SetParameters(paramTypes);
+
+        var il = mb.GetILGenerator();
+        var argsLocal = il.DeclareLocal(typeof(object[]));
+        il.Emit(OpCodes.Ldc_I4, paramTypes.Length);
+        il.Emit(OpCodes.Newarr, typeof(object));
+        il.Emit(OpCodes.Stloc, argsLocal);
+        for (int i = 0; i < paramTypes.Length; i++)
+        {
+            il.Emit(OpCodes.Ldloc, argsLocal);
+            il.Emit(OpCodes.Ldc_I4, i);
+            il.Emit(OpCodes.Ldarg, i + 1);
+            // `box` of a type parameter is a no-op for reference types.
+            if (paramTypes[i].IsGenericParameter || paramTypes[i].ContainsGenericParameters || paramTypes[i].IsValueType)
+                il.Emit(OpCodes.Box, paramTypes[i]);
+            il.Emit(OpCodes.Stelem_Ref);
+        }
+        var runtime = typeof(ProxyRuntime);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldstr, mi.Name);
+        il.Emit(OpCodes.Ldloc, argsLocal);
+        if (returnType == typeof(void))
+            il.Emit(OpCodes.Call, runtime.GetMethod(nameof(ProxyRuntime.InvokeVoid))!);
+        else
+            il.Emit(OpCodes.Call, runtime.GetMethod(nameof(ProxyRuntime.InvokeMethodTyped))!.MakeGenericMethod(returnType));
+        il.Emit(OpCodes.Ret);
+        tb.DefineMethodOverride(mb, mi);
+
+        // `super.Convert(...)`: a generic entry point to the base implementation.
+        if (mi.IsAbstract) return;
+        var baseCall = tb.DefineMethod(BaseCallPrefix + mi.Name, MethodAttributes.Public | MethodAttributes.HideBySig, CallingConventions.HasThis);
+        var bgps = baseCall.DefineGenericParameters(baseArgs.Select(a => a.Name).ToArray());
+        for (int i = 0; i < bgps.Length; i++) bgps[i].SetGenericParameterAttributes(baseArgs[i].GenericParameterAttributes);
+        Type SubBase(Type t)
+        {
+            if (t.IsGenericParameter && t.DeclaringMethod is not null) return bgps[t.GenericParameterPosition];
+            if (t.IsArray) return SubBase(t.GetElementType()!).MakeArrayType();
+            if (t.IsGenericType && t.ContainsGenericParameters)
+                return t.GetGenericTypeDefinition().MakeGenericType(t.GetGenericArguments().Select(SubBase).ToArray());
+            return t;
+        }
+        var baseParams = mi.GetParameters().Select(p => SubBase(p.ParameterType)).ToArray();
+        baseCall.SetReturnType(SubBase(mi.ReturnType));
+        baseCall.SetParameters(baseParams);
+        var bil = baseCall.GetILGenerator();
+        bil.Emit(OpCodes.Ldarg_0);
+        for (int i = 0; i < baseParams.Length; i++) bil.Emit(OpCodes.Ldarg, i + 1);
+        bil.Emit(OpCodes.Call, mi.MakeGenericMethod(bgps));
+        bil.Emit(OpCodes.Ret);
     }
 
     internal const string BaseCallPrefix = "__ns_base_";
@@ -303,14 +447,14 @@ public static partial class Bridge
 
     private static DispatchResult CreateJsSubclass(
         string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames)
-        => CreateJsSubclass(assemblyName, typeName, callbackId, interfaceNames, memberNames, []);
+        => CreateJsSubclass(assemblyName, typeName, callbackId, interfaceNames, memberNames, [], "");
 
     // Creates an instance of a JS subclass: a dynamic subclass of the base type (or of System.Object
     // when the "base" is an interface being implemented) whose overridden virtuals and interface
     // members call the JS object registered under `callbackId`. `ctorArgs` select and feed the
     // base constructor, as `super(...)` arguments do on Android/iOS.
     private static DispatchResult CreateJsSubclass(
-        string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames, object?[] ctorArgs)
+        string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames, object?[] ctorArgs, string className)
     {
         // `typeName` is the base type; older runtimes passed an auto-generated proxy name there and
         // the base type in `assemblyName`.
@@ -327,7 +471,7 @@ public static partial class Bridge
         if (baseType.IsSealed)
             throw new InvalidOperationException($"{baseType.FullName} is sealed and can't be extended.");
 
-        var proxyType = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames);
+        var proxyType = GetOrCreateDynamicProxyType(baseType, interfaces.ToArray(), memberNames, className);
 
         // Pick the constructor by argument count, preferring one whose parameters the arguments
         // convert to.
@@ -463,39 +607,30 @@ public static partial class Bridge
         throw new InvalidOperationException("No JS callback registered for proxy instance.");
     }
 
-    // Payload for the JS dispatcher: (self handle, member name, ...args). The arguments are sent
+    // The JS dispatcher gets (self handle, member name, ...args). The arguments are sent
     // individually so each arrives as its JS value (numbers, strings, structs as plain objects,
     // objects as handles).
-    private static object?[] DispatchPayload(object instance, ProxyCallbackHolder holder, string memberName, object?[] args)
-    {
-        var payload = new object?[args.Length + 2];
-        payload[0] = new HandleRef(EnsureJsHandle(instance, holder));
-        payload[1] = memberName;
-        Array.Copy(args, 0, payload, 2, args.Length);
-        return payload;
-    }
-
     private static object? ProxyInvokeMethod(object instance, string methodName, object[] args)
     {
         var holder = JsHolderFor(instance);
-        return CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, methodName, args), expectsResult: true);
+        return CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), methodName, args, expectsResult: true);
     }
 
     private static void ProxyInvokeVoid(object instance, string methodName, object[] args)
     {
         var holder = JsHolderFor(instance);
-        CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, methodName, args), expectsResult: false);
+        CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), methodName, args, expectsResult: false);
     }
 
     private static object? ProxyGetProperty(object instance, string propertyName)
     {
         var holder = JsHolderFor(instance);
-        return CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, "get_" + propertyName, []), expectsResult: true);
+        return CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), "get_" + propertyName, [], expectsResult: true);
     }
 
     private static void ProxySetProperty(object instance, string propertyName, object? value)
     {
         var holder = JsHolderFor(instance);
-        CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, "set_" + propertyName, [value]), expectsResult: false);
+        CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), "set_" + propertyName, [value], expectsResult: false);
     }
 }
