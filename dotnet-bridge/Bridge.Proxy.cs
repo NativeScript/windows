@@ -164,12 +164,12 @@ public static partial class Bridge
             name + "(" + string.Join(",", paramTypes.Select(p => p.FullName)) + ")";
 
         // Override only the base virtuals JS actually asked for (memberSet). Anything not in
-        // that set is simply never touched, so the base implementation stays live in the vtable —
-        // no "call base" IL needed. (Skip ref/out and generic methods — unsupported.)
+        // that set is simply never touched, so the base implementation stays live in the vtable:
+        // no "call base" IL needed. (ref/out methods are skipped.)
         // Abstract members are always implemented (dispatching to JS, which reports a missing
         // implementation as an error) — a type with an unimplemented abstract member can't be created.
         var virtualMethods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsGenericMethod && !m.IsConstructor
+            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsConstructor
                 && (m.IsPublic || m.IsFamily || m.IsFamilyOrAssembly)
                 && (memberSet.Contains(m.Name) || m.IsAbstract))
             .ToArray();
@@ -178,6 +178,11 @@ public static partial class Bridge
         {
             var parameters = mi.GetParameters();
             if (parameters.Any(p => p.ParameterType.IsByRef)) continue;
+            if (mi.IsGenericMethodDefinition)
+            {
+                EmitGenericOverride(tb, mi);
+                continue;
+            }
 
             var paramTypes = parameters.Select(p => p.ParameterType).ToArray();
             var sigKey = SignatureKey(mi.Name, paramTypes);
@@ -239,6 +244,88 @@ public static partial class Bridge
         }
 
         return tb.CreateTypeInfo()!.AsType();
+    }
+
+    // Overrides a generic virtual (`T Convert<T>(object)`) with a generic method that calls JS and
+    // converts the result to T.
+    private static void EmitGenericOverride(TypeBuilder tb, MethodInfo mi)
+    {
+        var mb = tb.DefineMethod(mi.Name, MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig, mi.CallingConvention);
+        var baseArgs = mi.GetGenericArguments();
+        var gps = mb.DefineGenericParameters(baseArgs.Select(a => a.Name).ToArray());
+
+        Type Sub(Type t)
+        {
+            if (t.IsGenericParameter && t.DeclaringMethod is not null) return gps[t.GenericParameterPosition];
+            if (t.IsArray) return t.GetArrayRank() == 1 ? Sub(t.GetElementType()!).MakeArrayType() : Sub(t.GetElementType()!).MakeArrayType(t.GetArrayRank());
+            if (t.IsByRef) return Sub(t.GetElementType()!).MakeByRefType();
+            if (t.IsGenericType && t.ContainsGenericParameters)
+                return t.GetGenericTypeDefinition().MakeGenericType(t.GetGenericArguments().Select(Sub).ToArray());
+            return t;
+        }
+
+        for (int i = 0; i < gps.Length; i++)
+        {
+            gps[i].SetGenericParameterAttributes(baseArgs[i].GenericParameterAttributes);
+            var constraints = baseArgs[i].GetGenericParameterConstraints().Select(Sub).ToArray();
+            var baseConstraint = constraints.FirstOrDefault(c => !c.IsInterface);
+            if (baseConstraint is not null) gps[i].SetBaseTypeConstraint(baseConstraint);
+            var interfaces = constraints.Where(c => c.IsInterface).ToArray();
+            if (interfaces.Length > 0) gps[i].SetInterfaceConstraints(interfaces);
+        }
+
+        var paramTypes = mi.GetParameters().Select(p => Sub(p.ParameterType)).ToArray();
+        var returnType = Sub(mi.ReturnType);
+        mb.SetReturnType(returnType);
+        mb.SetParameters(paramTypes);
+
+        var il = mb.GetILGenerator();
+        var argsLocal = il.DeclareLocal(typeof(object[]));
+        il.Emit(OpCodes.Ldc_I4, paramTypes.Length);
+        il.Emit(OpCodes.Newarr, typeof(object));
+        il.Emit(OpCodes.Stloc, argsLocal);
+        for (int i = 0; i < paramTypes.Length; i++)
+        {
+            il.Emit(OpCodes.Ldloc, argsLocal);
+            il.Emit(OpCodes.Ldc_I4, i);
+            il.Emit(OpCodes.Ldarg, i + 1);
+            // `box` of a type parameter is a no-op for reference types.
+            if (paramTypes[i].IsGenericParameter || paramTypes[i].ContainsGenericParameters || paramTypes[i].IsValueType)
+                il.Emit(OpCodes.Box, paramTypes[i]);
+            il.Emit(OpCodes.Stelem_Ref);
+        }
+        var runtime = typeof(ProxyRuntime);
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldstr, mi.Name);
+        il.Emit(OpCodes.Ldloc, argsLocal);
+        if (returnType == typeof(void))
+            il.Emit(OpCodes.Call, runtime.GetMethod(nameof(ProxyRuntime.InvokeVoid))!);
+        else
+            il.Emit(OpCodes.Call, runtime.GetMethod(nameof(ProxyRuntime.InvokeMethodTyped))!.MakeGenericMethod(returnType));
+        il.Emit(OpCodes.Ret);
+        tb.DefineMethodOverride(mb, mi);
+
+        // `super.Convert(...)`: a generic entry point to the base implementation.
+        if (mi.IsAbstract) return;
+        var baseCall = tb.DefineMethod(BaseCallPrefix + mi.Name, MethodAttributes.Public | MethodAttributes.HideBySig, CallingConventions.HasThis);
+        var bgps = baseCall.DefineGenericParameters(baseArgs.Select(a => a.Name).ToArray());
+        for (int i = 0; i < bgps.Length; i++) bgps[i].SetGenericParameterAttributes(baseArgs[i].GenericParameterAttributes);
+        Type SubBase(Type t)
+        {
+            if (t.IsGenericParameter && t.DeclaringMethod is not null) return bgps[t.GenericParameterPosition];
+            if (t.IsArray) return SubBase(t.GetElementType()!).MakeArrayType();
+            if (t.IsGenericType && t.ContainsGenericParameters)
+                return t.GetGenericTypeDefinition().MakeGenericType(t.GetGenericArguments().Select(SubBase).ToArray());
+            return t;
+        }
+        var baseParams = mi.GetParameters().Select(p => SubBase(p.ParameterType)).ToArray();
+        baseCall.SetReturnType(SubBase(mi.ReturnType));
+        baseCall.SetParameters(baseParams);
+        var bil = baseCall.GetILGenerator();
+        bil.Emit(OpCodes.Ldarg_0);
+        for (int i = 0; i < baseParams.Length; i++) bil.Emit(OpCodes.Ldarg, i + 1);
+        bil.Emit(OpCodes.Call, mi.MakeGenericMethod(bgps));
+        bil.Emit(OpCodes.Ret);
     }
 
     internal const string BaseCallPrefix = "__ns_base_";

@@ -5,9 +5,8 @@
 //! `v8::` references and is reused completely unmodified here: see
 //! `[[project_engine_framework_parity]]` for how that was confirmed. What this module supplies is
 //! the engine-specific half: the same seven `__ns*` natives the classic engine registers in
-//! `global_fns.rs`, reimplemented against Node-API instead of V8's C++ API, plus the JS half
-//! mirrored verbatim (native names match exactly, so the JS needed no changes) into
-//! [`DOTNET_HELPERS_JS`]. Keep the two JS copies in sync.
+//! `global_fns.rs`, reimplemented against Node-API instead of V8's C++ API, plus the JS half shared with
+//! the classic engine through `runtime/src/js` ([`DOTNET_HELPERS_JS`]).
 //!
 //! Includes `__nsDotNetCreateJsSubclass` and `__nsWrapWinRTPointer`, which back JS subclasses of
 //! .NET and WinRT classes (`class X extends Y`, `Y.extend(...)`, `new Interface({...})`; see the
@@ -162,10 +161,171 @@ fn napi_json_parse(env: &Env, text: &str) -> napi::Result<JsUnknown> {
     parse.call(Some(&json), &[env.create_string(text)?])
 }
 
+/// A BigInt as a .NET long (tag 0x10), or ulong (0x11) when only that fits. Read through sign and
+/// words: the QuickJS shim doesn't report `lossless`.
+fn napi_bin_write_bigint(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) -> bool {
+    let mut sign = 0i32;
+    let mut count = 2usize;
+    let mut words = [0u64; 2];
+    let status = unsafe { sys::napi_get_value_bigint_words(env.raw(), arg.raw(), &mut sign, &mut count, words.as_mut_ptr()) };
+    if status != sys::Status::napi_ok {
+        return false;
+    }
+    let magnitude = if count == 0 { 0 } else { words[0] };
+    if sign != 0 {
+        // Values below long.MinValue wrap, as they do in a C# unchecked cast.
+        buf.push(0x10);
+        buf.extend_from_slice(&(magnitude as i64).wrapping_neg().to_le_bytes());
+    } else if magnitude <= i64::MAX as u64 {
+        buf.push(0x10);
+        buf.extend_from_slice(&(magnitude as i64).to_le_bytes());
+    } else {
+        buf.push(0x11);
+        buf.extend_from_slice(&magnitude.to_le_bytes());
+    }
+    true
+}
+
+/// A typed array, ArrayBuffer or DataView as tag 0x12 (see `global_fns::bin_write_v8_bytes`).
+fn napi_bin_write_bytes(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) -> bool {
+    let (env_raw, value) = (env.raw(), unsafe { arg.raw() });
+    let mut is = false;
+    let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut len = 0usize;
+    let mut kind = 0u8;
+    unsafe {
+        if sys::napi_is_typedarray(env_raw, value, &mut is) == sys::Status::napi_ok && is {
+            let mut ty: sys::napi_typedarray_type = 0;
+            let mut count = 0usize;
+            let mut buffer: sys::napi_value = std::ptr::null_mut();
+            let mut offset = 0usize;
+            if sys::napi_get_typedarray_info(env_raw, value, &mut ty, &mut count, &mut data, &mut buffer, &mut offset) != sys::Status::napi_ok {
+                return false;
+            }
+            let (k, size) = match ty {
+                0 => (1, 1),
+                3 => (2, 2),
+                4 => (3, 2),
+                5 => (4, 4),
+                6 => (5, 4),
+                7 => (6, 4),
+                8 => (7, 8),
+                9 => (8, 8),
+                10 => (9, 8),
+                _ => (0, 1),
+            };
+            kind = k;
+            len = count * size;
+        } else if sys::napi_is_dataview(env_raw, value, &mut is) == sys::Status::napi_ok && is {
+            let mut buffer: sys::napi_value = std::ptr::null_mut();
+            let mut offset = 0usize;
+            if sys::napi_get_dataview_info(env_raw, value, &mut len, &mut data, &mut buffer, &mut offset) != sys::Status::napi_ok {
+                return false;
+            }
+        } else if sys::napi_is_arraybuffer(env_raw, value, &mut is) == sys::Status::napi_ok && is {
+            if sys::napi_get_arraybuffer_info(env_raw, value, &mut data, &mut len) != sys::Status::napi_ok {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    buf.push(0x12);
+    buf.push(kind);
+    buf.extend_from_slice(&(len as u32).to_le_bytes());
+    if data.is_null() || len == 0 {
+        buf.resize(buf.len() + len, 0);
+    } else {
+        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(data as *const u8, len) });
+    }
+    true
+}
+
+/// Bytes from the bridge (tag 0x12) as a typed array of `kind` over a new ArrayBuffer.
+fn napi_typed_array(env: &Env, kind: u8, bytes: &[u8]) -> Result<JsUnknown, String> {
+    let env_raw = env.raw();
+    let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut buffer: sys::napi_value = std::ptr::null_mut();
+    unsafe {
+        if sys::napi_create_arraybuffer(env_raw, bytes.len(), &mut data, &mut buffer) != sys::Status::napi_ok {
+            return Err("could not create an ArrayBuffer".into());
+        }
+        if !data.is_null() && !bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data as *mut u8, bytes.len());
+        }
+        let (ty, size): (sys::napi_typedarray_type, usize) = match kind {
+            1 => (0, 1),
+            2 => (3, 2),
+            3 => (4, 2),
+            4 => (5, 4),
+            5 => (6, 4),
+            6 => (7, 4),
+            7 => (8, 8),
+            8 => (9, 8),
+            9 => (10, 8),
+            _ => (1, 1),
+        };
+        let mut typed: sys::napi_value = std::ptr::null_mut();
+        if sys::napi_create_typedarray(env_raw, ty, bytes.len() / size, buffer, 0, &mut typed) != sys::Status::napi_ok {
+            return Ok(JsUnknown::from_raw_unchecked(env_raw, buffer));
+        }
+        Ok(JsUnknown::from_raw_unchecked(env_raw, typed))
+    }
+}
+
+/// A length-prefixed (u16 or u32, per `prefix`) UTF-8 string at `pos`, advancing past it.
+fn bin_take_str<'b>(bytes: &'b [u8], pos: &mut usize, prefix: usize) -> Option<&'b str> {
+    let len_bytes = bytes.get(*pos..*pos + prefix)?;
+    let len = if prefix == 2 {
+        u16::from_le_bytes(len_bytes.try_into().ok()?) as usize
+    } else {
+        u32::from_le_bytes(len_bytes.try_into().ok()?) as usize
+    };
+    let text = std::str::from_utf8(bytes.get(*pos + prefix..*pos + prefix + len)?).ok()?;
+    *pos += prefix + len;
+    Some(text)
+}
+
+/// Throws the Error for a bridge error (0xFF), see `global_fns::bin_error_value`, and returns the
+/// message; the caller's Err leaves that Error pending.
+fn napi_throw_bridge_error(env: &Env, bytes: &[u8]) -> String {
+    let mut pos = 1usize;
+    let message = bin_take_str(bytes, &mut pos, 4).unwrap_or("the .NET call failed").to_string();
+    let error = (|| -> napi::Result<JsObject> {
+        let mut error: JsObject = unsafe {
+            let msg = env.create_string(&message)?;
+            let mut raw: sys::napi_value = std::ptr::null_mut();
+            sys::napi_create_error(env.raw(), std::ptr::null_mut(), msg.raw(), &mut raw);
+            JsObject::from_raw_unchecked(env.raw(), raw)
+        };
+        let type_name = bin_take_str(bytes, &mut pos, 2);
+        let stack = bin_take_str(bytes, &mut pos, 4);
+        let handle = bytes.get(pos..pos + 4).map(|b| i32::from_le_bytes(b.try_into().unwrap()));
+        if let (Some(type_name), Some(stack)) = (type_name, stack) {
+            error.set_named_property("dotnetType", env.create_string(type_name)?)?;
+            error.set_named_property("dotnetStack", env.create_string(stack)?)?;
+            if let Some(id) = handle.filter(|id| *id >= 0) {
+                let mut native = env.create_object()?;
+                native.set_named_property("__handle", env.create_int32(id)?)?;
+                native.set_named_property("__type", env.create_string(type_name)?)?;
+                error.set_named_property("nativeException", native)?;
+            }
+        }
+        Ok(error)
+    })();
+    if let Ok(error) = error {
+        unsafe { sys::napi_throw(env.raw(), error.raw()) };
+    }
+    message
+}
+
 /// Encode one outgoing method-call argument (`u16` string-length prefix; AddRefs `__native_ptr`).
 /// Mirrors `global_fns::bin_write_v8_arg`.
 fn napi_bin_write_arg(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
     let vt = arg.get_type().unwrap_or(ValueType::Undefined);
+    if (vt == ValueType::BigInt && napi_bin_write_bigint(env, buf, arg)) || (vt == ValueType::Object && napi_bin_write_bytes(env, buf, arg)) {
+        return;
+    }
     match vt {
         ValueType::Null | ValueType::Undefined => buf.push(0x00),
         ValueType::Boolean => {
@@ -250,6 +410,9 @@ fn napi_bin_write_arg(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
 /// AddRef on `__native_ptr`). Mirrors `global_fns::bin_write_v8_value`.
 fn napi_bin_write_value(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
     let vt = arg.get_type().unwrap_or(ValueType::Undefined);
+    if (vt == ValueType::BigInt && napi_bin_write_bigint(env, buf, arg)) || (vt == ValueType::Object && napi_bin_write_bytes(env, buf, arg)) {
+        return;
+    }
     match vt {
         ValueType::Null | ValueType::Undefined => buf.push(0x00),
         ValueType::Boolean => {
@@ -355,6 +518,27 @@ fn napi_bin_read_value(env: &Env, bytes: &[u8], pos: &mut usize) -> Result<JsUnk
             Ok(as_unknown(env, env.create_string(s).map_err(map_err)?))
         }
 
+        0x10 => {
+            let v = i64::from_le_bytes(bytes.get(*pos..*pos + 8).ok_or("i64 read")?.try_into().map_err(|_| "i64 read")?);
+            *pos += 8;
+            Ok(as_unknown(env, env.create_bigint_from_i64(v).map_err(map_err)?.into_unknown().map_err(map_err)?))
+        }
+
+        0x11 => {
+            let v = u64::from_le_bytes(bytes.get(*pos..*pos + 8).ok_or("u64 read")?.try_into().map_err(|_| "u64 read")?);
+            *pos += 8;
+            Ok(as_unknown(env, env.create_bigint_from_u64(v).map_err(map_err)?.into_unknown().map_err(map_err)?))
+        }
+
+        0x12 => {
+            let kind = *bytes.get(*pos).ok_or("bytes kind")?;
+            let len = u32::from_le_bytes(bytes.get(*pos + 1..*pos + 5).ok_or("bytes len")?.try_into().map_err(|_| "bytes len")?) as usize;
+            *pos += 5;
+            let data = bytes.get(*pos..*pos + len).ok_or("bytes")?;
+            *pos += len;
+            napi_typed_array(env, kind, data)
+        }
+
         0x0D => {
             let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "json len")?)
                 as usize;
@@ -446,6 +630,25 @@ fn napi_bin_read_value(env: &Env, bytes: &[u8], pos: &mut usize) -> Result<JsUnk
                 }
                 obj.set_named_property(key, arr).map_err(map_err)?;
             }
+            // Extra named lists (events, nested types, ...): u16 count, then a key and a list each.
+            let extra = match bytes.get(*pos..*pos + 2) {
+                Some(b) => u16::from_le_bytes(b.try_into().unwrap()) as usize,
+                None => 0,
+            };
+            if extra > 0 {
+                *pos += 2;
+            }
+            for _ in 0..extra {
+                let key = bin_take_str(bytes, pos, 2).ok_or("member list key")?.to_string();
+                let count = u16::from_le_bytes(bytes.get(*pos..*pos + 2).ok_or("member count")?.try_into().unwrap()) as usize;
+                *pos += 2;
+                let mut arr = env.create_array_with_length(count).map_err(map_err)?;
+                for i in 0..count {
+                    let s = bin_take_str(bytes, pos, 2).ok_or("member name")?;
+                    arr.set_element(i as u32, env.create_string(s).map_err(map_err)?).map_err(map_err)?;
+                }
+                obj.set_named_property(&key, arr).map_err(map_err)?;
+            }
             Ok(as_unknown(env, obj))
         }
 
@@ -464,6 +667,9 @@ fn napi_bin_read_value(env: &Env, bytes: &[u8], pos: &mut usize) -> Result<JsUnk
 fn napi_bin_read_response(env: &Env, bytes: &[u8]) -> Result<JsUnknown, String> {
     if bytes.is_empty() {
         return Ok(as_unknown(env, env.get_null().map_err(|e| e.to_string())?));
+    }
+    if bytes[0] == 0xFF {
+        return Err(napi_throw_bridge_error(env, bytes));
     }
     let mut pos = 0usize;
     napi_bin_read_value(env, bytes, &mut pos)
@@ -534,6 +740,16 @@ fn native_invoke_bin(ctx: &CallContext) -> napi::Result<JsUnknown> {
             crate::dotnet::bin_write_str16(&mut req, type_name.as_bytes());
             crate::dotnet::bin_write_str16(&mut req, assembly.as_bytes());
         }
+    }
+
+    // A release gives back the exports its proxy took; without a count the handle goes outright.
+    if op == 0x04 && ctx.length > 4 {
+        let count_v = ctx.get::<JsUnknown>(4)?;
+        let count = match count_v.get_type()? {
+            ValueType::Number => unsafe { count_v.cast::<JsNumber>() }.get_double()? as i32,
+            _ => -1,
+        };
+        req.extend_from_slice(&count.to_le_bytes());
     }
 
     if op == 0x01 || op == 0x02 {
@@ -871,6 +1087,22 @@ unsafe fn stringify_exception(env: sys::napi_env, exc: sys::napi_value) -> Optio
     String::from_utf8(buf).ok()
 }
 
+/// The `stack` of a thrown Error, when it has one.
+unsafe fn exception_stack(env: sys::napi_env, exc: sys::napi_value) -> Option<String> {
+    let mut ty: sys::napi_valuetype = 0;
+    if sys::napi_typeof(env, exc, &mut ty) != sys::Status::napi_ok || ty != sys::ValueType::napi_object {
+        return None;
+    }
+    let mut stack: sys::napi_value = std::ptr::null_mut();
+    if sys::napi_get_named_property(env, exc, c"stack".as_ptr(), &mut stack) != sys::Status::napi_ok {
+        return None;
+    }
+    if sys::napi_typeof(env, stack, &mut ty) != sys::Status::napi_ok || ty != sys::ValueType::napi_string {
+        return None;
+    }
+    stringify_exception(env, stack)
+}
+
 /// `[count: u8] [tagged values...]` -> raw napi_values ready for `napi_call_function`.
 fn parse_callback_args(env: &Env, bytes: &[u8]) -> Vec<sys::napi_value> {
     if bytes.is_empty() {
@@ -932,7 +1164,7 @@ pub(crate) unsafe extern "C" fn napi_invoke_dotnet_js_callback(
                 napi_invoke_dotnet_js_callback(callback_id, args as *const u8, args_len, resp as *mut *mut u8, len as *mut i32)
             });
             if delivered.is_none() {
-                write_error_response("the JavaScript callback could not run", resp_ptr, resp_len);
+                write_error_response("", resp_ptr, resp_len);
             }
         }
         return;
@@ -981,10 +1213,12 @@ pub(crate) unsafe extern "C" fn napi_invoke_dotnet_js_callback(
             {
                 if let Some(msg) = stringify_exception(env_raw, exc) {
                     crate::store_last_js_error(msg.clone());
-                    // 0x0F: the callback threw. A managed caller that expects a result gets a
-                    // JsException; a void delegate/event ignores it.
+                    // 0x0F: the callback threw. Message, then JS stack (a JsException in .NET).
                     let mut buf = vec![0x0Fu8];
                     crate::dotnet::bin_write_str32(&mut buf, msg.as_bytes());
+                    if let Some(stack) = exception_stack(env_raw, exc) {
+                        crate::dotnet::bin_write_str32(&mut buf, stack.as_bytes());
+                    }
                     return buf;
                 }
             }
@@ -1107,1877 +1341,11 @@ pub fn install_dotnet(env: &Env) -> napi::Result<()> {
     Ok(())
 }
 
-/// The JS half of `NSWinRT.dotnet`, copied verbatim from the classic runtime's
-/// `global_fns.rs` `HELPER_SOURCE` (the native names match exactly, so nothing needed adapting):
-/// keep the two in sync. Requires the dotnet-bridge project to be published into
-/// `<app-root>/dotnet-bridge/publish/DotNetBridge.dll`; a no-op if `__nsDotNetInvokeBin` is absent.
-const DOTNET_HELPERS_JS: &str = r#"
-'use strict';
-(function () {
-    // Managed-subclass / proxy system, ported verbatim from the classic engine's
-    // `HELPER_SOURCE` (the giant bootstrap IIFE spanning `var proxyExtensions = []` through the
-    // `NSWinRT.proxy = {...}` object literal): see the module doc comment. Runs unconditionally,
-    // same as classic: `Function.prototype.extend`/`Object.extend`/pure-JS `makeExtendedConstructor`
-    // fallback are useful even without a .NET bridge (e.g. WinRT-only class extension). Only
-    // `createManagedSubclass` itself requires `__nsDotNetCreateJsSubclass`, which by the time this
-    // whole script runs is guaranteed to already be registered (both are installed together, see
-    // `install_dotnet` below): so no extra guard is needed here.
-    globalThis.NSWinRT = globalThis.NSWinRT || {};
-
-    var proxyExtensions = [];
-    var proxyInstances = new Map();
-    var nextProxyId = 1;
-
-    function ctorName(ctor) {
-        return (ctor && (ctor.__winrtProxyName__ || ctor.__typeName__ || ctor.name)) || 'Object';
-    }
-
-    // Wraps a raw tagged handle value into a live DotNet instance proxy exactly like the
-    // NSWinRT.dotnet block below's own private `_wrap`: reused here via the public `wrap` alias
-    // that block exposes on `NSWinRT.dotnet` (see below), since this code has no direct access to
-    // that other IIFE's closure. Both IIFEs run synchronously during the same `install_dotnet`
-    // call, so by the time createManagedSubclass is actually CALLED, NSWinRT.dotnet.wrap exists.
-    function _wrapDotNetHandle(value) {
-        var dotnet = globalThis.NSWinRT && globalThis.NSWinRT.dotnet;
-        return (dotnet && typeof dotnet.wrap === 'function') ? dotnet.wrap(value) : value;
-    }
-
-    var typeDescriptorCache = Object.create(null);
-
-    function describeWinRTType(typeName) {
-        if (!typeName || typeof globalThis.__nsDescribeWinRTType !== 'function') {
-            return null;
-        }
-        if (Object.prototype.hasOwnProperty.call(typeDescriptorCache, typeName)) {
-            return typeDescriptorCache[typeName];
-        }
-        try {
-            var raw = globalThis.__nsDescribeWinRTType(typeName);
-            typeDescriptorCache[typeName] = raw ? JSON.parse(raw) : null;
-        } catch (_) {
-            typeDescriptorCache[typeName] = null;
-        }
-        return typeDescriptorCache[typeName];
-    }
-
-    function buildFallbackParameterMetadata(fn) {
-        var params = [];
-        var count = typeof fn === 'function' && Number.isFinite(fn.length) ? fn.length : 0;
-        for (var i = 0; i < count; i++) {
-            params.push({ name: 'arg' + i, type: 'Object' });
-        }
-        return params;
-    }
-
-    function normalizeMethodMetadata(name, value, descriptors) {
-        for (var i = 0; i < descriptors.length; i++) {
-            var descriptor = descriptors[i];
-            if (!descriptor || !Array.isArray(descriptor.methods)) {
-                continue;
-            }
-            for (var j = 0; j < descriptor.methods.length; j++) {
-                var method = descriptor.methods[j];
-                if (method && method.name === name) {
-                    return {
-                        name: method.name,
-                        returnType: method.returnType || method.return_type || 'Void',
-                        parameters: Array.isArray(method.parameters) ? method.parameters : [],
-                    };
-                }
-            }
-        }
-
-        return {
-            name: name,
-            returnType: name === 'init' ? 'Void' : 'Object',
-            parameters: buildFallbackParameterMetadata(value),
-        };
-    }
-
-    function normalizePropertyMetadata(name, descriptors) {
-        for (var i = 0; i < descriptors.length; i++) {
-            var descriptor = descriptors[i];
-            if (!descriptor || !Array.isArray(descriptor.properties)) {
-                continue;
-            }
-            for (var j = 0; j < descriptor.properties.length; j++) {
-                var property = descriptor.properties[j];
-                if (property && property.name === name) {
-                    return {
-                        name: property.name,
-                        propType: property.propType || property.prop_type || 'Object',
-                        readable: property.readable !== false,
-                        writable: property.writable !== false,
-                    };
-                }
-            }
-        }
-
-        return {
-            name: name,
-            propType: 'Object',
-            readable: true,
-            writable: true,
-        };
-    }
-
-    function collectProxyMethods(overrides, descriptors) {
-        var methods = [];
-        for (var key in overrides) {
-            if (!Object.prototype.hasOwnProperty.call(overrides, key)) {
-                continue;
-            }
-            if (key === 'interfaces') {
-                continue;
-            }
-            if (typeof overrides[key] === 'function') {
-                methods.push(normalizeMethodMetadata(key, overrides[key], descriptors));
-            }
-        }
-        methods.sort(function (left, right) {
-            return String(left && left.name || '').localeCompare(String(right && right.name || ''));
-        });
-        return methods;
-    }
-
-    function collectProxyProperties(overrides, descriptors) {
-        var props = [];
-        for (var key in overrides) {
-            if (!Object.prototype.hasOwnProperty.call(overrides, key)) {
-                continue;
-            }
-            if (key === 'interfaces') {
-                continue;
-            }
-            if (typeof overrides[key] !== 'function') {
-                props.push(normalizePropertyMetadata(key, descriptors));
-            }
-        }
-        props.sort(function (left, right) {
-            return String(left && left.name || '').localeCompare(String(right && right.name || ''));
-        });
-        return props;
-    }
-
-    function safeIdentifier(name) {
-        return String(name || '')
-            .replace(/[^A-Za-z0-9_]/g, '_')
-            .replace(/^([^A-Za-z_])/, '_$1') || 'ProxyType';
-    }
-
-    function autoProxyTypeName(baseCtor) {
-        var baseType = ctorName(baseCtor) || 'Object';
-        var baseShort = safeIdentifier(baseType.split('.').pop());
-        return 'NativeScript.Gen.' + baseShort + '_' + (proxyExtensions.length + 1);
-    }
-
-    function renderProxyCSharp(meta) {
-        var typeName = meta.typeName || ('GeneratedProxy' + (proxyExtensions.length + 1));
-        var safeTypeName = safeIdentifier(typeName.split('.').pop());
-        var baseType = meta.baseType || 'object';
-        var methodStubs = '';
-        for (var i = 0; i < meta.methods.length; i++) {
-            var methodMeta = meta.methods[i];
-            var methodName = safeIdentifier((methodMeta && methodMeta.name) || methodMeta);
-            methodStubs +=
-                '    public object __ns_' + methodName + '(params object[] args)\\n' +
-                '    {\\n' +
-                '        return ProxyDispatcher.Invoke(this.__proxyId, "' + methodName + '", args);\\n' +
-                '    }\\n\\n';
-        }
-
-        return (
-            'using System;\\n\\n' +
-            'namespace NativeScriptGeneratedProxies\\n' +
-            '{\\n' +
-            '    public static class ProxyDispatcher\\n' +
-            '    {\\n' +
-            '        public static Func<int, string, object[], object> JsInvoke;\\n' +
-            '        public static object Invoke(int id, string method, object[] args)\\n' +
-            '        {\\n' +
-            '            var cb = JsInvoke;\\n' +
-            '            if (cb == null) throw new InvalidOperationException("JsInvoke callback is not registered.");\\n' +
-            '            return cb(id, method, args);\\n' +
-            '        }\\n' +
-            '    }\\n\\n' +
-            '    public class ' + safeTypeName + ' : ' + baseType + '\\n' +
-            '    {\\n' +
-            '        private readonly int __proxyId;\\n\\n' +
-            '        public ' + safeTypeName + '(int proxyId)\\n' +
-            '        {\\n' +
-            '            this.__proxyId = proxyId;\\n' +
-            '        }\\n\\n' +
-            methodStubs +
-            '    }\\n' +
-            '}\\n'
-        );
-    }
-
-    function renderProxyCsproj(meta) {
-        var asmName = safeIdentifier((meta.typeName || 'GeneratedProxy').split('.').pop());
-        return (
-            '<Project Sdk="Microsoft.NET.Sdk">\\n' +
-            '  <PropertyGroup>\\n' +
-            '    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>\\n' +
-            '    <AssemblyName>' + asmName + '</AssemblyName>\\n' +
-            '    <RootNamespace>NativeScriptGeneratedProxies</RootNamespace>\\n' +
-            '    <ImplicitUsings>enable</ImplicitUsings>\\n' +
-            '    <Nullable>disable</Nullable>\\n' +
-            '    <LangVersion>latest</LangVersion>\\n' +
-            '  </PropertyGroup>\\n' +
-            '</Project>\\n'
-        );
-    }
-
-    function buildProxyMetadata(baseCtor, typeName, overrides, Extended) {
-        var baseType = ctorName(baseCtor);
-        var interfaceNames = Array.isArray(overrides.interfaces)
-            ? overrides.interfaces.map(function (iface) { return ctorName(iface); })
-            : [];
-        var descriptors = [describeWinRTType(baseType)];
-        for (var i = 0; i < interfaceNames.length; i++) {
-            descriptors.push(describeWinRTType(interfaceNames[i]));
-        }
-        var namespace = '';
-        var className = typeName || '';
-        if (typeName) {
-            var splitIndex = typeName.lastIndexOf('.');
-            if (splitIndex >= 0) {
-                namespace = typeName.slice(0, splitIndex);
-                className = typeName.slice(splitIndex + 1);
-            }
-        }
-        var meta = {
-            kind: 'windows-proxy',
-            typeName: typeName || '',
-            className: className || safeIdentifier((typeName || baseType || 'GeneratedProxy').split('.').pop()),
-            namespace: namespace || null,
-            baseType: baseType,
-            baseClass: baseType,
-            interfaces: interfaceNames,
-            methods: collectProxyMethods(overrides, descriptors.filter(Boolean)),
-            properties: collectProxyProperties(overrides, descriptors.filter(Boolean)),
-            isAutoGeneratedName: !typeName,
-            registeredAt: new Date().toISOString(),
-            registered: false,
-            generated: null,
-        };
-        try {
-            Object.defineProperty(Extended, '__proxyMetadata__', {
-                value: meta,
-                writable: true,
-                configurable: true,
-                enumerable: false,
-            });
-        } catch (_) {
-            Extended.__proxyMetadata__ = meta;
-        }
-        proxyExtensions.push(meta);
-        if (typeof globalThis.__nsProxyAutoCapture === 'function') {
-            try {
-                globalThis.__nsProxyAutoCapture(JSON.stringify(proxyExtensions));
-            } catch (_) {
-                // Capture is best-effort; runtime behavior should remain unaffected.
-            }
-        }
-
-        if (meta.interfaces.length > 0) {
-            if (typeof globalThis.__nsProxyCompileProject === 'function') {
-                try { registerProxy(meta); } catch (_) { }
-            } else if (typeof globalThis.__nsProxyWriteTextFile === 'function') {
-                try { emitProxy(meta); } catch (_) { }
-            }
-        }
-        return meta;
-    }
-
-    function ensureProxyInstance(instance, overrides, ctor) {
-        if (!instance || typeof instance !== 'object') {
-            return -1;
-        }
-
-        var proxyId = instance.__proxyId;
-        if (typeof proxyId !== 'number' || !Number.isFinite(proxyId)) {
-            proxyId = nextProxyId++;
-            try {
-                Object.defineProperty(instance, '__proxyId', {
-                    value: proxyId,
-                    writable: false,
-                    configurable: true,
-                    enumerable: false,
-                });
-            } catch (_) {
-                instance.__proxyId = proxyId;
-            }
-        }
-
-        proxyInstances.set(proxyId, {
-            instance: instance,
-            overrides: overrides,
-            constructor: ctor,
-        });
-
-        return proxyId;
-    }
-
-    function makeExtendedConstructor(baseCtor, nameOrOverrides, maybeOverrides) {
-        var hasName = typeof nameOrOverrides === 'string';
-        var explicitTypeName = hasName ? nameOrOverrides : '';
-        var typeName = explicitTypeName || autoProxyTypeName(baseCtor);
-        var overrides = hasName ? maybeOverrides : nameOrOverrides;
-        if (!overrides || typeof overrides !== 'object') {
-            overrides = {};
-        }
-
-        function Extended() {
-            var instance;
-            var args = Array.prototype.slice.call(arguments);
-            try {
-                instance = Reflect.construct(baseCtor, args);
-            } catch (_) {
-                instance = {};
-            }
-
-            for (var key in overrides) {
-                if (key === 'interfaces') {
-                    continue;
-                }
-                var value = overrides[key];
-                if (typeof value === 'function') {
-                    try {
-                        Object.defineProperty(instance, key, {
-                            value: value,
-                            writable: true,
-                            configurable: true,
-                            enumerable: true,
-                        });
-                    } catch (_) {
-                        instance[key] = value;
-                    }
-                } else {
-                    instance[key] = value;
-                }
-            }
-
-            if (typeof overrides.init === 'function') {
-                try {
-                    var initResult = overrides.init.apply(instance, args);
-                    if (initResult && typeof initResult === 'object') {
-                        instance = initResult;
-                    }
-                } catch (_) {
-                    // Keep constructor resilient; init errors should not crash runtime.
-                }
-            }
-
-            if (Array.isArray(overrides.interfaces)) {
-                try {
-                    Object.defineProperty(instance, '__interfaces__', {
-                        value: overrides.interfaces.slice(),
-                        writable: false,
-                        configurable: true,
-                        enumerable: false,
-                    });
-                } catch (_) {
-                    instance.__interfaces__ = overrides.interfaces.slice();
-                }
-            }
-
-            ensureProxyInstance(instance, overrides, Extended);
-
-            return instance;
-        }
-
-        Extended.prototype = Object.create((baseCtor && baseCtor.prototype) || Object.prototype);
-        Extended.prototype.constructor = Extended;
-
-        for (var protoKey in overrides) {
-            if (protoKey === 'interfaces') {
-                continue;
-            }
-            Extended.prototype[protoKey] = overrides[protoKey];
-        }
-
-        if (typeName) {
-            try {
-                Object.defineProperty(Extended, 'name', {
-                    value: typeName,
-                    configurable: true,
-                });
-            } catch (_) {
-                // Non-critical metadata assignment.
-            }
-        }
-
-        Extended.__typeName__ = typeName || ctorName(baseCtor);
-        Extended.__nsWinRTClass__ = true;
-        var metadata = buildProxyMetadata(baseCtor, typeName, overrides, Extended);
-
-        Extended.extend = function (nextNameOrOverrides, nextMaybeOverrides) {
-            return makeExtendedConstructor(Extended, nextNameOrOverrides, nextMaybeOverrides);
-        };
-
-        try {
-            Object.defineProperty(Extended, 'emitProxy', {
-                value: function (outDir) {
-                    return NSWinRT.proxy.emit(metadata, outDir);
-                },
-                writable: true,
-                configurable: true,
-                enumerable: false,
-            });
-        } catch (_) {
-            Extended.emitProxy = function (outDir) {
-                return NSWinRT.proxy.emit(metadata, outDir);
-            };
-        }
-
-        return Extended;
-    }
-
-    if (typeof Function.prototype.extend !== 'function') {
-        Object.defineProperty(Function.prototype, 'extend', {
-            value: function (nameOrOverrides, maybeOverrides) {
-                // A WinRT class (or a JS class deriving from one): an ES2015 subclass, so
-                // instances get the composed-object construction of `class X extends Y`.
-                if (globalThis.NSWinRT && typeof globalThis.NSWinRT.extendClass === 'function') {
-                    if (typeof this.__typeName__ === 'string')
-                        return globalThis.NSWinRT.extendClass(this, nameOrOverrides, maybeOverrides);
-                    // Object.extend({ interfaces: [...], ... }): a subclass of System.Object.
-                    if (this === Object && globalThis.System)
-                        return globalThis.NSWinRT.extendClass(globalThis.System.Object, nameOrOverrides, maybeOverrides);
-                }
-                return makeManagedConstructor(this, nameOrOverrides, maybeOverrides);
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    if (typeof Object.extend !== 'function') {
-        Object.defineProperty(Object, 'extend', {
-            value: function (nameOrOverrides, maybeOverrides) {
-                return makeManagedConstructor(Object, nameOrOverrides, maybeOverrides);
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    // Create a managed-backed subclass factory. This returns a constructor
-    // that, when invoked, asks the managed bridge to instantiate a real
-    // C# subclass whose vtable forwards virtual calls back into the
-    // provided JS `overrides` object via the DotNet bridge.
-    function makeManagedConstructor(baseCtor, nameOrOverrides, maybeOverrides) {
-        var hasName = typeof nameOrOverrides === 'string';
-        var explicitTypeName = hasName ? nameOrOverrides : '';
-        var typeName = explicitTypeName || autoProxyTypeName(baseCtor);
-        var overrides = hasName ? maybeOverrides : nameOrOverrides;
-        if (!overrides || typeof overrides !== 'object') overrides = {};
-
-        function Managed() {
-            var args = Array.prototype.slice.call(arguments);
-            // Pass the actual base ctor type name as the assembly param so the
-            // bridge can fall back to it when no static proxy exists for typeName.
-            var baseTypeName = ctorName(baseCtor) || '';
-            var obj = NSWinRT.proxy.createManagedSubclass(baseTypeName, typeName || '', overrides);
-            if (typeof overrides.init === 'function') {
-                try {
-                    var initResult = overrides.init.apply(obj, args);
-                    if (initResult && typeof initResult === 'object') obj = initResult;
-                } catch (_) { }
-            }
-            return obj;
-        }
-
-        Managed.prototype = Object.create((baseCtor && baseCtor.prototype) || Object.prototype);
-        Managed.prototype.constructor = Managed;
-        Managed.extend = function (nextNameOrOverrides, nextMaybeOverrides) {
-            return makeManagedConstructor(Managed, nextNameOrOverrides, nextMaybeOverrides);
-        };
-        try {
-            Object.defineProperty(Managed, 'name', { value: typeName || ctorName(baseCtor), configurable: true });
-        } catch (_) { }
-        Managed.__typeName__ = typeName || ctorName(baseCtor);
-        Managed.__nsWinRTClass__ = true;
-        var meta = buildProxyMetadata(baseCtor, typeName, overrides, Managed);
-        try {
-            Object.defineProperty(Managed, 'emitProxy', {
-                value: function (outDir) { return NSWinRT.proxy.emit(meta, outDir); },
-                writable: true,
-                configurable: true,
-                enumerable: false,
-            });
-        } catch (_) {
-            Managed.emitProxy = function (outDir) { return NSWinRT.proxy.emit(meta, outDir); };
-        }
-        return Managed;
-    }
-
-    if (typeof Function.prototype.extendManaged !== 'function') {
-        Object.defineProperty(Function.prototype, 'extendManaged', {
-            value: function (nameOrOverrides, maybeOverrides) {
-                return makeManagedConstructor(this, nameOrOverrides, maybeOverrides);
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    if (typeof Object.extendManaged !== 'function') {
-        Object.defineProperty(Object, 'extendManaged', {
-            value: function (nameOrOverrides, maybeOverrides) {
-                return makeManagedConstructor(Object, nameOrOverrides, maybeOverrides);
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    // Convenience alias for hosts that expect a global BaseClass helper.
-    globalThis.BaseClass = globalThis.BaseClass || {};
-    if (typeof globalThis.BaseClass.extend !== 'function') {
-        globalThis.BaseClass.extend = function (baseCtor, nameOrOverrides, maybeOverrides) {
-            return makeManagedConstructor(baseCtor || Object, nameOrOverrides, maybeOverrides);
-        };
-    }
-
-    // Registry mapping each WinRT-extended prototype to its lazy factory.
-    // Keyed by the new Child.prototype created in __extends_winrt so that
-    // the Parent.apply override can look up the right factory per subclass.
-    var __nsExtendRegistry__ = new WeakMap();
-
-    function __extends_winrt(Child, Parent) {
-        var extendStatics = Object.setPrototypeOf || function (d, b) { d.__proto__ = b; };
-        extendStatics(Child, Parent);
-
-        // Lazy factory: deferred until first `new Child()` so that TypeScript
-        // has had a chance to populate Child.prototype with override methods.
-        var _extended = null;
-        var getExtended = function () {
-            if (!_extended) {
-                var overrides = {};
-                var interfaces = [];
-                var proto = Child.prototype;
-                if (proto) {
-                    Object.getOwnPropertyNames(proto).forEach(function (key) {
-                        if (key === 'constructor') return;
-                        if (key === 'interfaces') {
-                            var iv = proto[key];
-                            if (Array.isArray(iv)) interfaces = iv;
-                            return;
-                        }
-                        overrides[key] = proto[key];
-                    });
-                }
-                if (interfaces.length) overrides.interfaces = interfaces;
-                var name = Child.__winrtProxyName__ || Child.name || '';
-                var hasBridge = typeof globalThis.__nsDotNetCreateJsSubclass === 'function';
-                if (Child.__winrtProxyName__ || (interfaces.length > 0 && hasBridge)) {
-                    _extended = makeManagedConstructor(Parent, name, overrides);
-                } else {
-                    // No bridge or no interfaces: pure JS proxy via Reflect.construct.
-                    _extended = makeExtendedConstructor(Parent, name, overrides);
-                }
-            }
-            return _extended;
-        };
-
-        var newProto = Object.create((Parent && Parent.prototype) || Object.prototype);
-        newProto.constructor = Child;
-        Child.prototype = newProto;
-        __nsExtendRegistry__.set(newProto, getExtended);
-
-        // Patch Parent.apply/call once per parent class.  The WeakMap lookup
-        // inside the override picks the correct factory per subclass so that
-        // multiple classes extending the same parent coexist correctly.
-        if (!Parent.__nsApplyPatched__) {
-            Parent.__nsApplyPatched__ = true;
-
-            Parent.apply = function (thiz, args) {
-                if (thiz && thiz.__nsContainer__) return;
-                var factory = __nsExtendRegistry__.get(Object.getPrototypeOf(thiz));
-                if (!factory) return;
-                thiz.__nsContainer__ = true;
-                try {
-                    var Extended = factory();
-                    var argArr = Array.isArray(args) ? args : (args ? Array.prototype.slice.call(args) : []);
-                    if (argArr.length > 0) {
-                        thiz.__proto__ = new (Function.prototype.bind.apply(Extended, [null].concat(argArr)))();
-                    } else {
-                        thiz.__proto__ = new Extended();
-                    }
-                    return thiz.__proto__;
-                } finally {
-                    delete thiz.__nsContainer__;
-                }
-            };
-
-            Parent.call = function (thiz) {
-                return Parent.apply(thiz, Array.prototype.slice.call(arguments, 1));
-            };
-        }
-    }
-
-    // Global __extends that TypeScript compiled output resolves via
-    // `var __extends = (this && this.__extends) || ...`.
-    // Intercepts WinRT parent classes; falls back to standard TS behaviour.
-    if (typeof globalThis.__extends !== 'function') {
-        var __extends_ts_inner = function (d, b) {
-            if (b !== null && typeof b !== 'function') {
-                throw new TypeError('Class extends value ' + String(b) + ' is not a constructor or null');
-            }
-            var extendStatics = Object.setPrototypeOf || function (d, b) { d.__proto__ = b; };
-            extendStatics(d, b);
-            function __() { this.constructor = d; }
-            d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-        };
-
-        globalThis.__extends = function (d, b) {
-            if (b && b.__nsWinRTClass__) {
-                __extends_winrt(d, b);
-            } else {
-                __extends_ts_inner(d, b);
-            }
-        };
-    }
-
-    // TypeScript decorator helpers, as the iOS/Android runtimes provide them: compiled
-    // (`experimentalDecorators`) code calls a bare `__decorate(...)`. Core's globals module
-    // binds tslib's copies too, but an ES-module bundle can evaluate decorated core modules
-    // before it runs.
-    if (typeof globalThis.__decorate !== 'function') {
-        globalThis.__decorate = function (decorators, target, key, desc) {
-            var c = arguments.length;
-            var r = c < 3 ? target : desc === null ? (desc = Object.getOwnPropertyDescriptor(target, key)) : desc, d;
-            if (typeof Reflect === 'object' && typeof Reflect.decorate === 'function') {
-                r = Reflect.decorate(decorators, target, key, desc);
-            } else {
-                for (var i = decorators.length - 1; i >= 0; i--) {
-                    if ((d = decorators[i])) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
-                }
-            }
-            return c > 3 && r && Object.defineProperty(target, key, r), r;
-        };
-    }
-    if (typeof globalThis.__param !== 'function') {
-        globalThis.__param = function (paramIndex, decorator) {
-            return function (target, key) { decorator(target, key, paramIndex); };
-        };
-    }
-    if (typeof globalThis.__metadata !== 'function') {
-        globalThis.__metadata = function (metadataKey, metadataValue) {
-            if (typeof Reflect === 'object' && typeof Reflect.metadata === 'function') {
-                return Reflect.metadata(metadataKey, metadataValue);
-            }
-        };
-    }
-
-    // `return global.__native(this)` ends TypeScript subclass constructors written for
-    // Android/iOS; here `this` already is the native-backed object.
-    if (typeof globalThis.__native !== 'function') {
-        globalThis.__native = function (obj) { return obj; };
-    }
-
-    // @NativeClass / @NativeClass(): marks a class that extends a native (WinRT/.NET) class.
-    // Extending works without it; it exists so code written for iOS/Android, where the build
-    // transforms decorated classes, runs unchanged.
-    if (typeof globalThis.NativeClass !== 'function') {
-        Object.defineProperty(globalThis, 'NativeClass', {
-            value: function NativeClass(target) {
-                if (typeof target === 'function') return target;
-                return function (cls) { return cls; };
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    // @Interfaces([IFoo, IBar]): attach WinRT interface list to a class.
-    if (typeof globalThis.Interfaces !== 'function') {
-        Object.defineProperty(globalThis, 'Interfaces', {
-            value: function Interfaces(interfacesList) {
-                return function (target) {
-                    target.prototype.interfaces = Array.isArray(interfacesList) ? interfacesList.slice() : [];
-                    return target;
-                };
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    if (typeof globalThis.CSharpProxy !== 'function') {
-        Object.defineProperty(globalThis, 'CSharpProxy', {
-            value: function CSharpProxy(name) {
-                return function (target) {
-                    target.__winrtProxyName__ = typeof name === 'string' ? name : '';
-                    return target;
-                };
-            },
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    }
-
-    function defaultProxyOutDir(meta) {
-        var typeName = (meta && meta.typeName) ? meta.typeName : 'GeneratedProxy';
-        var safe = safeIdentifier(typeName.split('.').pop());
-        return './generated-proxies/' + safe;
-    }
-
-    function emitProxy(meta, outDir) {
-        if (!meta || typeof meta !== 'object') {
-            throw new Error('NSWinRT.proxy.emit(meta[, outDir]) expects a proxy metadata object');
-        }
-        if (typeof globalThis.__nsProxyWriteTextFile !== 'function') {
-            throw new Error('Host proxy file emitter is not available');
-        }
-
-        var dir = outDir || defaultProxyOutDir(meta);
-        var csprojPath = dir + '/Proxy.csproj';
-        var csPath = dir + '/Proxy.g.cs';
-        var csproj = renderProxyCsproj(meta);
-        var source = renderProxyCSharp(meta);
-
-        globalThis.__nsProxyWriteTextFile(csprojPath, csproj);
-        globalThis.__nsProxyWriteTextFile(csPath, source);
-
-        meta.generated = {
-            dir: dir,
-            csprojPath: csprojPath,
-            csPath: csPath,
-        };
-
-        return meta.generated;
-    }
-
-    function compileProxy(meta, outDir, configuration) {
-        if (typeof globalThis.__nsProxyCompileProject !== 'function') {
-            throw new Error('Host proxy compiler is not available');
-        }
-        var generated = emitProxy(meta, outDir);
-        var result = globalThis.__nsProxyCompileProject(generated.csprojPath, configuration || 'Debug');
-        generated.build = result;
-        return generated;
-    }
-
-    function registerProxy(meta, outDir, configuration) {
-        var generated = compileProxy(meta, outDir, configuration);
-        var manifest = {
-            kind: 'windows-proxy',
-            typeName: meta.typeName,
-            baseType: meta.baseType,
-            interfaces: meta.interfaces,
-            methods: meta.methods,
-            properties: meta.properties,
-            generated: generated,
-            registration: {
-                hostCanLoadAssemblies: false,
-                note: 'Assembly build succeeded, but runtime CLR proxy activation is not wired yet. Dynamic JS fallback remains active.',
-            },
-        };
-        if (typeof globalThis.__nsProxyRegisterManifest === 'function') {
-            globalThis.__nsProxyRegisterManifest(JSON.stringify(manifest));
-        }
-        meta.registered = true;
-        meta.registration = manifest.registration;
-        return manifest;
-    }
-
-    function invokeProxyById(proxyId, methodName, argsArray) {
-        var entry = proxyInstances.get(proxyId);
-        if (!entry) {
-            throw new Error('Proxy instance not found for id ' + proxyId);
-        }
-
-        var target = entry.instance;
-        var method = target && target[methodName];
-        if (typeof method !== 'function') {
-            throw new Error('Proxy method "' + methodName + '" is not defined on proxy id ' + proxyId);
-        }
-
-        return method.apply(target, Array.isArray(argsArray) ? argsArray : []);
-    }
-
-    globalThis.__nsInvokeProxyJs = invokeProxyById;
-
-    globalThis.NSWinRT.proxy = {
-        getExtensions: function () {
-            return proxyExtensions.slice();
-        },
-        emit: emitProxy,
-        compile: compileProxy,
-        register: registerProxy,
-        createManagedSubclass: function (assembly, typeName, overrides) {
-            if (typeof globalThis.__nsDotNetCreateJsSubclass !== 'function') {
-                throw new Error('__nsDotNetCreateJsSubclass is not available in this runtime');
-            }
-            if (!overrides || typeof overrides !== 'object') overrides = {};
-
-            var interfaceNames = Array.isArray(overrides.interfaces)
-                ? overrides.interfaces.map(function (iface) { return ctorName(iface); })
-                : [];
-
-            // Literal CLR member names this JS object actually overrides. The bridge only
-            // emits an IL override for base virtuals named here (everything else falls
-            // through to the real base implementation) and implements exactly these
-            // interface members from JS (others fall back to default/no-op). Plain
-            // functions are method overrides; accessor descriptors become get_/set_-
-            // prefixed property overrides: matching the literal CLR accessor names the
-            // dynamic proxy already dispatches by. Read via getOwnPropertyDescriptor
-            // throughout so collecting names never invokes a JS getter as a side effect.
-            var memberNames = [];
-            for (var mkey in overrides) {
-                if (!Object.prototype.hasOwnProperty.call(overrides, mkey)) continue;
-                if (mkey === 'interfaces' || mkey === 'init') continue;
-                var mdesc = Object.getOwnPropertyDescriptor(overrides, mkey);
-                if (!mdesc) continue;
-                if (typeof mdesc.get === 'function' || typeof mdesc.set === 'function') {
-                    if (typeof mdesc.get === 'function') memberNames.push('get_' + mkey);
-                    if (typeof mdesc.set === 'function') memberNames.push('set_' + mkey);
-                } else if (typeof mdesc.value === 'function') {
-                    memberNames.push(mkey);
-                }
-            }
-
-            var dispatcher = function () {
-                var a = Array.prototype.slice.call(arguments);
-                try {
-                    var target = _wrapDotNetHandle(a[0]);
-                    var method = a[1];
-                    var margs = a.slice(2).map(_wrapDotNetHandle);
-                    if (target && typeof method === 'string') {
-                        var fn = overrides[method];
-                        if (typeof fn === 'function') return fn.apply(target, Array.isArray(margs) ? margs : []);
-                    }
-                } catch (_) { }
-            };
-            var handle = globalThis.__nsDotNetCreateJsSubclass(assembly || '', typeName || '', interfaceNames, memberNames, dispatcher);
-            var obj = _wrapDotNetHandle(handle);
-            ensureProxyInstance(obj, overrides, function () { });
-            return obj;
-        },
-        invokeById: invokeProxyById,
-        listRegisteredManifests: function () {
-            if (typeof globalThis.__nsProxyListManifests === 'function') {
-                return globalThis.__nsProxyListManifests();
-            }
-            return [];
-        },
-    };
-})();
-
-(function () {
-    if (typeof globalThis.__nsDotNetInvokeBin !== 'function') return;
-    // installDotnet() is independently callable (unlike the classic engine's single monolithic
-    // HELPER_SOURCE, where some earlier block always creates NSWinRT first): don't assume
-    // install_interop ran first.
-    globalThis.NSWinRT = globalThis.NSWinRT || {};
-
-    // Binary protocol: no JSON.stringify / JSON.parse.
-    // __nsDotNetInvokeBin(handle, typeName, assembly, method, ...args)
-    // throws on error, returns the result value directly.
-    function _invoke(req) {
-        var handle = (req.handle !== undefined && req.handle !== null) ? req.handle : -1;
-        var args   = req.args;
-        var typeName = req.typeName || '', assembly = req.assembly || '', method = req.method || '';
-        if (!args || args.length === 0) return globalThis.__nsDotNetInvokeBin(handle, typeName, assembly, method);
-        if (args.length === 1) return globalThis.__nsDotNetInvokeBin(handle, typeName, assembly, method, args[0]);
-        return globalThis.__nsDotNetInvokeBin(handle, typeName, assembly, method, ...args);
-    }
-
-    // _invoke with a function's own `arguments`, unwrapped straight into the native call (no
-    // request object or intermediate arrays).
-    function _invokeWith(handle, typeName, assembly, method, args) {
-        var invoke = globalThis.__nsDotNetInvokeBin;
-        switch (args.length) {
-            case 0: return invoke(handle, typeName, assembly, method);
-            case 1: return invoke(handle, typeName, assembly, method, _unwrap(args[0]));
-            case 2: return invoke(handle, typeName, assembly, method, _unwrap(args[0]), _unwrap(args[1]));
-            case 3: return invoke(handle, typeName, assembly, method, _unwrap(args[0]), _unwrap(args[1]), _unwrap(args[2]));
-        }
-        // Built by push so the array stays packed: apply on a holey array takes V8's slow path.
-        var call = [handle, typeName, assembly, method];
-        for (var i = 0; i < args.length; i++) call.push(_unwrap(args[i]));
-        return invoke.apply(null, call);
-    }
-
-    // Populated lazily on first access; avoids repeated bridge round-trips.
-    var _typeInfoCache = {};
-    // A type's member lists get `kinds` (member name -> _K_* flags), so the proxy traps look a name up
-    // instead of scanning the lists on every access.
-    var _K_PROP = 1, _K_WO = 2, _K_RO = 4, _K_SPROP = 8, _K_SMETHOD = 16, _K_SWO = 32, _K_SRO = 64;
-    function _withKinds(info) {
-        var kinds = Object.create(null);
-        function add(list, flag) {
-            if (!list) return;
-            for (var i = 0; i < list.length; i++) kinds[list[i]] = (kinds[list[i]] | 0) | flag;
-        }
-        add(info.properties, _K_PROP);
-        add(info.writeonlyProperties, _K_WO);
-        add(info.readonlyProperties, _K_RO);
-        add(info.staticProperties, _K_SPROP);
-        add(info.staticMethods, _K_SMETHOD);
-        add(info.writeonlyStaticProperties, _K_SWO);
-        add(info.readonlyStaticProperties, _K_SRO);
-        info.kinds = kinds;
-        return info;
-    }
-    function _kindsOf(info) { return info.kinds || _withKinds(info).kinds; }
-
-    // "get_X" / "set_X" accessor names, made once per property name.
-    var _getterNames = Object.create(null), _setterNames = Object.create(null);
-    function _getterName(prop) { return _getterNames[prop] || (_getterNames[prop] = 'get_' + prop); }
-    function _setterName(prop) { return _setterNames[prop] || (_setterNames[prop] = 'set_' + prop); }
-
-    // The native COM pointer of a handle's object as the BigInt the runtime reads from `__native_ptr`,
-    // or undefined when it has none. The bridge makes it for a plain .NET object only on request.
-    function _nativePtrOf(handle) {
-        try {
-            var p = _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'GetNativePtrForHandle', args: [handle] });
-            if (typeof p !== 'number' || p === 0) return undefined;
-            return typeof BigInt === 'function' ? BigInt(p) : p;
-        } catch (_) {
-            return undefined;
-        }
-    }
-    var _emptyInfo = _withKinds({ methods: [], properties: [], staticMethods: [], staticProperties: [], readonlyProperties: [], readonlyStaticProperties: [], writeonlyProperties: [], writeonlyStaticProperties: [] });
-    // Optional mapping for namespace prefixes -> assembly simple-name.
-    // Exact namespaces are preferred first, then progressively shorter
-    // prefixes are tried as a fallback.
-    var _namespaceAssemblyMap = Object.create(null);
-
-    // _resolveAssembly results by type name, cleared whenever the namespace map changes.
-    var _assemblyCache = Object.create(null);
-
-    function _resolveAssembly(typeName) {
-        if (!typeName || typeof typeName !== 'string') return '';
-        var cached = _assemblyCache[typeName];
-        if (cached !== undefined) return cached;
-        var resolved = '';
-        var probe = typeName;
-        while (probe) {
-            var assembly = _namespaceAssemblyMap[probe];
-            if (typeof assembly === 'string' && assembly) { resolved = assembly; break; }
-            var lastDot = probe.lastIndexOf('.');
-            if (lastDot < 0) break;
-            probe = probe.substring(0, lastDot);
-        }
-        _assemblyCache[typeName] = resolved;
-        return resolved;
-    }
-
-    // When the JS GC collects a DotNet proxy the registry fires the
-    // callback with the managed handle id, releasing the CLR reference.
-    // Explicit sw.release() still works for deterministic teardown.
-    var _dotNetFinalizers = typeof FinalizationRegistry === 'function'
-        ? new FinalizationRegistry(function (handle) {
-            try { _invoke({ handle: handle, method: '__release', args: [] }); } catch (e) {}
-          })
-        : null;
-
-    // Auto-populate namespace→assembly map from the managed side.
-    // GetNamespaceAssemblyMapJson scans the app directory for assemblies and
-    // returns a JSON map of { rootNamespace: assemblySimpleName }.
-    // Runs once at IIFE init; any failure is silently ignored.
-    try {
-        var _autoNsJson = _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'GetNamespaceAssemblyMapJson', args: [] });
-        if (typeof _autoNsJson === 'string' && _autoNsJson) {
-            var _parsed = JSON.parse(_autoNsJson);
-            if (_parsed && typeof _parsed === 'object') {
-                for (var _k in _parsed) {
-                    if (Object.prototype.hasOwnProperty.call(_parsed, _k) && typeof _parsed[_k] === 'string') {
-                        _namespaceAssemblyMap[_k] = _parsed[_k];
-                    }
-                }
-            }
-        }
-    } catch (_e) {}
-
-    function _getTypeInfo(assembly, typeName) {
-        if (!typeName) return _emptyInfo;
-        var cached = _typeInfoCache[typeName];
-        if (cached !== undefined) return cached;
-        var info = _emptyInfo;
-        try {
-            // Respect an explicitly-provided assembly name. When empty,
-            // let the managed side attempt resolution (BCL types via Type.GetType).
-            var asm = (typeof assembly === 'string') ? assembly : '';
-            var members = _invoke({ assembly: asm, typeName: typeName, method: '__members__', args: [] });
-            if (members && typeof members === 'object') info = _withKinds(members);
-        } catch (e) {}
-        _typeInfoCache[typeName] = info;
-        return info;
-    }
-
-    function _unwrap(v) {
-        if (v && typeof v === 'object' && typeof v.__handle === 'number') return { __handle: v.__handle };
-        if (Array.isArray(v)) return v.map(_unwrap);
-        // A JS Date reaches DateTime / DateTimeOffset parameters as its ISO 8601 string.
-        if (v instanceof Date) return isNaN(v.getTime()) ? null : v.toISOString();
-        // A JS function passed where .NET expects a delegate gets .NET objects as arguments, the same
-        // proxies a method result would be, rather than raw handles.
-        if (typeof v === 'function' && typeof v.__dotnetType__ !== 'string' && typeof v.__handle !== 'number')
-            return _callbackFor(v);
-        return v;
-    }
-
-    // The wrapper sent for a JS callback: one per function, so passing it again sends the same one.
-    var _callbacks = typeof WeakMap === 'function' ? new WeakMap() : null;
-    function _callbackFor(fn) {
-        var wrapped = _callbacks && _callbacks.get(fn);
-        if (wrapped) return wrapped;
-        wrapped = function () { return fn.apply(this, Array.prototype.map.call(arguments, _wrap)); };
-        if (_callbacks) _callbacks.set(fn, wrapped);
-        return wrapped;
-    }
-
-    // .NET collections (List<T>, Dictionary, ObservableCollection) act like JS arrays: `length`,
-    // `list[i]`, for...of, and the array methods (map, filter, ...) on a copy of their items.
-    // _collectionKind is the bridge's CollectionKind flags (1 enumerable, 2 count, 4 indexed) by type.
-    var _collectionKinds = Object.create(null);
-    var _arrayMethods = Object.create(null);
-    ['forEach', 'map', 'filter', 'reduce', 'reduceRight', 'some', 'every', 'find', 'findIndex', 'findLast',
-        'findLastIndex', 'indexOf', 'lastIndexOf', 'includes', 'join', 'slice', 'concat', 'flat', 'flatMap',
-        'entries', 'keys', 'values', 'at', 'toJSON'].forEach(function (name) { _arrayMethods[name] = 1; });
-
-    function _bridgeCall(method, args) {
-        return _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: method, args: args });
-    }
-
-    function _isIndex(prop) {
-        var c = prop.charCodeAt(0);
-        return c >= 48 && c <= 57 && /^(0|[1-9]\d*)$/.test(prop);
-    }
-
-    function _collectionKind(handle, typeName) {
-        var kind = typeName ? _collectionKinds[typeName] : undefined;
-        if (kind !== undefined) return kind;
-        try { kind = _bridgeCall('CollectionKind', [{ __handle: handle }]) | 0; } catch (_) { kind = 0; }
-        if (typeName) _collectionKinds[typeName] = kind;
-        return kind;
-    }
-
-    function _collectionItems(handle) {
-        return _wrap(_bridgeCall('CollectionItems', [{ __handle: handle }])) || [];
-    }
-
-    // `prop` of a collection proxy when it is one of the array-like members, else undefined.
-    function _collectionMember(handle, typeName, prop) {
-        var kind = _collectionKind(handle, typeName);
-        if (prop === 'length') return (kind & 2) ? _bridgeCall('CollectionCount', [{ __handle: handle }]) : undefined;
-        if (_arrayMethods[prop] === 1) {
-            if (!(kind & 1)) return undefined;
-            return function () {
-                var items = _collectionItems(handle);
-                return prop === 'toJSON' ? items : Array.prototype[prop].apply(items, arguments);
-            };
-        }
-        return (kind & 4) ? _wrap(_bridgeCall('ItemAt', [{ __handle: handle }, +prop])) : undefined;
-    }
-
-    // Value types whose JS string is their .NET ToString(), so `${DateTime.Now}` reads as a date.
-    var _netToString = { 'System.DateTime': 1, 'System.DateTimeOffset': 1, 'System.TimeSpan': 1 };
-
-    // Makes sw.Stop() and sw.Elapsed both work naturally.
-    // The proxy is registered with _dotNetFinalizers so the CLR reference
-    // is released automatically when JS GC collects the proxy.
-    function _makeDotNetInstance(handle, assembly, typeName, isTask, nativePtr) {
-        _getTypeInfo(assembly, typeName);
-        // Method functions by name, made on first access.
-        var methods = null;
-        var ptrKnown = nativePtr !== undefined;
-        // The proxy target holds the plain JS fields set on the object.
-        var proxy = new Proxy({}, {
-            get: function (target, prop) {
-                if (typeof prop === 'symbol') {
-                    if (prop === Symbol.iterator && (_collectionKind(handle, typeName) & 1))
-                        return function () { return _collectionItems(handle)[Symbol.iterator](); };
-                    return target[prop];
-                }
-                if (prop === '__handle') return handle;
-                if (prop === '__type')   return typeName;
-                if (prop === '__isTask') return isTask === true;
-                if (prop === '__native_ptr') {
-                    if (!ptrKnown) { ptrKnown = true; nativePtr = _nativePtrOf(handle); }
-                    return nativePtr;
-                }
-                if (prop === 'release') return function () {
-                    _invoke({ handle: handle, method: '__release', args: [] });
-                };
-                // Like a plain object, so `'' + obj` and comparisons fall through to toString.
-                if (prop === 'valueOf') return function () { return proxy; };
-                if (prop === 'toString') return function () {
-                    if (_netToString[typeName] === 1) return String(_invoke({ handle: handle, method: 'ToString', args: [] }));
-                    return '[DotNetObject ' + typeName + ' #' + handle + ']';
-                };
-                // A Task/ValueTask (awaitable) result is thenable, so `await obj.SomethingAsync()` works;
-                // any other .NET object must not look like a promise.
-                if (prop === 'then') {
-                    if (isTask !== true) return undefined;
-                    return function (onFulfilled, onRejected) {
-                        return globalThis.NSWinRT.dotnet.taskToPromise({ __handle: handle, __isTask: true }).then(onFulfilled, onRejected);
-                    };
-                }
-                if (Object.prototype.hasOwnProperty.call(target, prop)) return target[prop];
-                // Re-read info in case it was populated after construction.
-                var kind = _kindsOf(_typeInfoCache[typeName] || _emptyInfo)[prop] | 0;
-                // Write-only (setter, no getter): reading it is an error.
-                if (kind & _K_WO)
-                    throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
-                if (kind & _K_PROP)
-                    return _wrap(_invoke({ handle: handle, method: _getterName(prop), args: [] }));
-                if (prop === 'length' || _arrayMethods[prop] === 1 || _isIndex(prop)) {
-                    var member = _collectionMember(handle, typeName, prop);
-                    if (member !== undefined) return member;
-                }
-                // Not a native property: a function for method dispatch.
-                if (methods === null) methods = Object.create(null);
-                return methods[prop] || (methods[prop] = function () {
-                    return _wrap(_invokeWith(handle, '', '', prop, arguments));
-                });
-            },
-            set: function (target, prop, value) {
-                if (typeof prop !== 'symbol') {
-                    var kind = _kindsOf(_typeInfoCache[typeName] || _emptyInfo)[prop] | 0;
-                    // Read-only (getter, no setter): assigning it is an error.
-                    if (kind & _K_RO)
-                        throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
-                    // Writable (read-write or write-only): invoke the setter.
-                    if (kind & (_K_PROP | _K_WO)) {
-                        _invoke({ handle: handle, method: _setterName(prop), args: [_unwrap(value)] });
-                        return true;
-                    }
-                    if (_isIndex(prop) && (_collectionKind(handle, typeName) & 4)) {
-                        _bridgeCall('SetItemAt', [{ __handle: handle }, +prop, _unwrap(value)]);
-                        return true;
-                    }
-                }
-                // Not a native property: a plain JS field of this object.
-                target[prop] = value;
-                return true;
-            },
-        });
-        if (_dotNetFinalizers) _dotNetFinalizers.register(proxy, handle);
-        return proxy;
-    }
-
-    function _wrap(value) {
-        if (value == null) return null;
-        if (Array.isArray(value)) return value.map(_wrap);
-        if (typeof value === 'object' && typeof value.__handle === 'number') {
-            var typeName = value.__type || '';
-            var jsSelf = _jsSelfByHandle && _deref(_jsSelfByHandle.get(value.__handle));
-            if (jsSelf) return jsSelf;
-            // A JS subclass instance whose JS object was collected: its dispatcher revives one.
-            if (typeName.indexOf('NSWinRTDynamicProxies.') === 0) {
-                try { _invoke({ handle: value.__handle, method: '__ns_js_self', args: [] }); } catch (_) {}
-                jsSelf = _deref(_jsSelfByHandle.get(value.__handle));
-                if (jsSelf) return jsSelf;
-            }
-            var assembly = _resolveAssembly(typeName);
-            return _makeDotNetInstance(value.__handle, assembly, typeName, value.__isTask === true, value.__native_ptr);
-        }
-        return value;
-    }
-
-    globalThis.NSWinRT.dotnet = {
-        invoke: function (assembly, typeName, method, args) {
-            return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: (args || []).map(_unwrap) }));
-        },
-        get: function (assembly, typeName, prop) {
-            return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: 'get_' + prop, args: [] }));
-        },
-        fromHandle: function (handle, typeName) {
-            var assembly = _resolveAssembly(typeName || '');
-            return _makeDotNetInstance(handle, assembly, typeName || '');
-        },
-        // Exposed so other IIFEs in this bootstrap (e.g. the managed-subclass/proxy block,
-        // which runs in its own closure earlier in the script and has no direct access to
-        // this IIFE's private `_wrap`) can wrap a raw tagged handle value the same way.
-        wrap: _wrap,
-        // Lazily register a namespace prefix and optional assembly mapping.
-        // Example: NSWinRT.dotnet.registerNamespace('com', 'NativeScript');
-        registerNamespace: function(rootName, assemblyName) {
-            if (!rootName || typeof rootName !== 'string') return;
-            var name = String(rootName);
-            var root = name.split('.')[0];
-            if (assemblyName && typeof assemblyName === 'string') {
-                _assemblyCache = Object.create(null);
-                _namespaceAssemblyMap[name] = assemblyName;
-                if (!_namespaceAssemblyMap[root]) {
-                    _namespaceAssemblyMap[root] = assemblyName;
-                }
-            }
-            if (root in globalThis) return;
-            try {
-                Object.defineProperty(globalThis, root, {
-                    configurable: true,
-                    enumerable: true,
-                    get: function() {
-                        var proxy = _makeNamespaceProxy(root);
-                        try { Object.defineProperty(globalThis, root, { value: proxy, writable: true, configurable: true, enumerable: true }); } catch (_) {}
-                        return proxy;
-                    },
-                    // A namespace root never blocks app code from using the name for its own value
-                    // (`var App = ...` in a classic script assigns through this accessor).
-                    set: function(value) {
-                        try { Object.defineProperty(globalThis, root, { value: value, writable: true, configurable: true, enumerable: true }); } catch (_) {}
-                    }
-                });
-            } catch (_) {
-                try { globalThis[root] = _makeNamespaceProxy(root); } catch (_) {}
-            }
-        },
-        registerNamespaces: function(arr) {
-            if (!Array.isArray(arr)) return;
-            for (var i = 0; i < arr.length; i++) this.registerNamespace(arr[i]);
-        },
-    };
-
-    // ── .NET types as JS classes ────────────────────────────────────────────────
-    // A .NET type proxy (System.Text.StringBuilder, MyApp.Native.Greeter) is a constructor with a
-    // stable `prototype`, so it can be extended the way Java and Objective-C classes are on Android
-    // and iOS:
-    //   class Cat extends MyApp.Animal { constructor(n) { super(n); } Speak() { return super.Speak(); } }
-    //   const Dog = MyApp.Animal.extend('Dog', { Speak() { return this.super.Speak(); } });
-    //   const calc = new MyApp.ICalculator({ Compute(a, b) { return a * b; } });
-    // Constructing a subclass creates the JS object first, then a managed subclass of the .NET type
-    // whose overridden virtuals (and implemented interface members) call back into that object.
-    // `super.X()` reaches the base implementation through the non-virtual `__ns_base_X` entry point
-    // the bridge emits for every overridden member. Native code handing the instance back to JS gets
-    // the same JS object.
-    var _nsProxyCache = Object.create(null);
-    var _namespaceExtras = { System: Object.create(null) };
-    var _typeKindCache = Object.create(null);
-    var _typeProtoCache = Object.create(null);
-    var _subclassInfoCache = new WeakMap();
-    var _jsSelfByHandle = new Map();
-
-    // ── Lifetime of JS subclass instances ───────────────────────────────────────
-    // An instance is a JS object plus the managed object it drives. The JS object holds the managed
-    // one through its handle; the managed object reaches the JS object only through its dispatcher,
-    // which holds it weakly. So once JS drops the JS object, its handle is released and the managed
-    // object goes as soon as .NET/native code drops it too (the bridge then unpins the dispatcher).
-    // When native code calls into an instance whose JS object was collected, a new JS object of the
-    // same class is made for it: fields its constructor set are gone, as on Android when a JS object
-    // used only from native code is collected. Subclasses of WinRT UI classes are kept strongly while
-    // they are in a live XAML tree.
-    var _canWeakRef = typeof WeakRef === 'function';
-    var _selfFinalizers = typeof FinalizationRegistry === 'function'
-        ? new FinalizationRegistry(function (handle) {
-            if (!_deref(_jsSelfByHandle.get(handle))) _jsSelfByHandle.delete(handle);
-            try { _invoke({ handle: handle, method: '__release', args: [] }); } catch (_) {}
-        })
-        : null;
-
-    function _weak(obj) { return _canWeakRef ? new WeakRef(obj) : obj; }
-    function _deref(ref) { return ref && _canWeakRef && ref instanceof WeakRef ? ref.deref() : ref; }
-
-    // Gives `self` the bridge identity in `raw` and registers it as the JS object of `entry`'s instance.
-    function _adopt(entry, self, raw) {
-        Object.defineProperty(self, '__handle', { value: raw.__handle });
-        Object.defineProperty(self, '__nsOverrides', { value: entry.overrides });
-        if (!entry.winrt) {
-            Object.defineProperty(self, '__type', { value: raw.__type || entry.typeName });
-            if (raw.__native_ptr !== undefined) Object.defineProperty(self, '__native_ptr', { value: raw.__native_ptr });
-        }
-        entry.ref = _weak(self);
-        _jsSelfByHandle.set(raw.__handle, _weak(self));
-        if (_selfFinalizers) _selfFinalizers.register(self, raw.__handle);
-        if (entry.winrt) {
-            entry.strong = self;
-            _attachedEntries.add(entry);
-        }
-        _sweepAttached();
-        return self;
-    }
-
-    // The JS object of `entry`'s instance, made anew when the previous one was collected.
-    function _selfFor(entry, raw) {
-        var self = _deref(entry.ref);
-        if (self) return self;
-        if (entry.constructing) throw new Error(entry.typeName + ' called into its JS subclass before the instance existed');
-        if (!raw || typeof raw.__handle !== 'number') throw new Error('The ' + entry.typeName + ' subclass instance is gone');
-        if (entry.winrt) {
-            self = globalThis.__nsWrapWinRTPointer(raw.__native_ptr, entry.typeName);
-            Object.setPrototypeOf(self, entry.proto);
-        } else {
-            self = Object.create(entry.proto);
-        }
-        return _adopt(entry, self, raw);
-    }
-
-    // The dispatcher native code calls the instance's overridden and interface members through.
-    function _makeDispatcher(entry) {
-        return function (selfHandle, member) {
-            var self = _selfFor(entry, selfHandle);
-            if (member === '__ns_js_self') return undefined;
-            _sweepAttached();
-            var margs = Array.prototype.slice.call(arguments, 2).map(_wrap);
-            return _dispatchToJs(self, entry.baseProto, entry.typeName, member, margs);
-        };
-    }
-
-    // Subclasses of WinRT classes held strongly (entry.strong) while in a live XAML tree, re-checked at
-    // most every two seconds when subclass instances are created or called into.
-    var _attachedEntries = new Set();
-    var _lastAttachedSweep = 0;
-    function _sweepAttached() {
-        var now = Date.now();
-        if (now - _lastAttachedSweep < 2000) return;
-        _lastAttachedSweep = now;
-        _attachedEntries.forEach(function (entry) {
-            var self = _deref(entry.ref);
-            if (!self) {
-                _attachedEntries.delete(entry);
-                return;
-            }
-            var attached = false;
-            try { attached = self.XamlRoot != null; } catch (_) {}
-            entry.strong = attached ? self : undefined;
-        });
-    }
-    var _baseCallPrefix = '__ns_base_';
-
-    function _has(list, name) {
-        return !!list && list.indexOf(name) >= 0;
-    }
-
-    function _typeKind(path) {
-        var kind = _typeKindCache[path];
-        if (kind !== undefined) return kind;
-        try {
-            kind = _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'TypeKind', args: [path] }) || '';
-        } catch (_) {
-            kind = '';
-        }
-        _typeKindCache[path] = kind;
-        return kind;
-    }
-
-    // Full name of a .NET type proxy, or of the .NET base of a JS class deriving from one.
-    function _dotnetTypeName(type) {
-        if (typeof type === 'string') return type;
-        if (!type || (typeof type !== 'function' && typeof type !== 'object')) return '';
-        var name = type.__dotnetType__;
-        return typeof name === 'string' ? name : '';
-    }
-
-    // The handle of an instance of a JS subclass (an own property); -1 for anything else, such as
-    // a class prototype further down the chain, without running any property trap.
-    function _ownHandle(o) {
-        if (!o || (typeof o !== 'object' && typeof o !== 'function')) return -1;
-        var d = Object.getOwnPropertyDescriptor(o, '__handle');
-        return d && typeof d.value === 'number' ? d.value : -1;
-    }
-
-    function _baseCallName(self, member) {
-        var overrides = self.__nsOverrides;
-        return overrides && overrides.has(member) ? _baseCallPrefix + member : member;
-    }
-
-    // A native member of `self` (an instance of a JS subclass), reached through the .NET type's
-    // prototype: properties are read through their getter, methods become functions. Members the JS
-    // class overrides resolve to the base implementation — only `super.X` gets this far for them.
-    function _baseMember(path, self, prop) {
-        if (prop === 'toString') return function () { return String(_invoke({ handle: self.__handle, method: 'ToString', args: [] })); };
-        if (prop === 'valueOf') return function () { return this; };
-        var info = _getTypeInfo(_resolveAssembly(path), path);
-        var overrides = self.__nsOverrides;
-        if (_has(info.properties, prop) || (overrides && overrides.has('get_' + prop))) {
-            return _wrap(_invoke({ handle: self.__handle, method: _baseCallName(self, 'get_' + prop), args: [] }));
-        }
-        if (_has(info.writeonlyProperties, prop))
-            throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + path + '\'');
-        if (_has(info.methods, prop) || (overrides && overrides.has(prop))) {
-            var method = _baseCallName(self, prop);
-            return function () {
-                var args = Array.prototype.slice.call(arguments).map(_unwrap);
-                return _wrap(_invoke({ handle: self.__handle, method: method, args: args }));
-            };
-        }
-        return undefined;
-    }
-
-    // The `prototype` of a .NET type: the end of every JS subclass's prototype chain. Reads resolve
-    // native members against the receiving instance; writes go to native properties, and anything
-    // else becomes a plain JS field of the instance.
-    function _typePrototype(path) {
-        var cached = _typeProtoCache[path];
-        if (cached) return cached;
-        var proto = new Proxy(Object.create(null), {
-            get: function (_, prop, receiver) {
-                if (typeof prop === 'symbol') return undefined;
-                if (_ownHandle(receiver) < 0) {
-                    // Read off the prototype itself — TypeScript's ES5 super call
-                    // `_super.prototype.Method.call(this, ...)`: a function that runs the base
-                    // implementation on whichever instance it is called with.
-                    var typeInfo = _getTypeInfo(_resolveAssembly(path), path);
-                    if (!_has(typeInfo.methods, prop)) return undefined;
-                    return function () {
-                        if (_ownHandle(this) < 0) throw new TypeError(path + '.prototype.' + prop + ' called on an object that is not a ' + path);
-                        return _baseMember(path, this, prop).apply(this, arguments);
-                    };
-                }
-                return _baseMember(path, receiver, prop);
-            },
-            set: function (_, prop, value, receiver) {
-                if (typeof prop !== 'symbol' && _ownHandle(receiver) >= 0) {
-                    var info = _getTypeInfo(_resolveAssembly(path), path);
-                    if (_has(info.readonlyProperties, prop))
-                        throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + path + '\'');
-                    if (_has(info.properties, prop) || _has(info.writeonlyProperties, prop)) {
-                        _invoke({ handle: receiver.__handle, method: _baseCallName(receiver, 'set_' + prop), args: [_unwrap(value)] });
-                        return true;
-                    }
-                }
-                Object.defineProperty(receiver, prop, { value: value, writable: true, enumerable: true, configurable: true });
-                return true;
-            },
-        });
-        _typeProtoCache[path] = proto;
-        return proto;
-    }
-
-    // Members (literal CLR names: methods, get_X/set_X accessors) and interfaces a JS class adds on
-    // top of its .NET base, from every class between it and the base.
-    function _subclassInfo(proto, baseProto) {
-        var cached = _subclassInfoCache.get(proto);
-        if (cached) return cached;
-        var members = [];
-        var overrides = new Set();
-        var interfaces = [];
-        var seen = Object.create(null);
-        function addInterfaces(list) {
-            if (!Array.isArray(list)) return;
-            for (var i = 0; i < list.length; i++) {
-                var name = _dotnetTypeName(list[i]) || (list[i] && (list[i].__typeName__ || list[i].name)) || '';
-                if (name && interfaces.indexOf(name) < 0) interfaces.push(name);
-            }
-        }
-        for (var p = proto; p && p !== baseProto; p = Object.getPrototypeOf(p)) {
-            var keys = Object.getOwnPropertyNames(p);
-            for (var i = 0; i < keys.length; i++) {
-                var key = keys[i];
-                if (key === 'constructor' || key === 'interfaces' || key === 'super' || key === 'init' || seen[key]) continue;
-                seen[key] = true;
-                var d = Object.getOwnPropertyDescriptor(p, key);
-                if (typeof d.get === 'function') { members.push('get_' + key); overrides.add('get_' + key); }
-                if (typeof d.set === 'function') { members.push('set_' + key); overrides.add('set_' + key); }
-                if (typeof d.value === 'function') { members.push(key); overrides.add(key); }
-            }
-            if (Object.prototype.hasOwnProperty.call(p, 'interfaces')) addInterfaces(p.interfaces);
-            var ctor = Object.prototype.hasOwnProperty.call(p, 'constructor') ? p.constructor : null;
-            if (ctor && Object.prototype.hasOwnProperty.call(ctor, 'interfaces')) addInterfaces(ctor.interfaces);
-        }
-        var info = { members: members, overrides: overrides, interfaces: interfaces };
-        _subclassInfoCache.set(proto, info);
-        return info;
-    }
-
-    // The JS-defined member `key` of `self` (an own field, or a member of one of its JS classes).
-    function _jsMember(self, key, baseProto) {
-        for (var o = self; o && o !== baseProto; o = Object.getPrototypeOf(o)) {
-            var d = Object.getOwnPropertyDescriptor(o, key);
-            if (d) return d;
-        }
-        return null;
-    }
-
-    // Native code calling an overridden member (or an implemented interface member) of `self`.
-    function _dispatchToJs(self, baseProto, typeName, member, args) {
-        var accessor = /^(get|set)[_:](.+)$/.exec(member);
-        if (accessor) {
-            var ad = _jsMember(self, accessor[2], baseProto);
-            if (ad) {
-                if (accessor[1] === 'get') {
-                    if (typeof ad.get === 'function') return ad.get.call(self);
-                    if ('value' in ad && typeof ad.value !== 'function') return ad.value;
-                } else if (typeof ad.set === 'function') {
-                    ad.set.call(self, args[0]);
-                    return undefined;
-                } else if ('value' in ad && ad.writable) {
-                    self[accessor[2]] = args[0];
-                    return undefined;
-                }
-            }
-        }
-        var md = _jsMember(self, member, baseProto);
-        if (md && typeof md.value === 'function') return md.value.apply(self, args);
-        throw new Error((self.constructor && self.constructor.name || typeName) + ' does not implement ' + member);
-    }
-
-    function _constructSubclass(path, args, proto) {
-        if (typeof globalThis.__nsDotNetCreateJsSubclass !== 'function')
-            throw new Error('Extending .NET types is not available in this runtime');
-        var baseProto = _typePrototype(path);
-        var info = _subclassInfo(proto, baseProto);
-        var self = Object.create(proto);
-        // A virtual the base constructor calls reaches `self` before it has its handle.
-        var entry = { proto: proto, baseProto: baseProto, typeName: path, overrides: info.overrides, winrt: false, ref: self };
-        var raw = globalThis.__nsDotNetCreateJsSubclass('', path, info.interfaces, info.members, _makeDispatcher(entry), args.map(_unwrap));
-        if (!raw || typeof raw.__handle !== 'number') throw new Error('Could not create an instance of a subclass of ' + path);
-        return _adopt(entry, self, raw);
-    }
-
-    // `new SomeInterface({ ... })`: an object implementing the interface with the given members.
-    function _implementInterface(path, impl) {
-        var proto = Object.create(_typePrototype('System.Object'));
-        Object.defineProperties(proto, Object.getOwnPropertyDescriptors(impl));
-        Object.defineProperty(proto, 'interfaces', { value: [path] });
-        return _constructSubclass('System.Object', [], proto);
-    }
-
-    // `this.super` inside a class made by extend(): the parent class's members bound to `self`.
-    function _superOf(self, Cls) {
-        var parent = Object.getPrototypeOf(Cls.prototype);
-        return new Proxy(Object.create(null), {
-            get: function (_, prop) {
-                var value = Reflect.get(parent, prop, self);
-                return typeof value === 'function' ? value.bind(self) : value;
-            },
-        });
-    }
-
-    // Base.extend([name,] members): an ES2015 subclass of Base with the given members; `init`, when
-    // present, runs after construction with the constructor arguments.
-    function _extendClass(Base, nameOrMembers, maybeMembers) {
-        var hasName = typeof nameOrMembers === 'string';
-        var members = (hasName ? maybeMembers : nameOrMembers) || {};
-        var Extended = class extends Base {
-            constructor() {
-                super(...arguments);
-                if (typeof members.init === 'function') members.init.apply(this, arguments);
-            }
-        };
-        var descriptors = Object.getOwnPropertyDescriptors(members);
-        delete descriptors.init;
-        if (descriptors.interfaces) {
-            Object.defineProperty(Extended.prototype, 'interfaces', { value: members.interfaces });
-            delete descriptors.interfaces;
-        }
-        Object.defineProperties(Extended.prototype, descriptors);
-        Object.defineProperty(Extended.prototype, 'super', {
-            get: function () { return _superOf(this, Extended); },
-        });
-        if (hasName) Object.defineProperty(Extended, 'name', { value: nameOrMembers.split('.').pop() });
-        return Extended;
-    }
-
-    // `_super.call(this, ...)` / `_super.apply(this, args)` in TypeScript's ES5 output (what the
-    // @NativeClass transform emits): construct the subclass instance `thisArg` was created for.
-    function _es5SuperCall(path, thisArg, args) {
-        var proto = thisArg && Object.getPrototypeOf(thisArg);
-        if (!proto || !Object.prototype.isPrototypeOf.call(_typePrototype(path), proto))
-            throw new TypeError('Class constructor ' + path + ' cannot be invoked without \'new\'');
-        return _constructSubclass(path, args, proto);
-    }
-
-    function _hasInstance(path, value) {
-        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
-        if (Object.prototype.isPrototypeOf.call(_typePrototype(path), value)) return true;
-        if (typeof value.__handle !== 'number') return false;
-        try {
-            return _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'IsInstanceOf', args: [{ __handle: value.__handle }, path] }) === true;
-        } catch (_) {
-            return false;
-        }
-    }
-
-    // ── WinRT classes as JS base classes ────────────────────────────────────────
-    // `class FixedPanel extends Microsoft.UI.Xaml.Controls.Panel { MeasureOverride(size) { ... } }`:
-    // the WinRT constructor hands `super(...)` here. The instance is a composed object created by
-    // the .NET bridge from the C#/WinRT projection of the class (the way a C# subclass is), so XAML
-    // calling an overridable member (MeasureOverride, ArrangeOverride, OnApplyTemplate, ...) lands in
-    // the JS override. The JS object is the ordinary WinRT wrapper of that object, with the subclass
-    // prototype spliced in front of the class's native members.
-    var _linkedWinRTPrototypes = new WeakSet();
-
-    // The WinRT class a JS class derives from: the nearest constructor with its own __typeName__.
-    function _winrtBaseOf(ctor) {
-        for (var c = ctor; c; c = Object.getPrototypeOf(c)) {
-            if (Object.prototype.hasOwnProperty.call(c, '__typeName__')) return c;
-        }
-        return null;
-    }
-
-    // `super.X(...)` for a member a JS subclass of a WinRT class overrides: the base implementation,
-    // through the bridge (the native member would dispatch back into the override).
-    function _winrtBaseCall(handle, prop) {
-        return function () {
-            var args = Array.prototype.slice.call(arguments).map(_unwrap);
-            return _wrap(_invoke({ handle: handle, method: _baseCallPrefix + prop, args: args }));
-        };
-    }
-
-    // Puts a layer under the JS subclass prototypes that resolves the class's native members and
-    // sends `super.X()` for overridden members to the base implementation. On the classic engine the
-    // class's `prototype` is separate from its instances' native prototype, so the layer goes under the
-    // class's `prototype` once; on the napi engines they're the same object, so it goes under the
-    // subclass prototype that sits directly on it.
-    function _linkWinRTSubclassPrototype(base, nativeProto, proto) {
-        if (!base || !nativeProto) return;
-        var target = base.prototype;
-        if (target === nativeProto) {
-            target = proto;
-            while (target && Object.getPrototypeOf(target) !== nativeProto) target = Object.getPrototypeOf(target);
-        }
-        if (!target || _linkedWinRTPrototypes.has(target)) return;
-        _linkedWinRTPrototypes.add(target);
-        var layer = new Proxy(Object.create(nativeProto), {
-            get: function (_, prop, receiver) {
-                var handle = _ownHandle(receiver);
-                if (typeof prop !== 'string') return Reflect.get(nativeProto, prop, receiver);
-                if (handle >= 0) {
-                    if (receiver.__nsOverrides && receiver.__nsOverrides.has(prop)) return _winrtBaseCall(handle, prop);
-                    return Reflect.get(nativeProto, prop, receiver);
-                }
-                // Read off a prototype — TypeScript's ES5 `_super.prototype.X.call(this, ...)`: decide
-                // between the base implementation and the native member when it's called.
-                var native = Reflect.get(nativeProto, prop, receiver);
-                if (typeof native !== 'function') return native;
-                return function () {
-                    var h = _ownHandle(this);
-                    if (h >= 0 && this.__nsOverrides && this.__nsOverrides.has(prop))
-                        return _winrtBaseCall(h, prop).apply(this, arguments);
-                    return native.apply(this, arguments);
-                };
-            },
-            has: function (_, prop) { return prop in nativeProto; },
-        });
-        Object.setPrototypeOf(target, layer);
-    }
-
-    // napi engines: the class `prototype` is the native prototype itself, so TypeScript's ES5
-    // `_super.prototype.X.call(this, ...)` reaches the native member directly. Wrap each native member a
-    // subclass overrides (once) so that, called on a JS subclass instance, it runs the base
-    // implementation instead of dispatching back into the override.
-    function _guardNativeMembers(nativeProto, overrides) {
-        overrides.forEach(function (name) {
-            for (var p = nativeProto; p; p = Object.getPrototypeOf(p)) {
-                var d = Object.getOwnPropertyDescriptor(p, name);
-                if (!d) continue;
-                if (typeof d.value === 'function' && !d.value.__nsGuarded && d.writable) {
-                    var native = d.value;
-                    var guarded = function () {
-                        var h = _ownHandle(this);
-                        if (h >= 0 && this.__nsOverrides && this.__nsOverrides.has(name))
-                            return _winrtBaseCall(h, name).apply(this, arguments);
-                        return native.apply(this, arguments);
-                    };
-                    Object.defineProperty(guarded, '__nsGuarded', { value: true });
-                    Object.defineProperty(p, name, { value: guarded, writable: true, configurable: true, enumerable: d.enumerable });
-                }
-                return;
-            }
-        });
-    }
-
-    // Called by the WinRT class constructors for `super(...)` from a JS subclass (newTarget) or
-    // TypeScript's ES5 `_super.call(this, ...)` (es5This). Returns undefined when this isn't a subclass
-    // construction or the .NET bridge isn't available; the constructor then builds a plain instance.
-    globalThis.__nsConstructWinRTSubclass = function (typeName, newTarget, args, es5This) {
-        var proto;
-        var base;
-        if (newTarget) {
-            proto = newTarget.prototype;
-            base = _winrtBaseOf(Object.getPrototypeOf(newTarget));
-        } else {
-            proto = es5This && Object.getPrototypeOf(es5This);
-            base = proto && proto.constructor ? _winrtBaseOf(Object.getPrototypeOf(proto.constructor)) : null;
-            if (!base || base.__typeName__ !== typeName || Object.prototype.hasOwnProperty.call(proto.constructor, '__typeName__'))
-                return undefined;
-        }
-        if (typeof globalThis.__nsDotNetCreateJsSubclass !== 'function' || typeof globalThis.__nsWrapWinRTPointer !== 'function')
-            return undefined;
-        var baseProto = base ? base.prototype : null;
-        var info = _subclassInfo(proto, baseProto);
-        var entry = { proto: proto, baseProto: baseProto, typeName: typeName, overrides: info.overrides, winrt: true, constructing: true };
-        var raw = globalThis.__nsDotNetCreateJsSubclass('', typeName, info.interfaces, info.members, _makeDispatcher(entry), (args || []).map(_unwrap));
-        entry.constructing = false;
-        if (!raw || raw.__native_ptr === undefined || raw.__native_ptr === null)
-            throw new Error('Could not create a WinRT object for a subclass of ' + typeName);
-        var self = globalThis.__nsWrapWinRTPointer(raw.__native_ptr, typeName);
-        var nativeProto = Object.getPrototypeOf(self);
-        _linkWinRTSubclassPrototype(base, nativeProto, proto);
-        if (base && base.prototype === nativeProto) _guardNativeMembers(nativeProto, info.overrides);
-        Object.setPrototypeOf(self, proto);
-        return _adopt(entry, self, raw);
-    };
-
-    globalThis.NSWinRT.extendClass = _extendClass;
-
-    // System.Diagnostics.Stopwatch.StartNew()    →  static method call
-    // System.Environment.MachineName             →  static property get
-    // new System.Text.StringBuilder(64)          →  constructor
-    // sw.Stop()                                  →  instance method
-    // sw.Elapsed                                 →  instance property
-    function _makeNamespaceProxy(path) {
-        var cached = _nsProxyCache[path];
-        if (cached) return cached;
-        // Static method functions and child namespace/type proxies by name, made on first access.
-        var members = Object.create(null);
-        // Plain JS fields assigned to the namespace or type, made on first assignment.
-        var fields = null;
-        function _node() {}
-        var proxy = new Proxy(_node, {
-            get: function (_, prop) {
-                if (prop === Symbol.hasInstance) return function (value) { return _hasInstance(path, value); };
-                if (typeof prop === 'symbol') return undefined;
-                // Prevent string-coercion methods from descending into sub-proxies.
-                // V8's console.log / JSON.stringify call toString/valueOf on unknown objects;
-                // returning a sub-proxy causes the apply trap to fire with a non-existent
-                // type name, producing a spurious "Type not found" bridge error.
-                if (prop === 'toString' || prop === 'valueOf')
-                    return function() { return '[.NET ' + path + ']'; };
-                var extras = _namespaceExtras[path];
-                if (extras && Object.prototype.hasOwnProperty.call(extras, prop)) return extras[prop];
-                if (fields !== null && prop in fields) return fields[prop];
-                var member = members[prop];
-                if (member !== undefined) return member;
-                if (prop === '__dotnetType__') return path;
-                if (prop === 'prototype') return _typePrototype(path);
-                // Not a WinRT class: TypeScript's __extends must take the standard path.
-                if (prop === '__nsWinRTClass__' || prop === 'then') return undefined;
-                var assembly = _resolveAssembly(path);
-                var kind = _kindsOf(_getTypeInfo(assembly, path))[prop] | 0;
-                // Write-only static property: reading it is an error.
-                if (kind & _K_SWO)
-                    throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + path + '\'');
-                // Readable static property: resolve value immediately.
-                if (kind & _K_SPROP)
-                    return _wrap(_invoke({ assembly: assembly, typeName: path, method: _getterName(prop), args: [] }));
-                // Static method: a function, made once.
-                if (kind & _K_SMETHOD) {
-                    return members[prop] = function () {
-                        return _wrap(_invokeWith(-1, path, _resolveAssembly(path), prop, arguments));
-                    };
-                }
-                if (prop === 'extend') return function (nameOrMembers, maybeMembers) { return _extendClass(this, nameOrMembers, maybeMembers); };
-                if (prop === 'call') return function (thisArg) { return _es5SuperCall(path, thisArg, Array.prototype.slice.call(arguments, 1)); };
-                if (prop === 'apply') return function (thisArg, args) { return _es5SuperCall(path, thisArg, args ? Array.prototype.slice.call(args) : []); };
-                // Namespace / sub-type: keep descending.
-                return members[prop] = _makeNamespaceProxy(path + '.' + prop);
-            },
-            set: function (_, prop, value) {
-                if (typeof prop === 'symbol') return true;
-                var assembly = _resolveAssembly(path);
-                var kind = _kindsOf(_getTypeInfo(assembly, path))[prop] | 0;
-                // Read-only static property: assignment is an error.
-                if (kind & _K_SRO)
-                    throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + path + '\'');
-                // Writable (read-write or write-only): invoke the setter.
-                if (kind & (_K_SPROP | _K_SWO)) {
-                    _invoke({ assembly: assembly, typeName: path, method: _setterName(prop), args: [_unwrap(value)] });
-                    return true;
-                }
-                // Not a native property: a plain JS field.
-                (fields || (fields = Object.create(null)))[prop] = value;
-                return true;
-            },
-            apply: function (_, _this, args) {
-                var lastDot  = path.lastIndexOf('.');
-                // No dot means this is a top-level name being called directly —
-                // there is no type+method pair to dispatch, so bail out.
-                if (lastDot <= 0) return undefined;
-                var typeName = path.substring(0, lastDot);
-                var method   = path.substring(lastDot + 1);
-                var assembly = _resolveAssembly(typeName);
-                return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: args.map(_unwrap) }));
-            },
-            construct: function (_, args, newTarget) {
-                // `super(...)` from a JS subclass.
-                if (newTarget && newTarget !== proxy) return _constructSubclass(path, args, newTarget.prototype);
-                if (args.length === 1 && args[0] && typeof args[0] === 'object' && typeof args[0].__handle !== 'number'
-                    && _typeKind(path) === 'interface')
-                    return _implementInterface(path, args[0]);
-                var assembly = _resolveAssembly(path);
-                return _wrap(_invoke({ assembly: assembly, typeName: path, method: '.ctor', args: args.map(_unwrap) }));
-            },
-        });
-        _nsProxyCache[path] = proxy;
-        return proxy;
-    }
-    // `System` stays the .NET namespace when app code assigns it: @nativescript/core sets
-    // `global.System = { import() }` (a SystemJS shim). Assigned members are kept and take
-    // precedence (`System.import(...)` keeps working); everything else is .NET.
-    (function () {
-        var systemProxy = _makeNamespaceProxy('System');
-        Object.defineProperty(globalThis, 'System', {
-            configurable: true,
-            enumerable: true,
-            get: function () { return systemProxy; },
-            set: function (value) {
-                if (value && (typeof value === 'object' || typeof value === 'function'))
-                    Object.keys(value).forEach(function (k) { _namespaceExtras.System[k] = value[k]; });
-            },
-        });
-    })();
-    globalThis.Microsoft      = _makeNamespaceProxy('Microsoft');
-    globalThis.NativeScript   = _makeNamespaceProxy('NativeScript');
-
-    // Every other root namespace of the app's assemblies (C# sources compiled into the app,
-    // plugin and NuGet assemblies) is a lazy global too, so `new MyCompany.Native.Foo()` works
-    // with no registration step, the way Java packages and Objective-C classes are globals on
-    // Android and iOS. WinRT owns Windows/Microsoft/NativeScript; the rest are implementation
-    // namespaces of the toolchain that no app reaches for.
-    (function () {
-        var reserved = { Windows: 1, Microsoft: 1, NativeScript: 1, System: 1, NativeScriptBridge: 1, NSWinRTDynamicProxies: 1,
-            WinRT: 1, ABI: 1, XamlGeneratedNamespace: 1, FxResources: 1, Internal: 1, Interop: 1, MS: 1, Mono: 1 };
-        for (var ns in _namespaceAssemblyMap) {
-            if (ns.indexOf('.') !== -1 || reserved[ns] === 1 || !/^[A-Za-z_$][\w$]*$/.test(ns)) continue;
-            globalThis.NSWinRT.dotnet.registerNamespace(ns);
-        }
-    })();
-
-    // Creates a typed .NET BCL delegate (not a WinRT COM delegate).
-    // Use this when the API expects a managed System.Action,
-    // System.EventHandler, etc. rather than a WinRT delegate interface.
-    // For WinRT delegate types use NSWinRT.asDelegate instead.
-    if (typeof globalThis.__nsDotNetAwaitTask === 'function') {
-        globalThis.NSWinRT.dotnet.taskToPromise = function (obj) {
-            var h = obj && typeof obj.__handle === 'number' && obj.__isTask === true ? obj.__handle : -1;
-            if (h < 0) return Promise.resolve(obj);
-            return new Promise(function (resolve, reject) {
-                globalThis.__nsDotNetAwaitTask(h, function (value) { resolve(_wrap(value)); }, reject);
-            });
-        };
-    }
-
-    if (typeof globalThis.__nsDotNetCreateDelegate === 'function') {
-        globalThis.NSWinRT.dotnet.asDelegate = function(typeNameOrFn, fn) {
-            var typeName, callback;
-            if (typeof typeNameOrFn === 'function') {
-                typeName = '';
-                callback = typeNameOrFn;
-            } else {
-                typeName = typeNameOrFn || '';
-                callback = fn;
-            }
-            if (typeof callback !== 'function')
-                throw new TypeError('NSWinRT.dotnet.asDelegate: callback must be a function');
-            var wrapped = function() {
-                var args = Array.prototype.slice.call(arguments).map(_wrap);
-                return callback.apply(null, args);
-            };
-            return globalThis.__nsDotNetCreateDelegate(typeName, wrapped);
-        };
-    }
-
-    if (typeof globalThis.__nsRunOnUIThread === 'function') {
-        globalThis.NSWinRT.runOnUIThread = function(fn) {
-            if (typeof fn !== 'function') throw new TypeError('NSWinRT.runOnUIThread: expected a function');
-            return globalThis.__nsRunOnUIThread(fn);
-        };
-    }
-})();
-"#;
+/// The JS half of `NSWinRT.dotnet` and the managed-subclass system, shared with the classic
+/// engine (`runtime/src/js`). A no-op if `__nsDotNetInvokeBin` is absent.
+const DOTNET_HELPERS_JS: &str = concat!(
+    "'use strict';\n(function () {\nglobalThis.NSWinRT = globalThis.NSWinRT || {};\n",
+    include_str!("../js/dotnet_subclass.js"),
+    "})();\n",
+    include_str!("../js/dotnet.js"),
+);

@@ -131,9 +131,8 @@ public static partial class Bridge
 
     internal static object? CallJsCallback(int id, object?[] args) => CallJsCallback(id, args, expectsResult: true);
 
-    // Calls the JS function registered under `id`. When it throws, a caller that expects a result
-    // gets a JsException (a delegate with a return value, an overridden member); a void delegate or
-    // event just returns, the error having been reported as an uncaught JS error.
+    // Calls the JS function `id`. A JS throw becomes a JsException with the JS stack; a callback
+    // that couldn't run (its worker is gone) only throws when a result is expected.
     internal static unsafe object? CallJsCallback(int id, object?[] args, bool expectsResult)
     {
         if (s_jsInvoker == null) return null;
@@ -154,12 +153,23 @@ public static partial class Bridge
         // Response is only set for non-void delegates; parse and free when present.
         if (respPtr != null && respLen > 0)
         {
-            string? jsError = null;
+            string? jsError = null, jsStack = null;
+            var couldNotRun = false;
             try
             {
                 var span = new ReadOnlySpan<byte>(respPtr, respLen);
                 if (span[0] == 0x0F)
-                    jsError = span.Length > 5 ? new BinReader(span[1..]).ReadString32() : "the JavaScript callback could not run";
+                {
+                    // 0x0F, message, optional JS stack. An empty message means it couldn't run.
+                    var r = new BinReader(span[1..]);
+                    jsError = span.Length >= 5 ? r.ReadString32() : "";
+                    if (r.HasMore) jsStack = r.ReadString32();
+                    if (jsError.Length == 0)
+                    {
+                        couldNotRun = true;
+                        jsError = "the JavaScript callback could not run";
+                    }
+                }
                 else
                     result = ParseCallbackResponse(span);
             }
@@ -168,7 +178,7 @@ public static partial class Bridge
             {
                 Marshal.FreeHGlobal((IntPtr)respPtr);
             }
-            if (jsError != null && expectsResult) throw new JsException(jsError);
+            if (jsError != null && (expectsResult || !couldNotRun)) throw new JsException(jsError, jsStack);
         }
 
         return result;
@@ -215,7 +225,9 @@ public static partial class Bridge
         if (arg is bool b)  { w.WriteByte(b ? (byte)0x02 : (byte)0x01); return; }
         if (arg is int  i)  { w.WriteByte(0x03); w.WriteI32(i); return; }
         if (arg is uint u)  { w.WriteByte(0x03); w.WriteI32((int)u); return; }
-        if (arg is long l)  { w.WriteByte(0x04); w.WriteF64((double)l); return; }
+        if (arg is long l)  { WriteInt64(ref w, l); return; }
+        if (arg is ulong ul) { WriteUInt64(ref w, ul); return; }
+        if (TryGetBytes(arg, out var bytes, out var kind)) { WriteTypedArray(ref w, bytes, kind); return; }
         if (arg is float f) { w.WriteByte(0x04); w.WriteF64((double)f); return; }
         if (arg is double d){ w.WriteByte(0x04); w.WriteF64(d); return; }
         if (arg is string s){ w.WriteByte(0x05); w.WriteString32(s); return; }
@@ -233,8 +245,7 @@ public static partial class Bridge
         // Object: box in the handle map and send as a handle reference.
         // The JS side receives {__handle, __type} which can be turned into a
         // proxy via NSWinRT.dotnet.fromHandle(...).
-        var handleId = Interlocked.Increment(ref s_nextHandle);
-        s_handles[handleId] = arg;
+        var handleId = HandleFor(arg);
         var typeName = arg.GetType().FullName ?? arg.GetType().Name;
         w.WriteByte(0x06);
         w.WriteI32(handleId);
@@ -263,6 +274,9 @@ public static partial class Bridge
             case 0x06: return (object)new HandleRef(r.ReadI32());
             case 0x0A: return (object)new WinRtRef(r.ReadI64());
             case 0x0D: return new JsJsonValue(r.ReadString32());
+            case 0x10: return (object)r.ReadI64();
+            case 0x11: return (object)unchecked((ulong)r.ReadI64());
+            case 0x12: return r.ReadTypedArray();
             case 0x07: // array: u32 count + N tagged items
             {
                 var count = (int)r.ReadU32();
@@ -280,6 +294,8 @@ public static partial class Bridge
                         case 0x05: arr[i] = r.ReadString32(); break;
                         case 0x06: arr[i] = new HandleRef(r.ReadI32()); break;
                         case 0x0A: arr[i] = new WinRtRef(r.ReadI64()); break;
+                        case 0x10: arr[i] = r.ReadI64(); break;
+                        case 0x11: arr[i] = unchecked((ulong)r.ReadI64()); break;
                         default: arr[i] = null; break;
                     }
                 }
@@ -297,5 +313,3 @@ public static partial class Bridge
     
 }
 
-/// Thrown into managed code when a JavaScript callback that was expected to return a value threw.
-public sealed class JsException(string message) : Exception(message);

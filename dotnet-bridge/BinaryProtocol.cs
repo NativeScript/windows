@@ -19,7 +19,7 @@ internal readonly struct WinRtRef(long ptr)
 
 // A JS function passed where a delegate is expected (tag 0x0C): the runtime's callback id, wrapped
 // in a delegate of the parameter's type when the call's arguments are coerced.
-internal readonly struct JsFunctionRef(int id)
+public readonly struct JsFunctionRef(int id)
 {
     public readonly int Id = id;
 }
@@ -140,8 +140,20 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
             case 0x0A: return new WinRtRef(ReadI64());
             case 0x0C: return new JsFunctionRef(ReadI32());
             case 0x0D: return new JsJsonValue(ReadString32());
+            case 0x10: return ReadI64();
+            case 0x11: return unchecked((ulong)ReadI64());
+            case 0x12: return ReadTypedArray();
             default: return null;
         }
+    }
+
+    public JsTypedArray ReadTypedArray()
+    {
+        var kind = ReadByte();
+        var len = (int)ReadU32();
+        var bytes = _buf.Slice(_pos, len).ToArray();
+        _pos += len;
+        return new JsTypedArray(kind, bytes);
     }
 }
 
@@ -222,6 +234,12 @@ internal ref struct BinWriter(ArrayBufferWriter<byte> buf)
         WriteU32((uint)byteCount);
         Encoding.UTF8.GetBytes(s, _buf.GetSpan(byteCount));
         _buf.Advance(byteCount);
+    }
+
+    public void WriteBytes(ReadOnlySpan<byte> bytes)
+    {
+        bytes.CopyTo(_buf.GetSpan(bytes.Length));
+        _buf.Advance(bytes.Length);
     }
 
     public void WriteString16(ReadOnlySpan<char> s)

@@ -34,7 +34,7 @@ public static partial class Bridge
     // Keyed by (assembly name or "", type name): no key string is built per lookup.
     private static readonly ConcurrentDictionary<(string Assembly, string Type), Type?> s_typeCache = new();
     private static readonly ConcurrentDictionary<MethodKey, DispatchEntry> s_methodCache = new();
-    private static readonly ConcurrentDictionary<PropKey, PropertyInfo?> s_propCache = new();
+    private static readonly ConcurrentDictionary<PropKey, DataMember?> s_propCache = new();
     private static readonly ConcurrentDictionary<CtorKey, CtorEntry> s_ctorCache = new();
     // Cache of attempted assembly loads (simple name -> Assembly or null if not found).
     private static readonly ConcurrentDictionary<string, Assembly?> s_assemblyLoadCache
@@ -50,6 +50,7 @@ public static partial class Bridge
     internal static void ClearCaches()
     {
         s_typeCache.Clear();
+        s_missingTypes.Clear();
         s_methodCache.Clear();
         s_propCache.Clear();
         s_ctorCache.Clear();
@@ -58,7 +59,7 @@ public static partial class Bridge
         s_boxInfo.Clear();
         s_paramsCache.Clear();
         s_collectionInfo.Clear();
-        s_handles.Clear();
+        ClearHandles();
         s_nativePtrs.Clear();
         s_nativePtrsReverse.Clear();
         s_nextHandle = 0;
@@ -157,6 +158,26 @@ public static partial class Bridge
         try { return JsonSerializer.Serialize(map); } catch { return "{}"; }
     }
 
+    /// Loads the assembly at `path` (relative to the app directory unless absolute) and returns its
+    /// namespace map, as GetNamespaceAssemblyMapJson does.
+    public static string LoadAssembly(string path)
+    {
+        var full = Path.IsPathRooted(path) ? path : Path.Combine(AppContext.BaseDirectory, path);
+        var asm = AssemblyLoadContext.Default.LoadFromAssemblyPath(Path.GetFullPath(full));
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        Type[] types;
+        try { types = asm.GetExportedTypes(); }
+        catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
+        var name = asm.GetName().Name ?? "";
+        foreach (var t in types)
+        {
+            if (string.IsNullOrEmpty(t.Namespace)) continue;
+            map[t.Namespace] = name;
+            map.TryAdd(t.Namespace.Split('.')[0], name);
+        }
+        return JsonSerializer.Serialize(map);
+    }
+
     static Bridge()
     {
         try
@@ -212,6 +233,7 @@ public static partial class Bridge
 
             s_assemblySearchDirs = dirs.Where(d => !string.IsNullOrEmpty(d)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
             AppDomain.CurrentDomain.AssemblyResolve += OnAssemblyResolve;
+            AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
         }
         catch
         {
@@ -517,52 +539,6 @@ public static partial class Bridge
         return 0;
     }
 
-    // Callback id registered by the runtime/JS that should receive unhandled
-    // managed exceptions and unobserved task exceptions.
-    private static int s_unhandledExceptionCallbackId = -1;
-
-    // Called from JS/Rust to request that managed unhandled exceptions be
-    // forwarded to the registered JS callback id.  The callback id must have
-    // been created on the Rust side and point to a JS function stored in the
-    // runtime's `DOTNET_JS_CALLBACKS` map.
-    public static int RegisterUnhandledExceptionCallback(int callbackId)
-    {
-        s_unhandledExceptionCallbackId = callbackId;
-
-        // Subscribe once (idempotent).
-        try
-        {
-            AppDomain.CurrentDomain.UnhandledException -= OnAppDomainUnhandledException;
-            AppDomain.CurrentDomain.UnhandledException += OnAppDomainUnhandledException;
-
-            TaskScheduler.UnobservedTaskException -= OnUnobservedTaskException;
-            TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
-
-            // Try to subscribe to Windows.CoreApplication.UnhandledErrorDetected if available
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                var coreAppType = asm.GetType("Windows.ApplicationModel.Core.CoreApplication");
-                if (coreAppType == null) continue;
-                var ev = coreAppType.GetEvent("UnhandledErrorDetected");
-                if (ev == null) continue;
-                try
-                {
-                    var handlerType = ev.EventHandlerType;
-                    var method = typeof(Bridge).GetMethod(nameof(CoreApplicationUnhandledErrorHandler), BindingFlags.NonPublic | BindingFlags.Static);
-                    if (handlerType != null && method != null)
-                    {
-                        var del = Delegate.CreateDelegate(handlerType, method);
-                        ev.AddEventHandler(null, del);
-                    }
-                }
-                catch { }
-            }
-        }
-        catch { }
-
-        return 0;
-    }
-
     // IInspectable IID — the common interface for all WinRT objects.
     // WinRT APIs typically QI for IInspectable (not just IUnknown) when they
     // accept a polymorphic `object` parameter or need runtime class identity.
@@ -691,56 +667,6 @@ public static partial class Bridge
         {
             return null;
         }
-    }
-
-    private static void OnAppDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)
-    {
-        try
-        {
-            var ex = e.ExceptionObject as Exception;
-            var msg = ex?.ToString() ?? e.ExceptionObject?.ToString() ?? "(unknown)";
-            SendUnhandledToJs("unhandled", msg);
-        }
-        catch { }
-    }
-
-    private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
-    {
-        try
-        {
-            var msg = e.Exception?.ToString() ?? "(unobserved task exception)";
-            SendUnhandledToJs("unobservedTask", msg);
-        }
-        catch { }
-    }
-
-    // Fallback handler for platform-specific CoreApplication unhandled events.
-    private static void CoreApplicationUnhandledErrorHandler(object? sender, object? args)
-    {
-        try
-        {
-            var msg = args?.ToString() ?? "(core unhandled)";
-            SendUnhandledToJs("coreUnhandled", msg);
-        }
-        catch { }
-    }
-
-    private static unsafe void SendUnhandledToJs(string kind, string message)
-    {
-        try
-        {
-            if (s_jsInvoker == null || s_unhandledExceptionCallbackId <= 0) return;
-            var payload = JsonSerializer.Serialize(new { kind = kind, message = message });
-            var bytes = System.Text.Encoding.UTF8.GetBytes(payload);
-            fixed (byte* p = bytes)
-            {
-                byte* respPtr = null;
-                int respLen = 0;
-                s_jsInvoker(s_unhandledExceptionCallbackId, p, bytes.Length, &respPtr, &respLen);
-                if (respPtr != null && respLen > 0) Marshal.FreeHGlobal((IntPtr)respPtr);
-            }
-        }
-        catch { }
     }
 
     [UnmanagedCallersOnly(EntryPoint = "Invoke",

@@ -31,7 +31,7 @@ public static partial class Bridge
         }
         catch (Exception ex)
         {
-            WriteBinError(Unwrap(ex).Message, responsePtr, responseLenPtr);
+            WriteBinError(Unwrap(ex), responsePtr, responseLenPtr);
         }
         return 0;
     }
@@ -73,23 +73,12 @@ public static partial class Bridge
     {
         var op = r.ReadByte();
 
-            if (op == 0x04) // release
-            {
-                var handleToRemove = r.ReadI32();
-                s_handles.TryRemove(handleToRemove, out _);
-                if (s_nativePtrs.TryRemove(handleToRemove, out var nativePtr))
-                {
-                    RemoveNativePtr(handleToRemove, nativePtr);
-                    try
-                    {
-                        Marshal.Release(nativePtr);
-                    }
-                    catch
-                    {
-                    }
-                }
-                return DispatchResult.Void;
-            }
+        if (op == 0x04) // release: handle, then the number of exports given back (all when absent)
+        {
+            var handleToRemove = r.ReadI32();
+            ReleaseHandle(handleToRemove, r.HasMore ? r.ReadI32() : -1);
+            return DispatchResult.Void;
+        }
 
         if (op == 0x05) // members by handle
         {
@@ -180,6 +169,14 @@ public static partial class Bridge
             // Constructors with the same parameter count (StringBuilder(int) / StringBuilder(string)):
             // the one whose parameter types best fit the arguments.
             var ctors = GetCtorOverloads(typeS, args.Length);
+            if (ctors.Ctors.Length == 0 || SelectOverload(ctors.Parameters, args) < 0)
+            {
+                // A struct's implicit parameterless constructor, or one with optional parameters.
+                if (args.Length == 0 && typeS.IsValueType) return Box(DefaultOf(typeS));
+                var ctorCall = new CallName(".ctor", false, null, null);
+                if (TryBindCall(SlowCandidates(typeS, ".ctor", BindingFlags.Public | BindingFlags.Instance), null, args, ctorCall, out var bound, out var boundArgs, out var info))
+                    return InvokeBound(bound!, null, boundArgs!, info, ctorCall);
+            }
             if (ctors.Ctors.Length > 1)
             {
                 var best = SelectOverload(ctors.Parameters, args);
@@ -193,7 +190,7 @@ public static partial class Bridge
                     return Box(ctors.Ctors[best].Invoke(built));
             }
             var entry = GetCachedCtor(typeS, args.Length);
-            if (entry.Ctor is null)
+            if (entry.Ctor is null || entry.Parameters.Length != args.Length)
                 throw new MissingMethodException(
                     $"No public ctor on {typeS.FullName} for {args.Length} args");
             // ConstructorInfo.Invoke requires exact arg count — build a precise array.
@@ -208,11 +205,17 @@ public static partial class Bridge
     }
 
     private static DispatchResult DispatchCallBin(
-        object? target, Type type, string method, object?[] args, bool isStatic)
+        object? target, Type type, string rawMethod, object?[] args, bool isStatic)
     {
         var flags = (isStatic ? BindingFlags.Static : BindingFlags.Instance) | BindingFlags.Public;
-
-        
+        var call = CallName.Parse(rawMethod);
+        var method = call.Name;
+        // `&`, `<...>` and `#...` calls (see CallName) only go through the slow path.
+        if (!ReferenceEquals(method, rawMethod))
+        {
+            if (TrySlowCall(target, type, call, args, flags, out var special)) return special;
+            throw new MissingMethodException($"No method '{method}' on {type.FullName} takes these {args.Length} argument(s)");
+        }
 
         if (method.Length > 4 && args.Length == 0
             && method[0] == 'g' && method[1] == 'e' && method[2] == 't' && method[3] == '_')
@@ -237,10 +240,13 @@ public static partial class Bridge
         // Describe(Shape)): the one whose parameter types best fit the arguments.
         var overloads = GetOverloads(type, method, args.Length, flags);
         var best = overloads.Methods.Length > 0 ? overloads.Select(args) : -1;
-        // No method with this many parameters takes these arguments: a params method may
-        // (String.Join(",", "a", "b", "c")).
-        if (best < 0 && TryParamsCall(target, type, method, args, flags, out var paramsResult))
-            return paramsResult;
+        // No overload of this arity fits: try params methods (String.Join(",", "a", "b")), then
+        // optional parameters, generic methods and extension methods.
+        if (best < 0)
+        {
+            if (TryParamsCall(target, type, method, args, flags, out var paramsResult)) return paramsResult;
+            if (TrySlowCall(target, type, call, args, flags, out var slowResult)) return slowResult;
+        }
         if (overloads.Methods.Length > 1)
         {
             if (best >= 0)
@@ -269,57 +275,28 @@ public static partial class Bridge
         }
 
         var entry = GetCachedMethod(type, method, args.Length, flags);
-        if (entry.Invoke is null && target is not null && IsJsBacked(target))
-        {
-            // A JS subclass may call the protected members it inherits.
-            var protectedFlags = BindingFlags.Instance | BindingFlags.NonPublic;
-            var inherited = type.GetMethods(protectedFlags)
-                .FirstOrDefault(m => m.Name == method && (m.IsFamily || m.IsFamilyOrAssembly) && m.GetParameters().Length == args.Length);
-            if (inherited is not null)
-            {
-                var built = BuildArgsBinExact(args, inherited.GetParameters());
-                return Box(inherited.Invoke(target, built));
-            }
-        }
         if (entry.Invoke is null)
-        {
-            var candidates = type.GetMethods(flags).Where(m => m.Name == method && !m.IsSpecialName);
-            foreach (var m in candidates)
-            {
-                var parameters = m.GetParameters();
-                var built = BuildArgsBin(args, parameters);
-                try
-                {
-                    var res = (m.Invoke(target, built));
-                    return Box(res);
-                }
-                catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
-                {
-                    if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{m.Name} on UI thread");
-                    try
-                    {
-                        var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
-                        return Box(res);
-                    }
-                    catch { /* retry failed — try next candidate */ }
-                }
-                catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
-                {
-                    if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{m.Name} on UI thread");
-                    try
-                    {
-                        var res = InvokeOnUIThread(() => (m.Invoke(target, built)));
-                        return Box(res);
-                    }
-                    catch { /* retry failed — try next candidate */ }
-                }
-                finally { if (built.Length > 0) ReturnArgs(built); }
-            }
             throw new MissingMethodException(
                 $"Method '{method}' ({args.Length} args) not found on {type.FullName}");
-        }
 
         return InvokeBuilt(target, type, method, entry, BuildArgsBin(args, entry.Parameters));
+    }
+
+    // Methods the overload cache skips: other arities, generic definitions, protected members (for
+    // JS subclasses) and extension methods.
+    private static bool TrySlowCall(object? target, Type type, CallName call, object?[] args, BindingFlags flags, out DispatchResult result)
+    {
+        result = default;
+        IEnumerable<MethodBase> candidates = SlowCandidates(type, call.Name, flags);
+        if (target is not null && IsJsBacked(target))
+            candidates = candidates.Concat(SlowCandidates(type, call.Name, BindingFlags.Instance | BindingFlags.NonPublic)
+                .Where(m => m.IsFamily || m.IsFamilyOrAssembly));
+        if (TryBindCall(candidates, target, args, call, out var method, out var built, out var info))
+        {
+            result = InvokeBound(method!, target, built!, info, call);
+            return true;
+        }
+        return target is not null && TryExtensionCall(target, args, call, out result);
     }
 
     // Runs a compiled invoker on arguments from BuildArgsBin (returned to the pool afterwards),
@@ -449,12 +426,33 @@ public static partial class Bridge
                 if (obj.GetType() == p) return 10;
                 return p.IsInstanceOfType(obj) ? (p == typeof(object) ? 2 : 8) : -1;
             case JsFunctionRef:
+                if (p == typeof(JsFunctionRef)) return 10;
                 if (typeof(Delegate).IsAssignableFrom(p))
                     return p == typeof(Delegate) || p == typeof(MulticastDelegate) ? 4 : 8;
                 return p == typeof(object) ? 1 : -1;
             case WinRtRef:
                 if (p == typeof(object)) return 2;
                 return p.IsInterface || (p.IsClass && p != typeof(string)) ? 4 : -1;
+            case long l:
+                if (p == typeof(long)) return 10;
+                if (p == typeof(ulong)) return l >= 0 ? 9 : -1;
+                if (p == typeof(decimal)) return 8;
+                if (p == typeof(double)) return 7;
+                if (p == typeof(float)) return 6;
+                if (p.IsEnum) return 5;
+                if (IsIntegerType(p)) return FitsInteger(l, p) ? 4 : -1;
+                return p.IsInstanceOfType(arg) ? 2 : -1;
+            case ulong u:
+                if (p == typeof(ulong)) return 10;
+                if (p == typeof(long)) return u <= long.MaxValue ? 9 : -1;
+                if (p == typeof(decimal)) return 8;
+                if (p == typeof(double)) return 7;
+                if (p == typeof(float)) return 6;
+                if (p.IsEnum) return 5;
+                if (IsIntegerType(p)) return FitsInteger(u, p) ? 4 : -1;
+                return p.IsInstanceOfType(arg) ? 2 : -1;
+            case JsTypedArray typed:
+                return TypedArrayScore(typed, p);
             case JsJsonValue:
                 if (p == typeof(object)) return 1;
                 if (p == typeof(string)) return 2;
@@ -629,10 +627,13 @@ public static partial class Bridge
         }
         if (value is JsArrayValue array)
             return CoerceArray(array.Items, targetType);
+        if (value is JsTypedArray typed)
+            return CoerceTypedArray(typed, targetType);
         if (value is string text && IsParsedFromString(Nullable.GetUnderlyingType(targetType) ?? targetType))
             return ParseString(text, Nullable.GetUnderlyingType(targetType) ?? targetType);
         if (value is JsFunctionRef fn)
         {
+            if ((Nullable.GetUnderlyingType(targetType) ?? targetType) == typeof(JsFunctionRef)) return fn;
             var delegateType = typeof(Delegate).IsAssignableFrom(targetType)
                 && targetType != typeof(Delegate) && targetType != typeof(MulticastDelegate)
                     ? targetType
@@ -741,14 +742,4 @@ public static partial class Bridge
     }
 
     private static string? NullIfEmpty(string s) => s.Length == 0 ? null : s;
-
-    private static unsafe void WriteBinError(string msg, byte** outPtr, int* outLen)
-    {
-        var msgBytes = System.Text.Encoding.UTF8.GetByteCount(msg);
-        var buf = new ArrayBufferWriter<byte>(5 + msgBytes);
-        var w   = new BinWriter(buf);
-        w.WriteByte(0xFF);
-        w.WriteString32(msg);
-        WriteUnmanaged(buf.WrittenSpan, outPtr, outLen);
-    }
 }
