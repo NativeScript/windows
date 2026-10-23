@@ -585,37 +585,6 @@ class ExternalInfo: public BaseInfoT<ExternalInfo, NativeType::External> {
         }
 };
 
-class ReferenceInfo : public BaseInfoT<ReferenceInfo, NativeType::Reference> {
-        public:
-        static napi_status Initialize(napi_env env, napi_value object, FinalizerT finalizer) {
-
-            napi_valuetype type;
-            napi_typeof(env, object, &type);
-
-            if (type == napi_object || type == napi_function) {
-                ReferenceInfo* info = new ReferenceInfo(env);
-                if (info == nullptr) {
-                    return napi_set_last_error(env, napi_generic_failure);
-                }
-
-                // JSObjectRef ref{JSObjectMake(env->context, info->_class, info)};
-                // JSObjectSetPrototype(env->context, prototype, JSObjectGetPrototype(env->context, ToJSObject(env, object)));
-               // JSObjectSetPrototype(env->context, ToJSObject(env, object), prototype);
-
-                NativeInfo::SetNativeInfo(env->context, ToJSObject(env, object), info->_class, "[[jsc_reference_info]]", info);
-
-                info->AddFinalizer(finalizer);
-            }
-
-            return napi_ok;
-        }
-
-        private:
-        ReferenceInfo(napi_env env)
-        : BaseInfoT{env, "Native (Reference)"} {
-        }
-};
-
 class WrapperInfo : public BaseInfoT<WrapperInfo, NativeType::Wrapper> {
         public:
         static napi_status Wrap(napi_env env, napi_value object, WrapperInfo** result) {
@@ -703,6 +672,16 @@ class ExternalArrayBufferInfo {
 };
 }
 
+// JavaScriptCore's weak handles (JSWeakPrivate.h, exported by the bundled JavaScriptCore.dll).
+extern "C" {
+typedef const struct OpaqueJSWeak* JSWeakRef;
+JS_EXPORT JSWeakRef JSWeakCreate(JSContextGroupRef group, JSObjectRef object);
+JS_EXPORT void JSWeakRelease(JSContextGroupRef group, JSWeakRef weak);
+JS_EXPORT JSObjectRef JSWeakGetObject(JSWeakRef weak);
+}
+
+// While its count is 0 a reference holds its object through a JSWeak, which the collector clears
+// before the object's memory can be reused.
 struct napi_ref__ {
     napi_ref__(napi_value value, uint32_t count)
     : _value{value}
@@ -710,12 +689,9 @@ struct napi_ref__ {
     }
 
     napi_status init(napi_env env) {
-        // track the ref values to support weak refs
-        auto pair{env->active_ref_values.insert(_value)};
-        if (pair.second) {
-            CHECK_NAPI(ReferenceInfo::Initialize(env, _value, [value = _value](ReferenceInfo* info) {
-                info->Env()->active_ref_values.erase(value);
-            }));
+        if (JSValueIsObject(env->context, ToJSValue(_value))) {
+            _group = JSContextGetGroup(env->context);
+            _weak = JSWeakCreate(_group, ToJSObject(env, _value));
         }
 
         if (_count != 0) {
@@ -728,6 +704,10 @@ struct napi_ref__ {
     void deinit(napi_env env) {
         if (_count != 0) {
             unprotect(env);
+        }
+        if (_weak != nullptr) {
+            JSWeakRelease(_group, _weak);
+            _weak = nullptr;
         }
 
         _value = nullptr;
@@ -751,11 +731,11 @@ struct napi_ref__ {
     }
 
     napi_value value(napi_env env) const {
-        if (env->active_ref_values.find(_value) == env->active_ref_values.end()) {
-            return nullptr;
+        if (_count != 0 || _weak == nullptr) {
+            return _value;
         }
-
-        return _value;
+        JSObjectRef object = JSWeakGetObject(_weak);
+        return object != nullptr ? ToNapi(object) : nullptr;
     }
 
     private:
@@ -773,6 +753,8 @@ struct napi_ref__ {
     napi_value _value{};
     uint32_t _count{};
     std::list<napi_ref>::iterator _iter{};
+    JSContextGroupRef _group{};
+    JSWeakRef _weak{};
 };
 
 void napi_env__::deinit_refs() {
