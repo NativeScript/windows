@@ -154,12 +154,15 @@
   <!--
     Publishes DotNetBridge.dll before the app build.
     Inputs/Outputs make this incremental: MSBuild skips the Exec when DotNetBridge.dll
-    is already newer than both source files.
+    is already newer than the project and every bridge source file.
   -->
+  <ItemGroup>
+    <_DotNetBridgeSources Include="$(NSWindowsRoot)\dotnet-bridge\*.cs" />
+  </ItemGroup>
   <Target Name="PublishDotNetBridge"
           BeforeTargets="Build"
           Inputs="$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj;
-                  $(NSWindowsRoot)\dotnet-bridge\Bridge.cs"
+                  @(_DotNetBridgeSources)"
           Outputs="$(NSWindowsRoot)\dotnet-bridge\publish\DotNetBridge.dll"
           Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj')">
     <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="low" />

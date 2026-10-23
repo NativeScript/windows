@@ -133,21 +133,49 @@ public static partial class Bridge
 
     // Calls the JS function `id`. A JS throw becomes a JsException with the JS stack; a callback
     // that couldn't run (its worker is gone) only throws when a result is expected.
-    internal static unsafe object? CallJsCallback(int id, object?[] args, bool expectsResult)
+    internal static object? CallJsCallback(int id, object?[] args, bool expectsResult) =>
+        CallJsCallback(id, -1, null, args, expectsResult);
+
+    // A request buffer per thread; a nested call (JS calling back into .NET) gets its own.
+    [ThreadStatic] private static ArrayBufferWriter<byte>? t_callbackRequest;
+    [ThreadStatic] private static bool t_callbackRequestInUse;
+
+    // `selfHandle` and `member`, when given, are written first: an override's instance and name.
+    internal static unsafe object? CallJsCallback(int id, int selfHandle, string? member, object?[] args, bool expectsResult)
     {
         if (s_jsInvoker == null) return null;
 
-        var buf = new ArrayBufferWriter<byte>(64);
-        var w   = new BinWriter(buf);
-        w.WriteByte((byte)Math.Min(args.Length, 255));
-        foreach (var arg in args)
-            WriteCallbackArg(ref w, arg);
-
-        var bytes   = buf.WrittenSpan;
+        var reuse = !t_callbackRequestInUse;
+        var buf = reuse ? (t_callbackRequest ??= new ArrayBufferWriter<byte>(128)) : new ArrayBufferWriter<byte>(64);
+        if (reuse)
+        {
+            buf.ResetWrittenCount();
+            t_callbackRequestInUse = true;
+        }
         byte* respPtr = null;
         int   respLen = 0;
-        fixed (byte* p = bytes)
-            s_jsInvoker(id, p, bytes.Length, &respPtr, &respLen);
+        try
+        {
+            var w = new BinWriter(buf);
+            var head = member is null ? 0 : 2;
+            w.WriteByte((byte)Math.Min(args.Length + head, 255));
+            if (member is not null)
+            {
+                WriteHandleArg(ref w, selfHandle);
+                w.WriteByte(0x05);
+                w.WriteString32(member);
+            }
+            foreach (var arg in args)
+                WriteCallbackArg(ref w, arg);
+
+            var bytes = buf.WrittenSpan;
+            fixed (byte* p = bytes)
+                s_jsInvoker(id, p, bytes.Length, &respPtr, &respLen);
+        }
+        finally
+        {
+            if (reuse) t_callbackRequestInUse = false;
+        }
 
         object? result = null;
         // Response is only set for non-void delegates; parse and free when present.
@@ -186,38 +214,29 @@ public static partial class Bridge
 
     // Serialises a single delegate argument in response-binary tag format so
     // the Rust side can reuse its existing bin_read_value parser.
+    // An existing handle, forwarded as is (tag 0x06, its object's type and native pointer).
+    private static void WriteHandleArg(ref BinWriter w, int id)
+    {
+        w.WriteByte(0x06);
+        w.WriteI32(id);
+        var obj = s_handles.TryGetValue(id, out var o) ? o : null;
+        w.WriteString16(obj is null ? "" : GetBoxInfo(obj.GetType()).TypeName);
+        if (s_nativePtrs.TryGetValue(id, out var nativePtr))
+        {
+            w.WriteByte(1);
+            w.WriteI64(nativePtr.ToInt64());
+        }
+        else
+        {
+            w.WriteByte(0);
+        }
+    }
+
     private static void WriteCallbackArg(ref BinWriter w, object? arg)
     {
-        // Allow existing handle references to be forwarded without re-boxing.
         if (arg is HandleRef hr)
         {
-            w.WriteByte(0x06);
-            w.WriteI32(hr.Id);
-            try
-            {
-                if (s_handles.TryGetValue(hr.Id, out var obj) && obj != null)
-                {
-                    var objTypeName = obj.GetType().FullName ?? obj.GetType().Name;
-                    w.WriteString16(objTypeName);
-                }
-                else
-                {
-                    w.WriteString16("");
-                }
-            }
-            catch
-            {
-                w.WriteString16("");
-            }
-            if (Bridge.s_nativePtrs.TryGetValue(hr.Id, out var nativePtr))
-            {
-                w.WriteByte(1);
-                w.WriteI64(nativePtr.ToInt64());
-            }
-            else
-            {
-                w.WriteByte(0);
-            }
+            WriteHandleArg(ref w, hr.Id);
             return;
         }
 

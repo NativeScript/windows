@@ -107,55 +107,54 @@ public static partial class Bridge
     // on a coarse top-level root such as Microsoft.
     public static string GetNamespaceAssemblyMapJson()
     {
+        // Metadata only: loading each DLL to list its types is slow.
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var entryPath = Assembly.GetEntryAssembly()?.Location;
         try
         {
             foreach (var dir in s_assemblySearchDirs.Where(Directory.Exists))
             {
-                try
+                IEnumerable<string> files;
+                try { files = Directory.EnumerateFiles(dir, "*.dll", SearchOption.TopDirectoryOnly); }
+                catch { continue; }
+                foreach (var file in files)
                 {
-                    foreach (var file in Directory.EnumerateFiles(dir, "*.dll", SearchOption.TopDirectoryOnly))
+                    try
                     {
-                        try
-                        {
-                            var simple = Path.GetFileNameWithoutExtension(file);
-                            if (string.IsNullOrEmpty(simple)) continue;
-
-                            Assembly? asm = AppDomain.CurrentDomain.GetAssemblies()
-                                .FirstOrDefault(a => string.Equals(a.GetName().Name, simple, StringComparison.OrdinalIgnoreCase));
-                            if (asm is null)
-                            {
-                                try { asm = AssemblyLoadContext.Default.LoadFromAssemblyPath(file); }
-                                catch { continue; }
-                            }
-
-                            // The app's own assembly (C# sources compiled into the app) contributes
-                            // its internal types too: they are reachable from JS (type resolution
-                            // finds non-public types), so their namespaces must be as well.
-                            Type[] types;
-                            try { types = asm == Assembly.GetEntryAssembly() ? asm.GetTypes() : asm.GetExportedTypes(); }
-                            catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray()!; }
-                            catch { types = Array.Empty<Type>(); }
-
-                            var assemblyName = asm.GetName().Name;
-                            if (string.IsNullOrEmpty(assemblyName)) continue;
-
-                            foreach (var t in types)
-                            {
-                                if (string.IsNullOrEmpty(t.Namespace) || t.Name.StartsWith('<')) continue;
-                                map[t.Namespace] = assemblyName;
-                                var root = t.Namespace.Split('.')[0];
-                                if (!map.ContainsKey(root)) map[root] = assemblyName;
-                            }
-                        }
-                        catch { }
+                        // The app's own assembly counts its internal types too: JS reaches them.
+                        var includeInternal = entryPath is not null && string.Equals(Path.GetFullPath(file), entryPath, StringComparison.OrdinalIgnoreCase);
+                        AddNamespaces(file, includeInternal, map);
                     }
+                    catch { }
                 }
-                catch { }
             }
         }
         catch { }
         try { return JsonSerializer.Serialize(map); } catch { return "{}"; }
+    }
+
+    // Maps the namespaces of an assembly's top-level types (and their roots) to its name.
+    private static void AddNamespaces(string file, bool includeInternal, Dictionary<string, string> map)
+    {
+        using var stream = File.OpenRead(file);
+        using var pe = new System.Reflection.PortableExecutable.PEReader(stream);
+        if (!pe.HasMetadata) return;
+        var md = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(pe);
+        if (!md.IsAssembly) return;
+        var assemblyName = md.GetString(md.GetAssemblyDefinition().Name);
+        if (string.IsNullOrEmpty(assemblyName)) return;
+        var seen = new HashSet<System.Reflection.Metadata.StringHandle>();
+        foreach (var h in md.TypeDefinitions)
+        {
+            var td = md.GetTypeDefinition(h);
+            var visibility = td.Attributes & TypeAttributes.VisibilityMask;
+            if (visibility != TypeAttributes.Public && !(includeInternal && visibility == TypeAttributes.NotPublic)) continue;
+            if (td.Namespace.IsNil || !seen.Add(td.Namespace)) continue;
+            if (md.GetString(td.Name).StartsWith('<')) continue;
+            var ns = md.GetString(td.Namespace);
+            map[ns] = assemblyName;
+            map.TryAdd(ns.Split('.')[0], assemblyName);
+        }
     }
 
     /// Loads the assembly at `path` (relative to the app directory unless absolute) and returns its

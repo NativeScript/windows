@@ -7,7 +7,7 @@ using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Running;
 using NativeScriptBridge;
 
-BenchmarkSwitcher.FromTypes([typeof(BridgeBenchmarks), typeof(AbiBenchmarks)]).Run(args);
+BenchmarkSwitcher.FromTypes([typeof(BridgeBenchmarks), typeof(AbiBenchmarks), typeof(CallbackBenchmarks), typeof(EntryBenchmarks)]).Run(args);
 
 /// <summary>
 /// Measures the hot-path dispatch cost for the JSON and binary protocols.

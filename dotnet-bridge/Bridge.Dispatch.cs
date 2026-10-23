@@ -171,7 +171,41 @@ public static partial class Bridge
     internal static DispatchEntry BuildDispatchEntry(Type type, MethodInfo mi)
     {
         var parameters = mi.GetParameters();
+        if (parameters.Any(p => p.ParameterType.IsByRef || p.ParameterType.IsByRefLike) || mi.ReturnType.IsByRefLike)
+            return new DispatchEntry(CompileInvoker(type, mi, parameters), parameters);
+        return new DispatchEntry(new TieredInvoker(type, mi, parameters).Invoke, parameters);
+    }
 
+    // MethodInvoker (cheap to create) until the method is called often enough to pay for a compiled
+    // delegate (~80 us to build, a few ns per call).
+    private sealed class TieredInvoker(Type type, MethodInfo mi, ParameterInfo[] parameters)
+    {
+        private const int CompileAfter = 32;
+        private readonly MethodInvoker _invoker = MethodInvoker.Create(mi);
+        private Func<object?, object?[], object?>? _compiled;
+        private int _calls;
+
+        public object? Invoke(object? target, object?[] args)
+        {
+            var compiled = _compiled;
+            if (compiled is not null) return compiled(target, args);
+            if (Interlocked.Increment(ref _calls) == CompileAfter)
+                _compiled = CompileInvoker(type, mi, parameters);
+            try
+            {
+                return _invoker.Invoke(target, new Span<object?>(args, 0, parameters.Length));
+            }
+            catch (TargetInvocationException tie) when (tie.InnerException is not null)
+            {
+                // Throw what the method threw, as the compiled delegate does.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+                throw;
+            }
+        }
+    }
+
+    private static Func<object?, object?[], object?> CompileInvoker(Type type, MethodInfo mi, ParameterInfo[] parameters)
+    {
         try
         {
             var targetParam = Expression.Parameter(typeof(object), "t");
@@ -191,18 +225,14 @@ public static partial class Bridge
             else if (body.Type != typeof(object))
                 body = Expression.Convert(body, typeof(object));
 
-            var fn = Expression.Lambda<Func<object?, object?[], object?>>(
+            return Expression.Lambda<Func<object?, object?[], object?>>(
                 body, targetParam, argsParam).Compile();
-
-            return new DispatchEntry(fn, parameters);
         }
         catch
         {
             // mi.Invoke validates args.Length == paramCount; slice the rented buffer if needed.
             int pc = parameters.Length;
-            return new DispatchEntry(
-                (t, a) => mi.Invoke(t, a.Length == pc ? a : a[..pc]),
-                parameters);
+            return (t, a) => mi.Invoke(t, a.Length == pc ? a : a[..pc]);
         }
     }
 

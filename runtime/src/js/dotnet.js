@@ -231,6 +231,11 @@
         if (!typeName) return _emptyInfo;
         var cached = _typeInfoCache[typeName];
         if (cached !== undefined) return cached;
+        // A namespace of the app's assemblies isn't a type; asking the bridge would scan them all.
+        if (typeof _namespaceAssemblyMap[typeName] === 'string' && handle === undefined) {
+            _typeInfoCache[typeName] = _emptyInfo;
+            return _emptyInfo;
+        }
         var info = _emptyInfo;
         try {
             // Respect an explicitly-provided assembly name. When empty,

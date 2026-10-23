@@ -550,39 +550,30 @@ public static partial class Bridge
         throw new InvalidOperationException("No JS callback registered for proxy instance.");
     }
 
-    // Payload for the JS dispatcher: (self handle, member name, ...args). The arguments are sent
+    // The JS dispatcher gets (self handle, member name, ...args). The arguments are sent
     // individually so each arrives as its JS value (numbers, strings, structs as plain objects,
     // objects as handles).
-    private static object?[] DispatchPayload(object instance, ProxyCallbackHolder holder, string memberName, object?[] args)
-    {
-        var payload = new object?[args.Length + 2];
-        payload[0] = new HandleRef(EnsureJsHandle(instance, holder));
-        payload[1] = memberName;
-        Array.Copy(args, 0, payload, 2, args.Length);
-        return payload;
-    }
-
     private static object? ProxyInvokeMethod(object instance, string methodName, object[] args)
     {
         var holder = JsHolderFor(instance);
-        return CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, methodName, args), expectsResult: true);
+        return CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), methodName, args, expectsResult: true);
     }
 
     private static void ProxyInvokeVoid(object instance, string methodName, object[] args)
     {
         var holder = JsHolderFor(instance);
-        CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, methodName, args), expectsResult: false);
+        CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), methodName, args, expectsResult: false);
     }
 
     private static object? ProxyGetProperty(object instance, string propertyName)
     {
         var holder = JsHolderFor(instance);
-        return CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, "get_" + propertyName, []), expectsResult: true);
+        return CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), "get_" + propertyName, [], expectsResult: true);
     }
 
     private static void ProxySetProperty(object instance, string propertyName, object? value)
     {
         var holder = JsHolderFor(instance);
-        CallJsCallback(holder.CallbackId, DispatchPayload(instance, holder, "set_" + propertyName, [value]), expectsResult: false);
+        CallJsCallback(holder.CallbackId, EnsureJsHandle(instance, holder), "set_" + propertyName, [value], expectsResult: false);
     }
 }
