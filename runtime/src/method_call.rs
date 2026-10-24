@@ -78,16 +78,14 @@ impl PointerPlan {
         type_args: &[String],
         typename_special: bool,
     ) -> Self {
-        if let Some(inner) = crate::helpers::ireference_inner_type(signature) {
+        if crate::helpers::ireference_inner_type(signature).is_some() {
             let name = signature.trim();
             let name = name.strip_prefix("ByRef ").unwrap_or(name);
-            let iid = GenericInstanceIdBuilder::generate_id_from_name(
-                &crate::property_call::substitute_type_vars(name, type_args),
-            );
-            return PointerPlan::IReference(
-                crate::property_call::substitute_type_vars(inner, type_args),
-                iid,
-            );
+            // Substituted as a whole so an enum `T` keeps its name for boxing.
+            let name = crate::property_call::substitute_type_vars(name, type_args);
+            let iid = GenericInstanceIdBuilder::generate_id_from_name(&name);
+            let inner = crate::helpers::ireference_inner_type(&name).unwrap_or_default();
+            return PointerPlan::IReference(inner.to_owned(), iid);
         }
         if !signature.contains('.') {
             return PointerPlan::Plain;

@@ -1116,7 +1116,8 @@ pub(crate) fn classify_return(return_type: &str, is_void: bool) -> ReturnKind {
         return ReturnKind::Void;
     }
     if let Some(kind) =
-        crate::helpers::ireference_inner_type(return_type).and_then(classify_reference_return)
+        crate::helpers::ireference_inner_type(return_type)
+            .and_then(|inner| classify_reference_return(crate::property_call::abi_type_arg(inner)))
     {
         return kind;
     }
@@ -8092,7 +8093,7 @@ pub(crate) fn delegate_param_sigs(iid_name: &str) -> Option<Vec<String>> {
                     .strip_prefix("Var!")
                     .and_then(|n| n.parse::<usize>().ok());
                 Some(match placeholder.and_then(|n| type_args.get(n)) {
-                    Some(arg) => arg.clone(),
+                    Some(arg) => crate::property_call::abi_type_arg(arg).to_owned(),
                     None => sig,
                 })
             })
@@ -8155,7 +8156,7 @@ fn delegate_return_from_invoke(method: &MethodDeclaration, type_args: &[String])
     let sig = Signature::to_string(meta, &method.return_type());
     let placeholder = sig.strip_prefix("Var!").and_then(|n| n.parse::<usize>().ok());
     let sig = match placeholder.and_then(|n| type_args.get(n)) {
-        Some(arg) => arg.clone(),
+        Some(arg) => crate::property_call::abi_type_arg(arg).to_owned(),
         None => sig,
     };
     delegate_invoke::delegate_return_for_signature(&sig, ffi_type_for_delegate_param)

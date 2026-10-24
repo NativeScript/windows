@@ -2684,6 +2684,38 @@ fn ireference_parameters_and_results() {
     );
 }
 
+/// Generics closed over an enum (`IAsyncOperation<Enum>`, `IVector<Enum>`, `IReference<Enum>`)
+/// resolve the IID hashed from the enum's name and carry the enum as a number.
+#[test]
+fn enum_type_arguments() {
+    run_js_assert(
+        "enum_type_arguments",
+        r#"
+            const Enumeration = Windows.Devices.Enumeration;
+            const classes = new Enumeration.DevicePicker().Filter.SupportedDeviceClasses;
+            classes.Append(Enumeration.DeviceClass.AudioCapture);
+            classes.Append(Enumeration.DeviceClass.VideoCapture);
+            if (classes.Size !== 2) throw new Error(`Size was ${classes.Size}`);
+            const first = classes.GetAt(0);
+            if (first !== Enumeration.DeviceClass.AudioCapture) throw new Error(`GetAt(0) was ${first}`);
+
+            const Devices = Windows.Media.Devices;
+            const focus = new Devices.FocusSettings();
+            if (focus.Distance !== null) throw new Error(`unset Distance was ${focus.Distance}`);
+            focus.Distance = Devices.ManualFocusDistance.Nearest;
+            if (focus.Distance !== Devices.ManualFocusDistance.Nearest) throw new Error(`Distance was ${focus.Distance}`);
+            focus.Distance = null;
+            if (focus.Distance !== null) throw new Error(`cleared Distance was ${focus.Distance}`);
+
+            const op = Windows.Devices.Haptics.VibrationDevice.RequestAccessAsync();
+            return NSWinRT.toPromise(op).then((status) => {
+                if (typeof status !== 'number') throw new Error(`access status was ${status}`);
+                if (op.GetResults() !== status) throw new Error(`GetResults was ${op.GetResults()}`);
+            });
+        "#,
+    );
+}
+
 /// Struct `IReference<T>` parameters take a plain object or a struct value, and null clears them.
 #[test]
 fn ireference_struct_parameters() {

@@ -877,6 +877,11 @@ pub fn box_as_ireference(
             return Some((NativeValue { pointer: reference.as_raw() }, Some(reference)));
         }
     }
+    if vt == ValueType::Number && crate::property_call::is_enum_name(inner_type) {
+        let value = coerce_f64(env, arg)? as i64 as u32;
+        let reference = crate::struct_reference::create(value.to_le_bytes().to_vec(), *iid);
+        return Some((NativeValue { pointer: reference.as_raw() }, Some(reference)));
+    }
     let wrapped = if vt == ValueType::Object || vt == ValueType::Function {
         let obj: JsObject = unsafe { arg.cast() };
         try_get_external_handle(env, &obj).filter(|ptr| !ptr.is_null())

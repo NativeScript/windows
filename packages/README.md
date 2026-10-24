@@ -98,7 +98,9 @@ nativescript-windows path/to/app.js     # e.g. packages/test/test-app.js
 ```
 `packages/test/interop-check.js` exercises the shared `NSWinRT.interop` surface (typed-value/
 `reference` boxing, Pointer/OutParam, buffer + DateTime helpers) and is expected to pass on
-all four engines. With a script argument the host runs it and then drives the **standalone event loop**
+all four engines, as is `packages/test/enum-check.js` (generics closed over an enum:
+`IAsyncOperation<Enum>`, `IVector<Enum>`, `IReference<Enum>`). With a script argument the host
+runs it and then drives the **standalone event loop**
 (`runtime::napi_engine::event_loop`) until the app goes idle: Windows message pump (STA WinRT
 async completions, delegate invokes), `setTimeout`/`setInterval` timers
 (`napi_engine::timers`, install-if-missing), and the engine's microtask drain. The prelude
