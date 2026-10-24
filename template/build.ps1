@@ -63,10 +63,10 @@ Write-Host "Repo root  : $RepoRoot"
 # `classic` is the default V8 workspace crate; the rest are the napi engine packages.
 $EngineMap = @{
     classic = @{ Package = 'nativescript'; NpmName = '@nativescript/windows' }
-    v8       = @{ Dir = 'windows-v8';      Lib = 'windows_v8';      Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-v8' }
-    quickjs  = @{ Dir = 'windows-quickjs'; Lib = 'windows_quickjs'; Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-quickjs' }
+    v8       = @{ Dir = 'windows-v8';      Lib = 'windows_v8';      Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-v8'; Tools = @() }
+    quickjs  = @{ Dir = 'windows-quickjs'; Lib = 'windows_quickjs'; Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-quickjs'; Tools = @() }
     hermes   = @{ Dir = 'windows-hermes';  Lib = 'windows_hermes';  Dlls = @('hermes.dll', 'hermes-icu.dll');                                  Features = @('host_dll'); NpmName = '@nativescript/windows-hermes'; Tools = @('hermesc.exe') }
-    jsc      = @{ Dir = 'windows-jsc';      Lib = 'windows_jsc';     Dlls = @('JavaScriptCore.dll', 'icuin77.dll', 'icuuc77.dll', 'icudt77.dll'); Features = @('host_dll', 'jsc_link'); NpmName = '@nativescript/windows-jsc' }
+    jsc      = @{ Dir = 'windows-jsc';      Lib = 'windows_jsc';     Dlls = @('JavaScriptCore.dll', 'icuin77.dll', 'icuuc77.dll', 'icudt77.dll'); Features = @('host_dll', 'jsc_link'); NpmName = '@nativescript/windows-jsc'; Tools = @() }
 }
 $EngineInfo = $EngineMap[$Engine]
 if ($Engine -ne 'classic') {
