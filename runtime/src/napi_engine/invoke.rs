@@ -105,6 +105,7 @@ pub(crate) fn convert_call_result(
         }
         ReturnKind::Reference { value, size } => {
             let inner = crate::helpers::ireference_inner_type(return_type).unwrap_or(return_type);
+            let inner = crate::property_call::abi_type_arg(inner);
             return match unsafe { crate::value::read_reference_value(result, *size) } {
                 Some(mut buf) => {
                     let ptr = buf.as_mut_ptr() as *mut c_void;

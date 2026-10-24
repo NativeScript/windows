@@ -3,7 +3,8 @@
 //!
 //! `PropertyValue` only boxes primitives and a few Foundation types, so the struct's bytes (laid
 //! out as for a struct parameter) are held by an agile object that answers the reference's IID,
-//! which is computed from its closed generic name, and copies them out of `get_Value`.
+//! which is computed from its closed generic name, and copies them out of `get_Value`. An enum
+//! `IReference<T>` holds the enum's 4 bytes the same way.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};

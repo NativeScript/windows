@@ -159,6 +159,17 @@ impl Signature {
         signature: &PCCOR_SIGNATURE,
         preserve_arity: bool,
     ) -> String {
+        Signature::get_string_in(metadata, signature, preserve_arity, false)
+    }
+
+    /// `in_type_arg` is set inside a generic's type arguments, where an enum keeps its name: the
+    /// closed type's IID hashes `enum(Name;i4)`, and `Int32` there names a different type.
+    fn get_string_in(
+        metadata: Option<&IMetaDataImport2>,
+        signature: &PCCOR_SIGNATURE,
+        preserve_arity: bool,
+        in_type_arg: bool,
+    ) -> String {
         let mut signature = signature.clone();
 
         let element_type = cor_sig_uncompress_element_type(&mut signature);
@@ -184,8 +195,8 @@ impl Signature {
                     let token_type = CorTokenType(token as i32);
 
                     // WinRT enums are ELEMENT_TYPE_VALUETYPE but must be passed as
-                    // Int32 on the ABI — not as a COM pointer.
-                    if is_enum_type(metadata_ref, token_type) {
+                    // Int32 on the ABI, not as a COM pointer.
+                    if !in_type_arg && is_enum_type(metadata_ref, token_type) {
                         return "Int32".to_string();
                     }
 
@@ -211,7 +222,8 @@ impl Signature {
             }
             ELEMENT_TYPE_OBJECT => "Object".to_string(),
             ELEMENT_TYPE_SZARRAY => {
-                let result = Signature::get_string(metadata, &mut signature, preserve_arity);
+                let result =
+                    Signature::get_string_in(metadata, &mut signature, preserve_arity, in_type_arg);
                 format!("{}[]", result)
             }
             ELEMENT_TYPE_VAR => {
@@ -244,7 +256,7 @@ impl Signature {
 
                 for i in 0..generic_arguments_count {
                     let mut sig_type = Signature::consume_type(&mut signature);
-                    let data = Signature::get_string(metadata, &mut sig_type, preserve_arity);
+                    let data = Signature::get_string_in(metadata, &mut sig_type, preserve_arity, true);
 
                     result += data.as_ref();
                     if i != generic_arguments_count.saturating_sub(1) {

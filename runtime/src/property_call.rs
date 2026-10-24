@@ -231,15 +231,46 @@ pub(crate) fn append_struct_object_bytes_napi(
     buf.extend(std::iter::repeat(0u8).take(tail));
 }
 
+/// Replaces `Var!N` placeholders in `s` with `type_args`. An enum argument stays named inside
+/// another generic (it is part of that type's IID) and becomes its `Int32` ABI type elsewhere.
 pub(crate) fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
-    if type_args.is_empty() {
+    if type_args.is_empty() || !s.contains("Var!") {
         return s.to_string();
     }
-    let mut result = s.to_string();
-    for (i, arg) in type_args.iter().enumerate() {
-        result = result.replace(&format!("Var!{}", i), arg.as_str());
+    let mut result = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if let Some(after) = rest.strip_prefix("Var!") {
+            let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+            if let Some(arg) = after[..digits].parse::<usize>().ok().and_then(|i| type_args.get(i)) {
+                result.push_str(if depth == 0 { abi_type_arg(arg) } else { arg });
+                rest = &after[digits..];
+                continue;
+            }
+        }
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        result.push(c);
+        rest = &rest[c.len_utf8()..];
     }
     result
+}
+
+/// The ABI type of a generic type argument: `Int32` for an enum, the argument itself otherwise.
+pub(crate) fn abi_type_arg(arg: &str) -> &str {
+    if is_enum_name(arg) { "Int32" } else { arg }
+}
+
+/// Whether `name` is a WinRT enum's full name.
+pub(crate) fn is_enum_name(name: &str) -> bool {
+    name.contains('.')
+        && !name.contains('<')
+        && MetadataReader::find_by_name(name)
+            .is_some_and(|decl| matches!(decl.read().kind(), DeclarationKind::Enum))
 }
 
 /// Immutable per-property-method-type data cached after first construction.

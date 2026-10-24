@@ -1111,6 +1111,11 @@ pub fn box_as_ireference(
             return Some((NativeValue { pointer: reference.as_raw() }, Some(reference)));
         }
     }
+    if arg.is_number() && crate::property_call::is_enum_name(inner_type) {
+        let value = arg.number_value(scope)? as i64 as u32;
+        let reference = crate::struct_reference::create(value.to_le_bytes().to_vec(), *iid);
+        return Some((NativeValue { pointer: reference.as_raw() }, Some(reference)));
+    }
     let wrapped = if arg.is_object() {
         arg.to_object(scope)
             .and_then(|obj| try_get_external_handle(scope, obj))
