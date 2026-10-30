@@ -236,7 +236,8 @@ fn open_and_decrypt(path: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
         blob_len: u64,
         nonce: [u8; 12],
     }
-    let mut toc = Vec::with_capacity(entry_count);
+    // Each TOC entry takes at least 30 bytes, which bounds a corrupt count's allocation.
+    let mut toc = Vec::with_capacity(entry_count.min(data.len() / 30));
     for _ in 0..entry_count {
         if cursor + 2 > data.len() {
             return Err("truncated TOC".to_string());
@@ -265,12 +266,15 @@ fn open_and_decrypt(path: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     let blob_section_start = cursor;
     let mut table = HashMap::with_capacity(toc.len());
     for entry in toc {
-        let start = blob_section_start + entry.blob_offset as usize;
-        let end = start + entry.blob_len as usize;
-        if end > data.len() {
-            return Err(format!("blob out of range for {}", entry.path));
-        }
-        let plaintext = open(&key, &entry.nonce, entry.path.as_bytes(), &data[start..end])
+        let blob = usize::try_from(entry.blob_offset)
+            .ok()
+            .and_then(|offset| blob_section_start.checked_add(offset))
+            .and_then(|start| {
+                let end = start.checked_add(usize::try_from(entry.blob_len).ok()?)?;
+                data.get(start..end)
+            })
+            .ok_or_else(|| format!("blob out of range for {}", entry.path))?;
+        let plaintext = open(&key, &entry.nonce, entry.path.as_bytes(), blob)
             .map_err(|_| format!("failed to decrypt {} (tampered container or wrong key)", entry.path))?;
         table.insert(entry.path.to_lowercase(), plaintext);
     }
@@ -437,6 +441,28 @@ mod tests {
         let blob_start = cursor + blob_offset as usize;
         let blob_end = blob_start + blob_len as usize;
         assert!(open(&key, &nonce, b"a.js", &data[blob_start..blob_end]).is_err());
+    }
+
+    #[test]
+    fn corrupt_counts_and_offsets_fail_cleanly() {
+        let input = scratch_dir("corrupt_in");
+        fs::write(input.join("a.js"), b"a").unwrap();
+        let output = scratch_dir("corrupt_out").join("app.nsbundle");
+        pack_directory(&input, &output, KEY_MODE_DEFAULT, default_key()).unwrap();
+        let packed = fs::read(&output).unwrap();
+
+        let mut data = packed.clone();
+        LittleEndian::write_u32(&mut data[24..28], u32::MAX);
+        fs::write(&output, &data).unwrap();
+        assert!(open_and_decrypt(&output).is_err());
+
+        let offset_at = HEADER_LEN + 2 + "a.js".len();
+        for value in [u64::MAX, u64::MAX - 8] {
+            let mut data = packed.clone();
+            LittleEndian::write_u64(&mut data[offset_at..offset_at + 8], value);
+            fs::write(&output, &data).unwrap();
+            assert!(open_and_decrypt(&output).is_err());
+        }
     }
 
     #[test]

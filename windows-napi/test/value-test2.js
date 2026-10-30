@@ -21,18 +21,20 @@ check('ptr(null)', ns.pointerValue(null), 0);
 check('ptr(undefined)', ns.pointerValue(undefined), 0);
 // handle property forms
 check('ptr({handle:null})', ns.pointerValue({ handle: null }), 0);
-check('ptr({handle:123})', ns.pointerValue({ handle: 123 }), 123);
+// Numbers and strings can come from JSON, so only BigInt/External/null carry pointers.
+throws('ptr({handle:123}) throws', () => ns.pointerValue({ handle: 123 }));
 check('ptr({handle:321n})', ns.pointerValue({ handle: 321n }), 321);
-check('ptr({handle:fn->77})', ns.pointerValue({ handle: () => 77 }), 77);
+throws('ptr({handle:fn->77}) throws', () => ns.pointerValue({ handle: () => 77 }));
+check('ptr({handle:fn->77n})', ns.pointerValue({ handle: () => 77n }), 77);
 check('ptr({handle:fn->null})', ns.pointerValue({ handle: () => null }), 0);
 // external round-trip, direct and via handle
 const ext = ns.makeExternal(4096);
 check('ptr(external)', ns.pointerValue(ext), 4096);
 check('ptr({handle:external})', ns.pointerValue({ handle: ext }), 4096);
 // __native_ptr forms
-check('ptr({__native_ptr:"0x10"})', ns.pointerValue({ __native_ptr: '0x10' }), 16);
-check('ptr({__native_ptr:"42"})', ns.pointerValue({ __native_ptr: '42' }), 42);
-check('ptr({__native_ptr:99})', ns.pointerValue({ __native_ptr: 99 }), 99);
+throws('ptr({__native_ptr:"0x10"}) throws', () => ns.pointerValue({ __native_ptr: '0x10' }));
+throws('ptr({__native_ptr:"42"}) throws', () => ns.pointerValue({ __native_ptr: '42' }));
+throws('ptr({__native_ptr:99}) throws', () => ns.pointerValue({ __native_ptr: 99 }));
 check('ptr({__native_ptr:7n})', ns.pointerValue({ __native_ptr: 7n }), 7);
 // primitive boxing to IPropertyValue (nonzero COM pointers)
 check('ptr("hello") boxed', ns.pointerValue('hello'), p => p > 0);
@@ -64,6 +66,8 @@ check('struct(ab).ptr', ns.structPtr(ab), abPtr);
 check('struct(view+4).ptr', ns.structPtr(u8), abPtr + 4);
 throws('struct(null) throws', () => ns.structPtr(null));
 throws('struct(5) throws', () => ns.structPtr(5));
+check('struct(view+4, 8 bytes).ptr', ns.structPtr(u8, 8), abPtr + 4);
+throws('struct shorter than its type throws', () => ns.structPtr(u8, 9));
 
 // write -> read native slot round-trips
 for (const [ty, v] of [['bool', true], ['u8', 200], ['i8', -5], ['u16', 60000], ['i16', -12345],

@@ -32,11 +32,7 @@ namespace __PROJECT_NAME__
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_set_local_folder))]
         private static extern void runtime_set_local_folder([MarshalAs(UnmanagedType.LPUTF8Str)] string localFolder);
 
-        // Escape hatch for apps packed with `nsbundle_pack --key-hex <hex>` (custom-key
-        // app.nsbundle containers). Must be called before runtime_init if used at all: apps
-        // packed with the default pepper (no --key-hex) never need to call this. Not wired to a
-        // default call site here; an app author supplies their own key material and calls this
-        // from Initialize() before runtime_init(...).
+        // Must be called before runtime_init, which opens app.nsbundle.
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_set_bundle_key))]
         private static extern int runtime_set_bundle_key([MarshalAs(UnmanagedType.LPUTF8Str)] string keyHex);
 
@@ -252,6 +248,15 @@ namespace __PROJECT_NAME__
             }
         }
 
+        private static void ApplyBundleKey()
+        {
+            using var stream = typeof(RuntimeHost).Assembly.GetManifestResourceStream("NSBundleKey");
+            if (stream == null) return;
+            using var reader = new StreamReader(stream);
+            try { runtime_set_bundle_key(reader.ReadToEnd().Trim()); }
+            catch (EntryPointNotFoundException) { }
+        }
+
         public void Initialize()
         {
             if (_initialized) return;
@@ -259,6 +264,7 @@ namespace __PROJECT_NAME__
             try { attached = AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
             runtime_install_ctrlc_handler(0);
             runtime_set_local_folder(LocalFolderPath);
+            ApplyBundleKey();
             _runtime = runtime_init(AppContext.BaseDirectory);
 #if DEBUG
             TrySetDebugBuild();

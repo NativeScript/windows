@@ -1399,49 +1399,44 @@ fn symbol_has_instance_callback(
     let data_ptr = data_ext.value() as *const HasInstanceData;
     let data = unsafe { &*data_ptr };
 
-    if let Some(dec_field) = obj.get_internal_field(scope, 0) {
-        if let Ok(dec_ext) = v8::Local::<v8::External>::try_from(dec_field) {
-            let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
-            if !dec_ptr.is_null() {
-                let dec = unsafe { &*dec_ptr };
+    if let Some(dec_ptr) = crate::ns_proxy::this_declaration_ffi(scope, obj) {
+        let dec = unsafe { &*dec_ptr };
 
-                {
-                    let lock = dec.read();
-                    if lock.full_name() == data.full_name.as_str() {
-                        retval.set_bool(true);
-                        return;
-                    }
-                }
-
-                let Some(iid) = data.iid else {
-                    // A class: true when the instance's class derives from it
-                    // (a StackPanel is a Panel, a FrameworkElement and a UIElement).
-                    let own_class = dec.read().full_name().to_string();
-                    retval.set_bool(class_derives_from(&own_class, &data.full_name));
-                    return;
-                };
-                let Some(instance) = dec.instance.clone() else {
-                    retval.set_bool(false);
-                    return;
-                };
-
-                let vtable = instance.vtable();
-                let mut qi_ptr: *mut c_void = std::ptr::null_mut();
-                let hr = unsafe {
-                    ((*vtable).QueryInterface)(
-                        instance.as_raw(),
-                        &iid,
-                        std::mem::transmute(&mut qi_ptr),
-                    )
-                };
-                let implements = hr.is_ok() && !qi_ptr.is_null();
-                if !qi_ptr.is_null() {
-                    drop(unsafe { IUnknown::from_raw(qi_ptr) });
-                }
-                retval.set_bool(implements);
+        {
+            let lock = dec.read();
+            if lock.full_name() == data.full_name.as_str() {
+                retval.set_bool(true);
                 return;
             }
         }
+
+        let Some(iid) = data.iid else {
+            // A class: true when the instance's class derives from it
+            // (a StackPanel is a Panel, a FrameworkElement and a UIElement).
+            let own_class = dec.read().full_name().to_string();
+            retval.set_bool(class_derives_from(&own_class, &data.full_name));
+            return;
+        };
+        let Some(instance) = dec.instance.clone() else {
+            retval.set_bool(false);
+            return;
+        };
+
+        let vtable = instance.vtable();
+        let mut qi_ptr: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            ((*vtable).QueryInterface)(
+                instance.as_raw(),
+                &iid,
+                std::mem::transmute(&mut qi_ptr),
+            )
+        };
+        let implements = hr.is_ok() && !qi_ptr.is_null();
+        if !qi_ptr.is_null() {
+            drop(unsafe { IUnknown::from_raw(qi_ptr) });
+        }
+        retval.set_bool(implements);
+        return;
     }
 
     if let Some(type_key) = v8::String::new(scope, "__type") {
@@ -1581,6 +1576,10 @@ pub fn debug_output(msg: &str) {
     let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { OutputDebugStringW(PCWSTR::from_raw(wide.as_ptr())) };
     eprint!("{}", msg);
+    // Release builds keep no on-disk trace: app console output can carry user data.
+    if !crate::esm_http::is_debug_build() {
+        return;
+    }
     use std::io::Write;
     LOG_FILE.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -1617,9 +1616,10 @@ pub fn debug_output(msg: &str) {
                 let chosen = if writable(&p) {
                     p.to_string_lossy().into_owned()
                 } else {
-                    let base =
-                        std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\fortu".into());
-                    format!("{}\\console.log", base)
+                    match std::env::var("USERPROFILE") {
+                        Ok(base) => format!("{}\\console.log", base),
+                        Err(_) => return String::new(),
+                    }
                 };
                 let banner = format!("[NativeScript] log file: {}\n", chosen);
                 let wide_banner: Vec<u16> =
@@ -7664,6 +7664,24 @@ unsafe impl Send for JsDelegate {}
 #[cfg(feature = "classic")]
 unsafe impl Sync for JsDelegate {}
 
+/// A `{ handle }` delegate argument: a JS delegate this runtime made passes as is, since a
+/// generic delegate's IID computed from its type name may be spelled differently from the
+/// parameter's. Anything else must implement the delegate interface `iid`.
+#[cfg(feature = "classic")]
+pub(crate) fn js_delegate_arg(
+    ptr: *mut c_void,
+    iid: &GUID,
+) -> std::result::Result<(crate::value::NativeValue, Option<IUnknown>), crate::error::AnyError> {
+    // Every JS delegate vtable, typed ones included, shares this QueryInterface in slot 0.
+    let is_js_delegate = !ptr.is_null()
+        && unsafe { (**(ptr as *const *const JsDelegateVtbl)).query_interface as usize }
+            == js_delegate_query_interface as usize;
+    if is_js_delegate {
+        return Ok((crate::value::NativeValue { pointer: ptr }, None));
+    }
+    crate::value::query_interface_arg(ptr, iid)
+}
+
 #[cfg(feature = "classic")]
 unsafe extern "system" fn js_delegate_query_interface(
     this: *mut JsDelegate,
@@ -8006,7 +8024,10 @@ pub(crate) fn js_delegate_params_from_declaration(
     lock: &dyn Declaration,
     kind: DeclarationKind,
 ) -> Option<(GUID, Vec<NativeType>)> {
-    let build = |method: &MethodDeclaration, guid: GUID| -> (GUID, Vec<NativeType>) {
+    let build = |method: &MethodDeclaration, guid: GUID| -> Option<(GUID, Vec<NativeType>)> {
+        if !delegate_params_supported(method) {
+            return None;
+        }
         let params = method
             .parameters()
             .iter()
@@ -8016,10 +8037,10 @@ pub(crate) fn js_delegate_params_from_declaration(
                 Some(ffi_type_for_delegate_param(&sig))
             })
             .collect();
-        (guid, params)
+        Some((guid, params))
     };
 
-    Some(match kind {
+    match kind {
         DeclarationKind::Delegate => {
             let d = lock.as_any().downcast_ref::<DelegateDeclaration>()?;
             build(d.invoke_method(), d.id())
@@ -8034,7 +8055,16 @@ pub(crate) fn js_delegate_params_from_declaration(
                 .downcast_ref::<GenericDelegateInstanceDeclaration>()?;
             build(d.invoke_method(), d.id())
         }
-        _ => return None,
+        _ => None,
+    }
+}
+
+/// A native caller passes an array argument as two slots, which a JS delegate's single argument
+/// would misread, so delegates taking arrays aren't implemented in JS.
+fn delegate_params_supported(method: &MethodDeclaration) -> bool {
+    method.parameters().iter().all(|p| {
+        p.metadata()
+            .map_or(true, |m| !Signature::to_string(m, &p.type_()).trim().ends_with("[]"))
     })
 }
 
@@ -8058,6 +8088,9 @@ pub(crate) fn delegate_info_from_type_sig(iid_name: &str) -> Option<(GUID, Vec<N
             .as_any()
             .downcast_ref::<GenericDelegateDeclaration>()?;
         let invoke = open_delegate.invoke_method();
+        if !delegate_params_supported(invoke) {
+            return None;
+        }
         let param_types = invoke
             .parameters()
             .iter()
@@ -8758,6 +8791,13 @@ impl Runtime {
         if is_esm {
             self.run_module(script, filename);
             return;
+        }
+        // The remote-module gate reads `security` from the entry's package.json, as for modules.
+        if let Some(dir) = Path::new(filename).parent() {
+            let manifest = dir.join("package.json");
+            if manifest.is_file() || crate::source_protect::contains(&manifest.to_string_lossy()) {
+                crate::esm_http::init_security_from_app_dir(dir);
+            }
         }
 
         v8::scope!(scope, &mut self.isolate);

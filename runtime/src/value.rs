@@ -685,6 +685,19 @@ pub fn ffi_parse_f64_arg(arg: v8::Local<v8::Value>) -> std::result::Result<Nativ
     Ok(NativeValue { f64_value })
 }
 
+/// A native pointer carried by a JS value: an External, a BigInt, or null. Numbers and strings
+/// are refused because `JSON.parse` output can carry them, and data must never become a pointer.
+#[cfg(feature = "classic")]
+fn native_pointer_value(value: v8::Local<v8::Value>) -> Option<*mut c_void> {
+    if let Ok(ext) = v8::Local::<v8::External>::try_from(value) {
+        return Some(ext.value());
+    }
+    if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(value) {
+        return Some(bi.u64_value().0 as *mut c_void);
+    }
+    value.is_null().then(std::ptr::null_mut)
+}
+
 #[cfg(feature = "classic")]
 #[inline]
 fn try_get_external_handle(
@@ -719,56 +732,24 @@ fn try_get_external_handle(
                 if let Ok(func) = v8::Local::<v8::Function>::try_from(handle) {
                     // Call with `this` = the object so typical getters work.
                     if let Some(ret) = func.call(scope, arg.into(), &[]) {
-                        if let Ok(ext) = v8::Local::<v8::External>::try_from(ret) {
-                            return Some(ext.value());
-                        }
-                        if ret.is_null() {
-                            return Some(std::ptr::null_mut());
-                        }
-                        if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(ret) {
-                            let u = bi.u64_value().0;
-                            return Some(u as *mut c_void);
-                        }
-                        if let Ok(num) = v8::Local::<v8::Number>::try_from(ret) {
-                            if let Some(iv) = num.integer_value(scope) {
-                                return Some(iv as isize as *mut c_void);
-                            } else {
-                                let v = num.value();
-                                return Some(v as usize as *mut c_void);
-                            }
+                        if let Some(ptr) = native_pointer_value(ret) {
+                            return Some(ptr);
                         }
                     }
                 }
             }
-            if let Ok(value) = v8::Local::<v8::External>::try_from(handle) {
-                return Some(value.value());
-            }
-
-            if handle.is_null() {
-                return Some(std::ptr::null_mut());
-            }
-            // Fallback: some managed bridges may expose the native pointer as a
-            // numeric value (BigInt or Number). Accept those too.
-            if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(handle) {
-                let u = bi.u64_value().0;
-                let ptr = u as *mut c_void;
+            if let Some(ptr) = native_pointer_value(handle) {
                 return Some(ptr);
-            }
-            if let Ok(num) = v8::Local::<v8::Number>::try_from(handle) {
-                if let Some(iv) = num.integer_value(scope) {
-                    let ptr = iv as isize as *mut c_void;
-                    return Some(ptr);
-                } else {
-                    let v = num.value();
-                    let ptr = v as usize as *mut c_void;
-                    return Some(ptr);
-                }
             }
         }
     }
 
-    if let Some(field) = arg.get_internal_field(scope, 0) {
-        // Checked: a typed array's embedder slots hold Smis, not Externals.
+    // Only runtime wrappers (two fields) hold a DeclarationFFI: URL objects keep other data in
+    // their one field, and a typed array's embedder slots hold Smis.
+    let wrapper_field = (arg.internal_field_count() == 2)
+        .then(|| arg.get_internal_field(scope, 0))
+        .flatten();
+    if let Some(field) = wrapper_field {
         let Ok(ext) = v8::Local::<v8::External>::try_from(field) else {
             return None;
         };
@@ -785,41 +766,13 @@ fn try_get_external_handle(
         return Some(std::ptr::null_mut());
     }
 
-    // Bridge may provide a canonical native pointer directly on the JS object
-    // via a `__native_ptr` property (written as a string or numeric value by
-    // the managed bridge). Accept hex strings, decimal strings, BigInt, and
-    // Number values here so managed-returned wrappers can expose their
-    // canonical IUnknown/IInspectable pointer identity.
+    // Bridge wrappers expose their canonical IUnknown pointer as a `__native_ptr` BigInt.
     if let Some(native_key) = v8::String::new(scope, "__native_ptr") {
         if let Some(val) = arg.get(scope, native_key.into()) {
-            if val.is_string() {
-                if let Ok(sv) = v8::Local::<v8::String>::try_from(val) {
-                    let s = sv.to_rust_string_lossy(scope);
-                    let s_trim = s.trim_start();
-                    let parsed = if s_trim.starts_with("0x") || s_trim.starts_with("0X") {
-                        usize::from_str_radix(&s_trim[2..], 16).ok()
-                    } else {
-                        s_trim.parse::<usize>().ok()
-                    };
-                    if let Some(u) = parsed {
-                        return Some(u as *mut c_void);
-                    }
+            if !val.is_null() {
+                if let Some(ptr) = native_pointer_value(val) {
+                    return Some(ptr);
                 }
-            }
-            if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(val) {
-                let u = bi.u64_value().0;
-                return Some(u as *mut c_void);
-            }
-            if let Ok(num) = v8::Local::<v8::Number>::try_from(val) {
-                if let Some(iv) = num.integer_value(scope) {
-                    return Some(iv as isize as *mut c_void);
-                } else {
-                    let v = num.value();
-                    return Some(v as usize as *mut c_void);
-                }
-            }
-            if let Ok(ext) = v8::Local::<v8::External>::try_from(val) {
-                return Some(ext.value());
             }
         }
     }
@@ -1276,6 +1229,26 @@ pub fn ffi_parse_pointer_arg(
     Ok(NativeValue { pointer })
 }
 
+/// `pointer` QI'd to `iid` (the guard holds the new reference), or a TypeError for an object
+/// that doesn't implement it. Null passes through.
+pub(crate) fn query_interface_arg(
+    pointer: *mut c_void,
+    iid: &windows::core::GUID,
+) -> std::result::Result<(NativeValue, Option<windows::core::IUnknown>), AnyError> {
+    use windows::core::Interface;
+    if pointer.is_null() {
+        return Ok((NativeValue { pointer }, None));
+    }
+    let unknown = ManuallyDrop::new(unsafe { windows::core::IUnknown::from_raw(pointer) });
+    let mut queried: *mut c_void = std::ptr::null_mut();
+    let result = unsafe { (unknown.vtable().QueryInterface)(unknown.as_raw(), iid, &mut queried) };
+    if result.is_ok() && !queried.is_null() {
+        let queried = unsafe { windows::core::IUnknown::from_raw(queried) };
+        return Ok((NativeValue { pointer: queried.as_raw() }, Some(queried)));
+    }
+    Err(type_error("Invalid FFI interface argument for expected WinRT type"))
+}
+
 #[cfg(feature = "classic")]
 #[inline]
 pub fn ffi_parse_query_interface_arg(
@@ -1295,40 +1268,27 @@ pub fn ffi_parse_query_interface_arg(
     if arg.is_object() {
         let arg = arg.to_object(scope).unwrap();
         if let Some(pointer) = try_get_external_handle(scope, arg) {
-            if pointer.is_null() {
-                return Ok((
-                    NativeValue {
-                        pointer: std::ptr::null_mut(),
-                    },
-                    None,
-                ));
-            }
-
-            let unknown = ManuallyDrop::new(unsafe { IUnknown::from_raw(pointer) });
-            let vtable = unknown.vtable();
-            let mut queried: *mut c_void = std::ptr::null_mut();
-
-            let result = unsafe {
-                ((*vtable).QueryInterface)(
-                    unknown.as_raw(),
-                    iid,
-                    &mut queried as *mut _ as *mut *mut c_void,
-                )
-            };
-
-            if result.is_ok() && !queried.is_null() {
-                let queried = unsafe { IUnknown::from_raw(queried) };
-                let pointer = queried.as_raw() as *mut c_void;
-                return Ok((NativeValue { pointer }, Some(queried)));
-            }
-
-            return Err(type_error(
-                "Invalid FFI interface argument for expected WinRT type",
-            ));
+            return query_interface_arg(pointer, iid);
         }
     }
 
-    Ok((ffi_parse_pointer_arg(scope, arg)?, None))
+    // Boxed primitives and struct shapes are checked too: an IPropertyValue handed to a callee
+    // expecting another interface would be called through the wrong vtable.
+    query_interface_arg(unsafe { ffi_parse_pointer_arg(scope, arg)?.pointer }, iid)
+}
+
+/// Whether each buffer argument still has the backing it had when parsed. Parsing a later argument
+/// can run JS (a getter, `valueOf`) that detaches, transfers or resizes an earlier buffer, and the
+/// callee would then write through a stale pointer.
+#[cfg(feature = "classic")]
+pub(crate) fn buffers_unchanged(
+    scope: &mut v8::PinScope<'_, '_>,
+    buffers: &[(v8::Local<v8::Value>, *mut c_void, u32)],
+) -> bool {
+    buffers.iter().all(|&(value, pointer, length)| {
+        matches!(ffi_parse_buffer_arg_with_length(scope, value),
+            Ok((now, now_length)) if unsafe { now.pointer } == pointer && now_length == length)
+    })
 }
 
 #[cfg(feature = "classic")]
@@ -1378,10 +1338,25 @@ pub fn ffi_parse_buffer_arg_with_length(
 pub fn ffi_parse_struct_arg(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
+    struct_size: usize,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
     // 1. ArrayBuffer: Fairly common and not supported by Fast API, optimise this case.
     // 2. ArrayBufferView: Common and supported by Fast API
+
+    let byte_length = if let Ok(value) = v8::Local::<v8::ArrayBufferView>::try_from(arg) {
+        value.byte_length()
+    } else if let Ok(value) = v8::Local::<v8::ArrayBuffer>::try_from(arg) {
+        value.byte_length()
+    } else {
+        0
+    };
+    // The callee reads the whole struct, so a shorter buffer would be read past its end.
+    if byte_length < struct_size {
+        return Err(type_error(format!(
+            "Invalid FFI struct buffer: {byte_length} bytes, expected at least {struct_size}"
+        )));
+    }
 
     let pointer = if let Ok(value) = v8::Local::<v8::ArrayBuffer>::try_from(arg) {
         if let Some(non_null) = value.data() {
@@ -1911,7 +1886,7 @@ pub fn write_v8_value_to_ptr(
         }
         NativeType::Struct(_) => {
             // Copy struct bytes from an ArrayBuffer/ArrayBufferView or other struct source
-            let nv = ffi_parse_struct_arg(scope, arg)?;
+            let nv = ffi_parse_struct_arg(scope, arg, native_type.size())?;
             let src = unsafe { nv.pointer as *const u8 };
             let size = native_type.size();
             unsafe {

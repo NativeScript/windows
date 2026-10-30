@@ -294,3 +294,19 @@ fn native_websocket_round_trip() {
     );
     assert_eq!(refused, "ok:1006:false");
 }
+
+#[test]
+fn legacy_dynamic_import_uses_the_module_loader() {
+    let server = TestServer::start();
+    let o = server.origin.clone();
+    server.route("/remote/mod.js", "text/javascript", "export default 'remote'; export const n = 2;");
+    server.route("/remote/style.css", "text/css", "body{}");
+
+    let mut runtime = Runtime::new(".");
+    runtime.register_delegate_isolate_ptr();
+    let got = await_js(&mut runtime, &format!("NSWinRT.dynamicImport('{o}/remote/mod.js').then(m => m.default + m.n)"));
+    assert_eq!(got, "ok:remote2");
+    // The loader's MIME check applies too.
+    let css = await_js(&mut runtime, &format!("NSWinRT.dynamicImport('{o}/remote/style.css')"));
+    assert!(css.starts_with("err:"), "{css}");
+}

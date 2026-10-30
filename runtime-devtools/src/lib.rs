@@ -499,7 +499,7 @@ fn handle_connection(
     // Peek at the request line to route without consuming any bytes.
     // TcpStream::peek() leaves data in the kernel receive buffer so that
     // tungstenite can re-read the full HTTP upgrade request.
-    let mut peek_buf = [0u8; 256];
+    let mut peek_buf = [0u8; 2048];
     let n = match stream.peek(&mut peek_buf) {
         Ok(n) => n,
         Err(_) => return,
@@ -511,14 +511,68 @@ fn handle_connection(
         .unwrap_or("/")
         .to_string();
 
+    if !host_allowed(header_value(&peek_str, "host")) {
+        let mut stream = stream;
+        let _ = stream.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        return;
+    }
+
     if path.starts_with("/json") {
         serve_json(stream, &path, ws_url);
     } else {
         stream.set_nonblocking(false).ok();
-        if let Ok(ws) = tungstenite::accept(stream) {
+        if let Ok(ws) = tungstenite::accept_hdr(stream, check_handshake) {
             handle_ws(ws, inbound_tx, outbound_rx);
         }
     }
+}
+
+/// Any web page can open a WebSocket to localhost, and an inspector session runs arbitrary
+/// code, so the handshake must come from a DevTools frontend or a non-browser client.
+fn check_handshake(
+    req: &tungstenite::handshake::server::Request,
+    resp: tungstenite::handshake::server::Response,
+) -> Result<tungstenite::handshake::server::Response, tungstenite::handshake::server::ErrorResponse>
+{
+    // A header that isn't valid text maps to "", which neither check accepts.
+    let header = |name: &str| req.headers().get(name).map(|v| v.to_str().unwrap_or(""));
+    if origin_allowed(header("origin")) && host_allowed(header("host")) {
+        return Ok(resp);
+    }
+    let mut err = tungstenite::handshake::server::ErrorResponse::new(Some("Forbidden".into()));
+    *err.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+    Err(err)
+}
+
+/// Browsers always send `Origin` on WebSocket handshakes; CDP clients such as VS Code don't.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => o.starts_with("devtools://") || o.starts_with("chrome-devtools://"),
+    }
+}
+
+/// Rejects DNS rebinding, where `Host` names the attacker's domain resolved to loopback.
+fn host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host else { return true };
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
 }
 
 fn serve_json(mut stream: TcpStream, path: &str, ws_url: &str) {
@@ -606,6 +660,34 @@ mod tests {
         let cfg = DevtoolsServerConfig::default();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 43000);
+    }
+
+    #[test]
+    fn handshake_rejects_web_origins() {
+        assert!(origin_allowed(None));
+        assert!(origin_allowed(Some("devtools://devtools")));
+        assert!(!origin_allowed(Some("https://example.com")));
+        assert!(!origin_allowed(Some("null")));
+        assert!(!origin_allowed(Some("")));
+    }
+
+    #[test]
+    fn host_must_be_loopback() {
+        assert!(host_allowed(None));
+        assert!(host_allowed(Some("127.0.0.1:43000")));
+        assert!(host_allowed(Some("localhost:43000")));
+        assert!(host_allowed(Some("LOCALHOST")));
+        assert!(host_allowed(Some("[::1]:43000")));
+        assert!(!host_allowed(Some("evil.example:43000")));
+        assert!(!host_allowed(Some("localhost.evil.example")));
+        assert!(!host_allowed(Some("")));
+    }
+
+    #[test]
+    fn header_value_reads_request_headers() {
+        let req = "GET /json HTTP/1.1\r\nhost: evil.example\r\nX: y\r\n\r\nbody: no";
+        assert_eq!(header_value(req, "Host"), Some("evil.example"));
+        assert_eq!(header_value(req, "body"), None);
     }
 
     #[test]

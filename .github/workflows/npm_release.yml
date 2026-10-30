@@ -25,7 +25,7 @@ on:
         required: false
         default: ""
       rebuild_framework:
-        description: "Engine variants: rebuild the shared framework (tools + dotnet-bridge) from source instead of shipping the copies committed under template/framework. (The classic build always rebuilds it.)"
+        description: "Engine variants: rebuild the shared framework (tools + dotnet-bridge) from source instead of shipping the copies committed under template/framework. Tag releases always rebuild, as does the classic build."
         type: boolean
         required: false
         default: false
@@ -169,20 +169,30 @@ jobs:
       # The classic build publishes ManifestMerger and dotnet-typings-gen with `dotnet publish`
       # every time; a variant only needs the SDK when it regenerates the shared framework.
       - name: Setup .NET
-        if: ${{ matrix.engine == 'classic' || inputs.rebuild_framework }}
+        if: ${{ matrix.engine == 'classic' || github.event_name == 'push' || inputs.rebuild_framework }}
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           # dotnet-typings-gen targets net10.0; ManifestMerger is netstandard2.0 and builds on it.
           dotnet-version: "10.x"
       - name: Rebuild shared framework
-        if: ${{ matrix.engine != 'classic' && inputs.rebuild_framework }}
+        # Tag releases always rebuild, so a published variant never ships binaries built off CI.
+        if: ${{ matrix.engine != 'classic' && (github.event_name == 'push' || inputs.rebuild_framework) }}
         shell: pwsh
         # -SkipRelease -SkipDevtools: the classic V8 nativescript.dll is not staged into a variant
         # (the engine cdylib takes its place), so building it here would be thrown away.
         # -SkipArm64: the variants are x64-only (`cpu: ["x64"]` in their package.json).
         run: |
           $ErrorActionPreference = 'Stop'
+          # Clear the committed tool binaries so only this run's output can be staged.
+          $tools = 'template/framework/tools'
+          Get-ChildItem $tools -Recurse -File -Include *.exe, *.dll, *.pdb, *.json |
+            Remove-Item -Force
           ./template/build.ps1 -SkipArm64 -SkipRelease -SkipDevtools
+          $expected = @('ManifestMerger/ManifestMerger.dll', 'dotnet-typings-gen/dotnet-typings-gen.dll',
+                        'dotnet-tool-x64.exe', 'nsbundle_pack-x64.exe', 'typings-generator-x64.exe') |
+            ForEach-Object { Join-Path $tools $_ }
+          $missing = $expected | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "Framework rebuild missing: $($missing -join ', ')" }
       # The runtime DLLs and tool binaries are committed under template/framework so the variants
       # can stage them without a classic build. A classic release must ship what THIS run built,
       # so clear them first: with the committed copies gone, the checks after the build can only

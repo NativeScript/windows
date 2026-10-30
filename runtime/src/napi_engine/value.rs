@@ -339,7 +339,7 @@ pub fn napi_parse_arg(
         NativeType::Pointer => napi_parse_pointer(env, arg),
         NativeType::Buffer => napi_parse_buffer(env, arg),
         NativeType::Function => napi_parse_function(env, arg),
-        NativeType::Struct(_) => napi_parse_struct(env, arg),
+        NativeType::Struct(_) => napi_parse_struct(env, arg, native_type.size()),
         NativeType::Void => Err(type_error("napi_parse_arg: Void is not a parameter type")),
     }
 }
@@ -595,9 +595,8 @@ fn external_or_null(env: &Env, ptr: *mut c_void) -> Result<JsUnknown, AnyError> 
 
 // 
 
-/// Interpret a JS value as a raw native pointer: External, null, BigInt, or Number.
-/// Mirrors the acceptance set of the `handle` branches in the rusty_v8 original
-/// (undefined and anything else → None, NOT a null pointer).
+/// A native pointer carried by a JS value: an External, a BigInt, or null. Numbers and strings
+/// are refused because `JSON.parse` output can carry them, and data must never become a pointer.
 fn js_value_as_ptr(env: &Env, v: &JsUnknown) -> Option<*mut c_void> {
     match v.get_type().ok()? {
         ValueType::External => external_ptr_raw(env, unsafe { v.raw() }),
@@ -606,21 +605,15 @@ fn js_value_as_ptr(env: &Env, v: &JsUnknown) -> Option<*mut c_void> {
             let b: JsBigInt = unsafe { v.cast() };
             b.get_u64().ok().map(|(u, _)| u as *mut c_void)
         }
-        ValueType::Number => {
-            let n: JsNumber = unsafe { v.cast() };
-            // v8 used `integer_value` (ToInteger: trunc toward zero, saturating, NaN→0);
-            // `f64 as i64` has identical semantics for an actual Number.
-            n.get_double().ok().map(|d| d as i64 as isize as *mut c_void)
-        }
         _ => None,
     }
 }
 
 /// Extract a native COM/handle pointer from a JS object, trying in order:
-/// 1. `handle` property — accessor function result or direct External/null/BigInt/Number.
+/// 1. `handle` property: an accessor's result, or a direct External/null/BigInt.
 /// 2. Wrapped `DeclarationFFI` (rusty_v8 kept it in internal field 0; here ns_proxy wraps
 ///    instance objects via `env.wrap`, read back with `env.unwrap`).
-/// 3. `__native_ptr` property — hex/decimal string, BigInt, Number, or External.
+/// 3. `__native_ptr` property: a BigInt or External.
 /// 4. `__handle` managed-bridge id — resolved via `Bridge.GetNativePtrForHandle`.
 pub(crate) fn try_get_external_handle(env: &Env, obj: &JsObject) -> Option<*mut c_void> {
     if let Some(handle_raw) = get_named_property_raw(env, unsafe { obj.raw() }, HANDLE_KEY) {
@@ -661,22 +654,10 @@ pub(crate) fn try_get_external_handle(env: &Env, obj: &JsObject) -> Option<*mut 
     }
 
     if let Ok(val) = obj.get_named_property::<JsUnknown>("__native_ptr") {
-        if let Ok(ValueType::String) = val.get_type() {
-            let s = js_to_rust_string(env, &val);
-            let s_trim = s.trim_start();
-            let parsed = if s_trim.starts_with("0x") || s_trim.starts_with("0X") {
-                usize::from_str_radix(&s_trim[2..], 16).ok()
-            } else {
-                s_trim.parse::<usize>().ok()
-            };
-            if let Some(u) = parsed {
-                return Some(u as *mut c_void);
+        if !matches!(val.get_type(), Ok(ValueType::Null)) {
+            if let Some(p) = js_value_as_ptr(env, &val) {
+                return Some(p);
             }
-        }
-        if let Some(p) = js_value_as_ptr(env, &val) {
-            // BigInt / Number / External forms of __native_ptr (null is not meaningful here,
-            // but the original accepted numeric zero the same way).
-            return Some(p);
         }
     }
 
@@ -1049,40 +1030,13 @@ pub fn napi_parse_query_interface(
     if vt == ValueType::Object || vt == ValueType::Function {
         let obj: JsObject = unsafe { arg.cast() };
         if let Some(pointer) = try_get_external_handle(env, &obj) {
-            if pointer.is_null() {
-                return Ok((
-                    NativeValue {
-                        pointer: std::ptr::null_mut(),
-                    },
-                    None,
-                ));
-            }
-
-            let unknown = ManuallyDrop::new(unsafe { IUnknown::from_raw(pointer) });
-            let vtable = unknown.vtable();
-            let mut queried: *mut c_void = std::ptr::null_mut();
-
-            let result = unsafe {
-                ((*vtable).QueryInterface)(
-                    unknown.as_raw(),
-                    iid,
-                    &mut queried as *mut _ as *mut *mut c_void,
-                )
-            };
-
-            if result.is_ok() && !queried.is_null() {
-                let queried = unsafe { IUnknown::from_raw(queried) };
-                let pointer = queried.as_raw() as *mut c_void;
-                return Ok((NativeValue { pointer }, Some(queried)));
-            }
-
-            return Err(type_error(
-                "Invalid FFI interface argument for expected WinRT type",
-            ));
+            return crate::value::query_interface_arg(pointer, iid);
         }
     }
 
-    Ok((napi_parse_pointer(env, arg)?, None))
+    // Boxed primitives and struct shapes are checked too: an IPropertyValue handed to a callee
+    // expecting another interface would be called through the wrong vtable.
+    crate::value::query_interface_arg(unsafe { napi_parse_pointer(env, arg)?.pointer }, iid)
 }
 
 // 
@@ -1152,6 +1106,17 @@ pub fn napi_parse_buffer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, AnyE
     Ok(value)
 }
 
+/// Whether each buffer argument still has the backing it had when parsed. Parsing a later argument
+/// can run JS (a getter, `valueOf`) that detaches, transfers or resizes an earlier buffer, and the
+/// callee would then write through a stale pointer.
+pub(crate) fn buffers_unchanged(env: &Env, buffers: &[(sys::napi_value, *mut c_void, u32)]) -> bool {
+    buffers.iter().all(|&(raw, pointer, length)| {
+        let value = unsafe { JsUnknown::from_raw_unchecked(env.raw(), raw) };
+        matches!(napi_parse_buffer_with_length(env, &value),
+            Ok((now, now_length)) if unsafe { now.pointer } == pointer && now_length == length)
+    })
+}
+
 pub fn napi_parse_buffer_with_length(
     env: &Env,
     arg: &JsUnknown,
@@ -1172,12 +1137,22 @@ pub fn napi_parse_buffer_with_length(
     ))
 }
 
-pub fn napi_parse_struct(env: &Env, arg: &JsUnknown) -> Result<NativeValue, AnyError> {
-    if let Some((pointer, _)) = buffer_data(env, arg) {
+pub fn napi_parse_struct(
+    env: &Env,
+    arg: &JsUnknown,
+    struct_size: usize,
+) -> Result<NativeValue, AnyError> {
+    if let Some((pointer, byte_length)) = buffer_data(env, arg) {
         if pointer.is_null() {
             return Err(type_error(
                 "Invalid FFI ArrayBuffer, expected data in buffer",
             ));
+        }
+        // The callee reads the whole struct, so a shorter buffer would be read past its end.
+        if byte_length < struct_size {
+            return Err(type_error(format!(
+                "Invalid FFI struct buffer: {byte_length} bytes, expected at least {struct_size}"
+            )));
         }
         return Ok(NativeValue { pointer });
     }
@@ -1438,7 +1413,7 @@ pub fn write_js_value_to_ptr(
         }
         NativeType::Struct(_) => {
             // Copy struct bytes from an ArrayBuffer/ArrayBufferView source.
-            let nv = napi_parse_struct(env, arg)?;
+            let nv = napi_parse_struct(env, arg, native_type.size())?;
             let src = unsafe { nv.pointer as *const u8 };
             let size = native_type.size();
             unsafe { copy_nonoverlapping(src, dst as *mut u8, size) };

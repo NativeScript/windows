@@ -72,10 +72,10 @@ pub fn buffer_info(env: Env, value: JsUnknown) -> napi::Result<Vec<f64>> {
     Ok(vec![unsafe { nv.pointer } as usize as f64, len as f64])
 }
 
-/// Parse `value` as a Struct arg; returns the data pointer as f64.
+/// Parse `value` as a Struct arg of `size` bytes (default 0); returns the data pointer as f64.
 #[napi]
-pub fn struct_ptr(env: Env, value: JsUnknown) -> napi::Result<f64> {
-    let nv = napi_parse_struct(&env, &value).map_err(reason)?;
+pub fn struct_ptr(env: Env, value: JsUnknown, size: Option<u32>) -> napi::Result<f64> {
+    let nv = napi_parse_struct(&env, &value, size.unwrap_or(0) as usize).map_err(reason)?;
     Ok(unsafe { nv.pointer } as usize as f64)
 }
 

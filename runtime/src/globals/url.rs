@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::ffi::c_void;
 use url::Url;
 use v8::FunctionTemplate;
 
@@ -12,12 +13,24 @@ pub(crate) fn clear_thread_url_ctor() {
     URL_CTOR.with(|c| *c.borrow_mut() = None);
 }
 
+#[repr(C)]
 struct UrlData {
+    tag: DataTag,
     url: Url,
 }
 
+/// First field of both data types, so an accessor can check which one an object carries.
+#[repr(u32)]
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DataTag {
+    Url = 0x5552_4c31,
+    SearchParams = 0x5553_5031,
+}
+
 // URLSearchParams stores pairs as a Vec to preserve insertion order and allow duplicates.
+#[repr(C)]
 struct SearchParamsData {
+    tag: DataTag,
     pairs: Vec<(String, String)>,
 }
 
@@ -27,7 +40,7 @@ impl SearchParamsData {
         let pairs = form_urlencoded::parse(s.as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        Self { pairs }
+        Self { tag: DataTag::SearchParams, pairs }
     }
 
     fn to_string_value(&self) -> String {
@@ -107,20 +120,37 @@ impl RetainAtPosition for Vec<(String, String)> {
     }
 }
 
+/// The data pointer of a URL or URLSearchParams object, or None (with a TypeError thrown) for any
+/// other receiver. Both templates have exactly one internal field; WinRT wrappers have two.
+fn tagged_data_ptr(
+    scope: &mut v8::PinScope<'_, '_>,
+    obj: v8::Local<v8::Object>,
+    tag: DataTag,
+) -> Option<*mut c_void> {
+    let ptr = (obj.internal_field_count() == 1)
+        .then(|| obj.get_internal_field(scope, 0))
+        .flatten()
+        .and_then(|field| v8::Local::<v8::External>::try_from(field).ok())
+        .map(|ext| ext.value())
+        .filter(|ptr| !ptr.is_null() && unsafe { *(*ptr as *const DataTag) } == tag);
+    if ptr.is_none() {
+        throw_type_error(scope, "Illegal invocation");
+    }
+    ptr
+}
+
 unsafe fn url_data_ptr(
     scope: &mut v8::PinScope<'_, '_>,
     obj: v8::Local<v8::Object>,
-) -> *mut UrlData {
-    let field = obj.get_internal_field(scope, 0).unwrap();
-    unsafe { field.cast::<v8::External>() }.value() as *mut UrlData
+) -> Option<*mut UrlData> {
+    tagged_data_ptr(scope, obj, DataTag::Url).map(|ptr| ptr as *mut UrlData)
 }
 
 unsafe fn sp_data_ptr(
     scope: &mut v8::PinScope<'_, '_>,
     obj: v8::Local<v8::Object>,
-) -> *mut SearchParamsData {
-    let field = obj.get_internal_field(scope, 0).unwrap();
-    unsafe { field.cast::<v8::External>() }.value() as *mut SearchParamsData
+) -> Option<*mut SearchParamsData> {
+    tagged_data_ptr(scope, obj, DataTag::SearchParams).map(|ptr| ptr as *mut SearchParamsData)
 }
 
 fn to_v8_str<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::Value> {
@@ -184,6 +214,11 @@ fn url_constructor(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    // Without `new`, `this` is the receiver, which has no internal field to hold the data.
+    if !args.is_construct_call() {
+        throw_type_error(scope, "Failed to construct 'URL': Please use the 'new' operator");
+        return;
+    }
     let Some(input) = arg_str(scope, &args, 0) else {
         throw_type_error(scope, "Failed to construct 'URL': 1 argument required");
         return;
@@ -195,7 +230,7 @@ fn url_constructor(
     };
     match parse_url(&input, base.as_deref()) {
         Ok(url) => {
-            let data = Box::into_raw(Box::new(UrlData { url }));
+            let data = Box::into_raw(Box::new(UrlData { tag: DataTag::Url, url }));
             args.this()
                 .set_internal_field(0, v8::External::new(scope, data as _).into());
         }
@@ -213,7 +248,7 @@ fn url_href_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.as_str().to_owned() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -222,7 +257,7 @@ fn url_protocol_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { whatwg_protocol(&(*d).url) };
     rv.set(to_v8_str(scope, &s));
 }
@@ -231,7 +266,7 @@ fn url_username_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.username().to_owned() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -240,7 +275,7 @@ fn url_password_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.password().unwrap_or("").to_owned() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -249,7 +284,7 @@ fn url_host_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { whatwg_host(&(*d).url) };
     rv.set(to_v8_str(scope, &s));
 }
@@ -258,7 +293,7 @@ fn url_hostname_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.host_str().unwrap_or("").to_owned() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -267,7 +302,7 @@ fn url_port_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { whatwg_port(&(*d).url) };
     rv.set(to_v8_str(scope, &s));
 }
@@ -276,7 +311,7 @@ fn url_pathname_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.path().to_owned() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -285,7 +320,7 @@ fn url_search_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { whatwg_search(&(*d).url) };
     rv.set(to_v8_str(scope, &s));
 }
@@ -294,7 +329,7 @@ fn url_hash_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { whatwg_hash(&(*d).url) };
     rv.set(to_v8_str(scope, &s));
 }
@@ -303,7 +338,7 @@ fn url_origin_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.origin().ascii_serialization() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -316,7 +351,7 @@ fn url_href_set(
     let val = arg_str(scope, &args, 0).unwrap_or_default();
     match Url::parse(&val) {
         Ok(new_url) => {
-            let d = unsafe { url_data_ptr(scope, args.this()) };
+            let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
             unsafe { (*d).url = new_url };
         }
         Err(_) => throw_type_error(
@@ -333,7 +368,7 @@ fn url_protocol_set(
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
     let scheme = val.trim_end_matches(':');
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let _ = unsafe { (*d).url.set_scheme(scheme) };
 }
 
@@ -343,7 +378,7 @@ fn url_username_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let _ = unsafe { (*d).url.set_username(&val) };
 }
 
@@ -353,7 +388,7 @@ fn url_password_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let pass = if val.is_empty() {
         None
     } else {
@@ -368,7 +403,7 @@ fn url_host_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     // val may contain "hostname:port"; set_host handles this
     let _ = unsafe {
         (*d).url
@@ -382,7 +417,7 @@ fn url_hostname_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let _ = unsafe {
         (*d).url
             .set_host(if val.is_empty() { None } else { Some(&val) })
@@ -395,7 +430,7 @@ fn url_port_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let port: Option<u16> = val.parse().ok();
     let _ = unsafe { (*d).url.set_port(port) };
 }
@@ -406,7 +441,7 @@ fn url_pathname_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     unsafe { (*d).url.set_path(&val) };
 }
 
@@ -416,7 +451,7 @@ fn url_search_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let q = val.trim_start_matches('?');
     unsafe {
         (*d).url
@@ -430,7 +465,7 @@ fn url_hash_set(
     _rv: v8::ReturnValue,
 ) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let f = val.trim_start_matches('#');
     unsafe {
         (*d).url
@@ -443,7 +478,7 @@ fn url_to_string(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { url_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { url_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).url.as_str().to_owned() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -506,6 +541,13 @@ fn sp_constructor(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw_type_error(
+            scope,
+            "Failed to construct 'URLSearchParams': Please use the 'new' operator",
+        );
+        return;
+    }
     let params = if args.length() == 0 || args.get(0).is_undefined() || args.get(0).is_null() {
         SearchParamsData::from_str("")
     } else {
@@ -518,7 +560,7 @@ fn sp_constructor(
             SearchParamsData::from_str(&s)
         } else if init.is_array() {
             let arr = v8::Local::<v8::Array>::try_from(init).unwrap();
-            let mut p = SearchParamsData { pairs: Vec::new() };
+            let mut p = SearchParamsData { tag: DataTag::SearchParams, pairs: Vec::new() };
             for i in 0..arr.length() {
                 let Some(item) = arr.get_index(scope, i) else {
                     continue;
@@ -540,7 +582,7 @@ fn sp_constructor(
             }
             p
         } else if init.is_object() {
-            let mut p = SearchParamsData { pairs: Vec::new() };
+            let mut p = SearchParamsData { tag: DataTag::SearchParams, pairs: Vec::new() };
             if let Some(json) = v8::json::stringify(scope, init) {
                 let s = json.to_rust_string_lossy(scope);
                 if let Ok(map) =
@@ -578,7 +620,7 @@ fn sp_append(
 ) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
     let v = arg_str(scope, &args, 1).unwrap_or_default();
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     unsafe { (*d).append(&k, &v) };
 }
 
@@ -588,7 +630,7 @@ fn sp_delete(
     _rv: v8::ReturnValue,
 ) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     if args.length() > 1 && !args.get(1).is_undefined() {
         let v = arg_str(scope, &args, 1).unwrap_or_default();
         unsafe { (*d).remove_pair(&k, &v) };
@@ -603,7 +645,7 @@ fn sp_get(
     mut rv: v8::ReturnValue,
 ) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     match unsafe { (*d).get(&k) } {
         Some(s) => rv.set(to_v8_str(scope, s)),
         None => rv.set(v8::null(scope).into()),
@@ -616,7 +658,7 @@ fn sp_get_all(
     mut rv: v8::ReturnValue,
 ) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let all: Vec<String> = unsafe { (*d).get_all(&k) }
         .iter()
         .map(|s| s.to_string())
@@ -635,7 +677,7 @@ fn sp_has(
     mut rv: v8::ReturnValue,
 ) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let result = if args.length() > 1 && !args.get(1).is_undefined() {
         let v = arg_str(scope, &args, 1).unwrap_or_default();
         unsafe { (*d).has_pair(&k, &v) }
@@ -652,7 +694,7 @@ fn sp_set(
 ) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
     let v = arg_str(scope, &args, 1).unwrap_or_default();
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     unsafe { (*d).set(&k, &v) };
 }
 
@@ -661,7 +703,7 @@ fn sp_sort(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     unsafe { (*d).sort() };
 }
 
@@ -670,7 +712,7 @@ fn sp_to_string(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let s = unsafe { (*d).to_string_value() };
     rv.set(to_v8_str(scope, &s));
 }
@@ -680,7 +722,7 @@ fn sp_size_get(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     rv.set_int32(unsafe { (*d).pairs.len() } as i32);
 }
 
@@ -698,7 +740,7 @@ fn sp_for_each(
     } else {
         v8::undefined(scope).into()
     };
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let entries: Vec<(String, String)> = unsafe { (*d).pairs.clone() };
     let sp = args.this();
     for (k, v) in &entries {
@@ -714,7 +756,7 @@ fn sp_keys(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let keys: Vec<String> = unsafe { (*d).pairs.iter().map(|(k, _)| k.clone()).collect() };
     let arr = v8::Array::new(scope, keys.len() as i32);
     for (i, k) in keys.iter().enumerate() {
@@ -729,7 +771,7 @@ fn sp_values(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let vals: Vec<String> = unsafe { (*d).pairs.iter().map(|(_, v)| v.clone()).collect() };
     let arr = v8::Array::new(scope, vals.len() as i32);
     for (i, val) in vals.iter().enumerate() {
@@ -744,7 +786,7 @@ fn sp_entries(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let d = unsafe { sp_data_ptr(scope, args.this()) };
+    let Some(d) = (unsafe { sp_data_ptr(scope, args.this()) }) else { return };
     let pairs: Vec<(String, String)> = unsafe { (*d).pairs.clone() };
     let arr = v8::Array::new(scope, pairs.len() as i32);
     for (i, (k, v)) in pairs.iter().enumerate() {

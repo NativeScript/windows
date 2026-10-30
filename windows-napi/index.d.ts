@@ -45,8 +45,8 @@ export declare function pointerValue(value: unknown): number
 export declare function makeExternal(addr: number): unknown
 /** Parse `value` as a Buffer arg; returns `[dataPtr, byteLength]` as f64s. */
 export declare function bufferInfo(value: unknown): Array<number>
-/** Parse `value` as a Struct arg; returns the data pointer as f64. */
-export declare function structPtr(value: unknown): number
+/** Parse `value` as a Struct arg of `size` bytes (default 0); returns the data pointer as f64. */
+export declare function structPtr(value: unknown, size?: number | undefined | null): number
 /**
  * Write `value` into a native scratch slot as `ty`, then read it back to JS — exercises
  * `write_js_value_to_ptr` + `read_value_from_ptr` (including HSTRING ownership hand-off).
