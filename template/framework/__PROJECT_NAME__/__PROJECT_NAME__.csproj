@@ -87,6 +87,9 @@
     <Content Include="app.nsbundle" Condition="Exists('app.nsbundle')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <!-- app.nsbundle's per-build key; RuntimeHost passes it to the runtime. -->
+    <EmbeddedResource Include="nsbundle.key" LogicalName="NSBundleKey"
+                      Condition="Exists('app.nsbundle') and Exists('nsbundle.key')" />
     <Content Include="app\**\*" Condition="!Exists('app.nsbundle')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
