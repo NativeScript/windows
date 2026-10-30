@@ -14,6 +14,9 @@ on:
       - '.github/workflows/windows-napi.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -28,14 +31,14 @@ jobs:
           - target: aarch64-pc-windows-msvc
     name: build ${{ matrix.settings.target }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 20
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.settings.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.settings.target }}
       - name: Install npm dependencies
@@ -52,7 +55,7 @@ jobs:
         # the authoritative run is the local one on a client SKU.
         continue-on-error: true
         run: npm test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: bindings-${{ matrix.settings.target }}
           path: windows-napi/windows.*.node
@@ -63,9 +66,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/windows-napi-v')
     needs: build
     runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
@@ -73,7 +79,7 @@ jobs:
         working-directory: windows-napi
         run: npm ci
       - name: Download all binding artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: windows-napi/artifacts
       - name: Distribute artifacts into npm/<triple> sub-packages
@@ -86,3 +92,5 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Applies to the sub-package publishes `napi prepublish` runs as well.
+          NPM_CONFIG_PROVENANCE: "true"
