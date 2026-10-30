@@ -1776,11 +1776,18 @@ napi_status napi_get_typedarray_info(napi_env env,
         JS_FreeValue(env->context, len);
     }
 
+    JSValue byteOffset = JS_GetPropertyStr(env->context, value, "byteOffset");
+    uint32_t offset = 0;
+    JS_ToUint32(env->context, &offset, byteOffset);
+    JS_FreeValue(env->context, byteOffset);
+
     if (data || arraybuffer) {
         JSValue jsArrayBuffer = JS_GetPropertyStr(env->context, value, "buffer");
         if (data) {
-            size_t bufferSize;
-            *data = JS_GetArrayBuffer(env->context, &bufferSize, jsArrayBuffer);
+            // Node-API reports the view's first byte, not the start of its buffer.
+            size_t bufferSize = 0;
+            uint8_t *base = JS_GetArrayBuffer(env->context, &bufferSize, jsArrayBuffer);
+            *data = (base != NULL && offset <= bufferSize) ? base + offset : NULL;
         }
 
         if (arraybuffer) {
@@ -1791,11 +1798,7 @@ napi_status napi_get_typedarray_info(napi_env env,
     }
 
     if (byte_offset) {
-        JSValue byteOffset = JS_GetPropertyStr(env->context, value, "byteOffset");
-        uint32_t cValue = 0;
-        JS_ToUint32(env->context, &cValue, byteOffset);
-        JS_FreeValue(env->context, byteOffset);
-        *byte_offset = cValue;
+        *byte_offset = offset;
     }
 
     return napi_clear_last_error(env);
@@ -1822,11 +1825,18 @@ napi_status napi_get_dataview_info(napi_env env,
         JS_FreeValue(env->context, byteLength);
     }
 
+    JSValue byteOffset = JS_GetPropertyStr(env->context, value, "byteOffset");
+    uint32_t offset = 0;
+    JS_ToUint32(env->context, &offset, byteOffset);
+    JS_FreeValue(env->context, byteOffset);
+
     if (data || arraybuffer) {
         JSValue jsArrayBuffer = JS_GetPropertyStr(env->context, value, "buffer");
         if (data) {
-            size_t bufferSize;
-            *data = JS_GetArrayBuffer(env->context, &bufferSize, jsArrayBuffer);
+            // Node-API reports the view's first byte, not the start of its buffer.
+            size_t bufferSize = 0;
+            uint8_t *base = JS_GetArrayBuffer(env->context, &bufferSize, jsArrayBuffer);
+            *data = (base != NULL && offset <= bufferSize) ? base + offset : NULL;
         }
 
         if (arraybuffer) {
@@ -1837,11 +1847,7 @@ napi_status napi_get_dataview_info(napi_env env,
     }
 
     if (byte_offset) {
-        JSValue byteOffset = JS_GetPropertyStr(env->context, value, "byteOffset");
-        uint32_t cValue = 0;
-        JS_ToUint32(env->context, &cValue, byteOffset);
-        JS_FreeValue(env->context, byteOffset);
-        *byte_offset = cValue;
+        *byte_offset = offset;
     }
 
     return napi_clear_last_error(env);
@@ -2216,7 +2222,8 @@ napi_status napi_get_value_string_utf16(napi_env env,
         return napi_set_last_error(env, napi_string_expected, NULL, 0, NULL);
     }
 
-    int ret = Utf8ToUtf16Length(str, strlen(str));
+    // `l` is the full length: strlen would stop at an embedded NUL.
+    int ret = Utf8ToUtf16Length(str, l);
     if (ret == -1) {
         JS_FreeCString(env->context, str);
         return napi_set_last_error(env, napi_generic_failure, NULL, 0, NULL);
@@ -2228,7 +2235,7 @@ napi_status napi_get_value_string_utf16(napi_env env,
 
     if (buf != NULL) {
         memset(buf, 0, sizeof(char16_t) * bufsize);
-        Utf8ToUtf16(str, strlen(str), buf, bufsize);
+        Utf8ToUtf16(str, l, buf, bufsize);
     }
 
     JS_FreeCString(env->context, str);
@@ -4399,9 +4406,10 @@ napi_status qjs_execute_script(napi_env env,
     CHECK_ARG(script)
 
     JSValue eval_result;
-    const char *cScript = JS_ToCString(env->context, *((JSValue *) script));
+    size_t script_len = 0;
+    const char *cScript = JS_ToCStringLen(env->context, &script_len, *((JSValue *) script));
     js_enter(env);
-    eval_result = JS_Eval(env->context, cScript, strlen(cScript), file, JS_EVAL_TYPE_GLOBAL);
+    eval_result = JS_Eval(env->context, cScript, script_len, file, JS_EVAL_TYPE_GLOBAL);
     JS_FreeCString(env->context, cScript);
     js_exit(env);
     if (JS_IsException(eval_result)) {
