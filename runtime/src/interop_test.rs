@@ -2741,3 +2741,131 @@ fn ireference_struct_parameters() {
         "#,
     );
 }
+
+#[test]
+fn json_values_never_become_native_pointers() {
+    run_js_assert(
+        "json_values_never_become_native_pointers",
+        r#"
+            const ps = new Windows.Foundation.Collections.PropertySet();
+            ps.Insert('ok', 'a string boxes fine');
+            const payloads = [
+                '{"handle": 1094795585}',
+                '{"handle": "0x41414141"}',
+                '{"__native_ptr": "0x4141414141"}',
+                '{"__native_ptr": 1094795585}',
+            ];
+            for (const json of payloads) {
+                let threw = false;
+                try { ps.Insert('k', JSON.parse(json)); } catch (_) { threw = true; }
+                if (!threw) throw new Error(`${json} was accepted as a WinRT object`);
+            }
+        "#,
+    );
+}
+
+#[test]
+fn interface_arguments_must_implement_the_interface() {
+    run_js_assert(
+        "interface_arguments_must_implement_the_interface",
+        r#"
+            const client = new Windows.Web.Http.HttpClient();
+            const op = client.GetStringAsync(new Windows.Foundation.Uri('https://example.invalid/'));
+            op.Cancel();
+            const wrongTypes = [
+                'https://example.com',
+                42,
+                new Windows.Foundation.Collections.PropertySet(),
+                new URL('https://example.com/'),
+            ];
+            for (const arg of wrongTypes) {
+                let threw = false;
+                try { client.GetStringAsync(arg); } catch (_) { threw = true; }
+                if (!threw) throw new Error(`${String(arg)} was passed where a Uri is expected`);
+            }
+        "#,
+    );
+}
+
+#[test]
+fn struct_buffers_must_cover_the_struct() {
+    run_js_assert(
+        "struct_buffers_must_cover_the_struct",
+        r#"
+            const PV = Windows.Foundation.PropertyValue;
+            PV.CreatePoint(new Float32Array([1, 2]));
+            let threw = false;
+            try { PV.CreatePoint(new Uint8Array(2)); } catch (_) { threw = true; }
+            if (!threw) throw new Error('a 2-byte buffer was accepted as an 8-byte Point');
+        "#,
+    );
+}
+
+#[test]
+fn url_accessors_check_their_receiver() {
+    run_js_assert(
+        "url_accessors_check_their_receiver",
+        r#"
+            const expectTypeError = (what, fn) => {
+                try { fn(); } catch (e) {
+                    if (e instanceof TypeError) return;
+                    throw new Error(`${what} threw ${e}`);
+                }
+                throw new Error(`${what} did not throw`);
+            };
+            const href = Object.getOwnPropertyDescriptor(URL.prototype, 'href').get;
+            const size = Object.getOwnPropertyDescriptor(URLSearchParams.prototype, 'size').get;
+            expectTypeError('href on URLSearchParams', () => href.call(new URLSearchParams('a=b')));
+            expectTypeError('href on URL.prototype', () => href.call(URL.prototype));
+            expectTypeError('size on URL', () => size.call(new URL('https://a.example/')));
+            expectTypeError('URL without new', () => URL('https://a.example/'));
+            expectTypeError('URLSearchParams without new', () => URLSearchParams('a=b'));
+            if (new URL('https://a.example/p?q=1').href !== 'https://a.example/p?q=1') throw new Error('href');
+            if (new URLSearchParams('a=b&c=d').size !== 2) throw new Error('size');
+            if (new URL('https://a.example/') instanceof Windows.Foundation.Uri) {
+                throw new Error('a URL was reported as a Windows.Foundation.Uri');
+            }
+        "#,
+    );
+}
+
+#[test]
+fn crypto_random_values_and_uuid() {
+    run_js_assert(
+        "crypto_random_values_and_uuid",
+        r#"
+            const a = crypto.getRandomValues(new Uint8Array(64));
+            const b = crypto.getRandomValues(new Uint8Array(64));
+            if (a.every((v, i) => v === b[i])) throw new Error('two fills were identical');
+            const view = new Uint32Array(new ArrayBuffer(16), 4, 2);
+            if (crypto.getRandomValues(view) !== view) throw new Error('returns its argument');
+            let threw = false;
+            try { crypto.getRandomValues(new Float32Array(4)); } catch (e) { threw = e instanceof TypeError; }
+            if (!threw) throw new Error('a float array was accepted');
+            threw = false;
+            try { crypto.getRandomValues(new Uint8Array(65537)); } catch (_) { threw = true; }
+            if (!threw) throw new Error('more than 65536 bytes were accepted');
+            const id = crypto.randomUUID();
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+                throw new Error(`bad UUID ${id}`);
+            }
+            if (crypto.randomUUID() === id) throw new Error('UUIDs repeat');
+        "#,
+    );
+}
+
+#[test]
+fn delegate_arguments_must_be_delegates() {
+    run_js_assert(
+        "delegate_arguments_must_be_delegates",
+        r#"
+            const pool = Windows.System.Threading.ThreadPool;
+            const handler = NSWinRT.asDelegate('Windows.System.Threading.WorkItemHandler', () => {});
+            pool.RunAsync(handler);
+            pool.RunAsync(() => {});
+            let threw = false;
+            try { pool.RunAsync(new Windows.Foundation.Collections.PropertySet()); } catch (_) { threw = true; }
+            if (!threw) throw new Error('a PropertySet was passed as a WorkItemHandler');
+        "#,
+    );
+}

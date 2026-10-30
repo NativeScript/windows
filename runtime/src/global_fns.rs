@@ -2090,47 +2090,9 @@ const HELPER_SOURCE: &str = concat!(r#"
                     });
                 }
 
-                try {
-                    var sec = {};
-                    try {
-                        var pkgText = globalThis.__nsReadTextFile(
-                            (globalThis.__nsAppRoot || '') + '/package.json'
-                        );
-                        sec = ((JSON.parse(pkgText) || {}).nativescript || {}).security || {};
-                    } catch (_) {}
-
-                    if (!sec.allowRemoteModules) {
-                        return Promise.reject(new Error(
-                            'Remote module imports are disabled. ' +
-                            'Set nativescript.security.allowRemoteModules=true in package.json'
-                        ));
-                    }
-
-                    var allowlist = sec.remoteModuleAllowlist;
-                    if (Array.isArray(allowlist) && allowlist.length > 0) {
-                        var isAllowed = allowlist.some(function (p) {
-                            return typeof p === 'string' && specifier.startsWith(p);
-                        });
-                        if (!isAllowed) {
-                            return Promise.reject(new Error(
-                                'Remote module URL is not in the allowlist: ' + specifier
-                            ));
-                        }
-                    }
-
-                    if (moduleCache.has(specifier)) {
-                        return Promise.resolve(moduleCache.get(specifier));
-                    }
-
-                    var uri    = new Windows.Foundation.Uri(specifier);
-                    var client = new Windows.Web.Http.HttpClient();
-
-                    return NSWinRT.toPromise(client.getStringAsync(uri)).then(function (source) {
-                        return executeRuntimeModule(String(source), specifier);
-                    });
-                } catch (e) {
-                    return Promise.reject(e instanceof Error ? e : new Error(String(e)));
-                }
+                // Remote modules go through the native ES module loader: its gate applies the app's
+                // `security` settings in release builds and re-checks where redirects lead.
+                return import(specifier);
             }
 
             globalThis.__nsInvalidateModuleCacheEntry = function (resolvedPath) {
@@ -2382,7 +2344,7 @@ const HELPER_SOURCE: &str = concat!(r#"
             globalThis.URLPattern = URLPattern;
         })();
 
-"#, include_str!("js/dotnet.js"), r#"
+"#, include_str!("js/dotnet.js"), "\n", include_str!("js/crypto.js"), r#"
 
         (function () {
             if (typeof globalThis.__nsWin32Call !== 'function') return;
@@ -4019,6 +3981,28 @@ pub(crate) fn handle_tns_uptime(
     retval.set_double(ts);
 }
 
+/// `__nsRandomFill(view)`: fills an ArrayBufferView from the OS RNG, for `crypto.getRandomValues`.
+pub(crate) fn handle_ns_random_fill(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)) else {
+        crate::throw_js_error(scope, "__nsRandomFill expects an ArrayBufferView");
+        return;
+    };
+    let length = view.byte_length();
+    let Some(data) = view.buffer(scope).and_then(|buffer| buffer.data()) else {
+        return;
+    };
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut((data.as_ptr() as *mut u8).add(view.byte_offset()), length)
+    };
+    if getrandom::getrandom(bytes).is_err() {
+        crate::throw_js_error(scope, "The OS random number generator is unavailable");
+    }
+}
+
 pub(crate) fn handle_ns_uuid(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -4401,6 +4385,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsRequestFrame", crate::animation_frames::handle_request_frame);
     register!("__tns_uptime", handle_tns_uptime);
     register!("__nsUUID", handle_ns_uuid);
+    register!("__nsRandomFill", handle_ns_random_fill);
     register!("__nsIsUiThread", handle_is_ui_thread);
     register!("__nsThreadInfo", handle_thread_info);
     register!("__nsGetLastJsError", handle_get_last_js_error);

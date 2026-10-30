@@ -123,6 +123,10 @@ pub(crate) fn take_events() -> Vec<(i32, Event)> {
     CHANNEL.with(|(_, rx)| rx.try_iter().collect())
 }
 
+/// Largest message a socket buffers, the `ws` package's default `maxPayload`: a server streaming
+/// one endless message must not exhaust memory.
+const MAX_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
+
 fn run_socket(id: i32, url: String, protocols: Vec<String>, tx: Sender<(i32, Event)>) {
     let (ws, connect) = match crate::winhttp::websocket_connect(&url, &protocols) {
         Ok(pair) => pair,
@@ -156,6 +160,13 @@ fn run_socket(id: i32, url: String, protocols: Vec<String>, tx: Sender<(i32, Eve
             let reason = windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(err)).message();
             let _ = tx.send((id, Event::Error(reason)));
             break Event::Close { code: 1006, reason: String::new(), clean: false };
+        }
+        if message.len() + read as usize > MAX_MESSAGE_BYTES {
+            unsafe {
+                let _ = WinHttpWebSocketShutdown(socket.ws.raw(), 1009, None, 0);
+            }
+            let _ = tx.send((id, Event::Error("WebSocket message exceeds 100 MiB".to_string())));
+            break Event::Close { code: 1009, reason: String::new(), clean: false };
         }
         message.extend_from_slice(&buf[..read as usize]);
         match kind {

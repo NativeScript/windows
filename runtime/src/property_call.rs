@@ -55,6 +55,14 @@ pub(crate) fn sig_size_align_pub(sig: &str) -> (usize, usize) {
     sig_size_align(sig)
 }
 
+/// ABI size in bytes of a struct declaration, or 0 when it isn't one.
+pub(crate) fn struct_declaration_size(declaration: &dyn Declaration) -> usize {
+    declaration
+        .as_any()
+        .downcast_ref::<StructDeclaration>()
+        .map_or(0, |sd| struct_size_align(sd).0)
+}
+
 /// (size, alignment) in bytes for a struct field signature. Recurses into nested structs; WinRT enums
 /// are 4-byte Int32; primitives use their native size.
 fn sig_size_align(sig: &str) -> (usize, usize) {
@@ -71,6 +79,11 @@ fn sig_size_align(sig: &str) -> (usize, usize) {
                 DeclarationKind::Enum => return (4, 4),
                 _ => {}
             }
+        }
+        // The one reference type a value struct can hold is IReference<T>, a pointer.
+        if lookup.contains("IReference") {
+            let size = std::mem::size_of::<usize>();
+            return (size, size);
         }
         return (4, 4); // unknown dotted ref in a value struct — treat as Int32-sized enum
     }
@@ -361,7 +374,7 @@ pub struct PropertyCall {
     argument_parse_types: SmallVec<[Option<NativeType>; 8]>,
     /// Scratch buffer used when a WinRT property/method returns a value type
     /// or scalar that must be written into caller-owned storage.
-    return_value_buf: [u8; 128],
+    return_value_buf: [u8; crate::helpers::RETURN_BUFFER_SIZE],
 }
 
 impl PropertyCall {
@@ -437,7 +450,7 @@ impl PropertyCall {
             interface: ManuallyDrop::new(unsafe { IUnknown::from_raw(interface_ptr) }),
             owns_interface: false,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
         }
@@ -492,7 +505,7 @@ impl PropertyCall {
             }),
             owns_interface: false,
             func: prepared.func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
         }
@@ -557,7 +570,7 @@ impl PropertyCall {
             interface: ManuallyDrop::new(queried_interface),
             owns_interface: true,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
         })
@@ -676,6 +689,9 @@ impl PropertyCall {
         let signature = method.return_type();
 
         let return_type = Signature::to_string(method.metadata()?, &signature);
+        if !crate::helpers::return_layout_supported(&return_type) {
+            return None;
+        }
 
         let other_params: usize = if is_initializer {
             if is_sealed {
@@ -702,6 +718,9 @@ impl PropertyCall {
             let metadata = parameter.metadata()?;
 
             let signature = Signature::to_string(metadata, &type_);
+            if !crate::helpers::parameter_layout_supported(&signature) {
+                return None;
+            }
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
@@ -811,7 +830,7 @@ impl PropertyCall {
             interface: ManuallyDrop::new(interface),
             owns_interface: true,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
         })
@@ -880,6 +899,9 @@ impl PropertyCall {
         let signature = method.return_type();
         let raw_return_type = Signature::to_string(method.metadata()?, &signature);
         let return_type = substitute_type_vars(&raw_return_type, &type_args);
+        if !crate::helpers::return_layout_supported(&return_type) {
+            return None;
+        }
         let return_kind = crate::classify_return(&return_type, is_void);
 
         let other_params: usize = if is_void { 1 } else { 2 };
@@ -895,6 +917,9 @@ impl PropertyCall {
             let metadata = parameter.metadata()?;
             let raw_sig = Signature::to_string(metadata, &type_);
             let signature = substitute_type_vars(&raw_sig, &type_args);
+            if !crate::helpers::parameter_layout_supported(&signature) {
+                return None;
+            }
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
@@ -992,7 +1017,7 @@ impl PropertyCall {
             interface: ManuallyDrop::new(interface),
             owns_interface: true,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
         })
@@ -1049,6 +1074,9 @@ impl PropertyCall {
         let signature = method.return_type();
         let raw_return_type = Signature::to_string(method.metadata()?, &signature);
         let return_type = substitute_type_vars(&raw_return_type, &type_args);
+        if !crate::helpers::return_layout_supported(&return_type) {
+            return None;
+        }
         let return_kind = crate::classify_return(&return_type, is_void);
 
         let other_params: usize = if is_void { 1 } else { 2 };
@@ -1064,6 +1092,9 @@ impl PropertyCall {
             let metadata = parameter.metadata()?;
             let raw_sig = Signature::to_string(metadata, &type_);
             let sig = substitute_type_vars(&raw_sig, &type_args);
+            if !crate::helpers::parameter_layout_supported(&sig) {
+                return None;
+            }
             let parse_native_type = NativeType::try_from(sig.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
             param_sigs.push(sig.clone());
@@ -1160,7 +1191,7 @@ impl PropertyCall {
             interface: ManuallyDrop::new(interface),
             owns_interface: true,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
         })
@@ -1219,6 +1250,7 @@ impl PropertyCall {
         });
         self.argument_parse_types.push(None);
 
+        let mut buffer_args = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let value = values
                 .get(i)
@@ -1313,7 +1345,8 @@ impl PropertyCall {
                         PointerPlan::Struct(declaration) => {
                             // ArrayBuffer / ArrayBufferView → raw bytes pointer
                             if value.is_array_buffer() || value.is_array_buffer_view() {
-                                ffi_parse_struct_arg(scope, value)
+                                let size = struct_declaration_size(&*declaration.read());
+                                ffi_parse_struct_arg(scope, value, size)
                             } else if value.is_object() {
                                 let obj = value.to_object(scope).unwrap();
                                 let mut sbuf: Vec<u8> = Vec::new();
@@ -1324,6 +1357,8 @@ impl PropertyCall {
                                     {
                                         append_struct_object_bytes(&mut sbuf, scope, obj, sd);
                                     }
+                                    let size = struct_declaration_size(&*lock);
+                                    sbuf.resize(sbuf.len().max(size), 0);
                                 }
                                 if sbuf.is_empty() {
                                     sbuf.push(0);
@@ -1347,13 +1382,22 @@ impl PropertyCall {
                             });
 
                             if let Some(ptr) = handle_ptr {
-                                Ok(NativeValue { pointer: ptr })
+                                match crate::js_delegate_arg(ptr, guid) {
+                                    Ok((pointer, guard)) => {
+                                        queried_interfaces.extend(guard);
+                                        Ok(pointer)
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
                                 Ok(NativeValue {
                                     pointer: crate::new_js_delegate(v8::Global::new(scope, func), *guid, delegate_param_types.clone()),
                                 })
                             } else {
-                                ffi_parse_pointer_arg(scope, value)
+                                ffi_parse_query_interface_arg(scope, value, guid).map(|(pointer, guard)| {
+                                    queried_interfaces.extend(guard);
+                                    pointer
+                                })
                             }
                         }
                         PointerPlan::Interface(iid) => {
@@ -1385,6 +1429,7 @@ impl PropertyCall {
                         Ok(value) => value,
                         Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
+                    buffer_args.push((value, unsafe { buffer_value.pointer }, byte_length));
 
                     self.argument_buf.push(NativeValue {
                         u32_value: byte_length,
@@ -1419,6 +1464,8 @@ impl PropertyCall {
                                     {
                                         append_struct_object_bytes(&mut sbuf, scope, obj, sd);
                                     }
+                                    let size = struct_declaration_size(&*lock);
+                                    sbuf.resize(sbuf.len().max(size).max(native_type.size()), 0);
                                 }
                                 if sbuf.is_empty() {
                                     sbuf.push(0);
@@ -1431,7 +1478,7 @@ impl PropertyCall {
                     }
                     match handled {
                         Some(nv) => Ok(nv),
-                        None => ffi_parse_struct_arg(scope, value),
+                        None => ffi_parse_struct_arg(scope, value, native_type.size()),
                     }
                 }
                 NativeType::String => ffi_parse_string_arg(scope, value),
@@ -1459,6 +1506,10 @@ impl PropertyCall {
                 });
                 self.argument_parse_types.push(None);
             }
+        }
+
+        if !crate::value::buffers_unchanged(scope, &buffer_args) {
+            return (call_failure(), std::ptr::null_mut(), Vec::new());
         }
 
         let prep = match crate::ffi::prepare_string_storage(
@@ -1623,6 +1674,7 @@ impl PropertyCall {
         });
         self.argument_parse_types.push(None);
 
+        let mut buffer_args = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let value = match values.get(i) {
                 Some(v) => dup_arg(env, v),
@@ -1707,9 +1759,9 @@ impl PropertyCall {
                         PointerPlan::Struct(declaration) => {
                             // ArrayBuffer/view → raw bytes; other objects → serialize
                             // field-by-field (v8 original used is_array_buffer checks).
-                            let is_buffer_like = nv::napi_parse_struct(env, &value).is_ok();
-                            if is_buffer_like {
-                                nv::napi_parse_struct(env, &value)
+                            if nv::buffer_data(env, &value).is_some() {
+                                let size = struct_declaration_size(&*declaration.read());
+                                nv::napi_parse_struct(env, &value, size)
                             } else if vt == ValueType::Object {
                                 let obj: JsObject = unsafe { value.cast() };
                                 let mut sbuf: Vec<u8> = Vec::new();
@@ -1720,6 +1772,8 @@ impl PropertyCall {
                                     {
                                         append_struct_object_bytes_napi(env, &mut sbuf, &obj, sd);
                                     }
+                                    let size = struct_declaration_size(&*lock);
+                                    sbuf.resize(sbuf.len().max(size), 0);
                                 }
                                 if sbuf.is_empty() {
                                     sbuf.push(0);
@@ -1742,7 +1796,13 @@ impl PropertyCall {
                             };
 
                             if let Some(ptr) = handle_ptr {
-                                Ok(NativeValue { pointer: ptr })
+                                match crate::napi_engine::delegate::napi_delegate_arg(ptr, guid) {
+                                    Ok((pointer, guard)) => {
+                                        queried_interfaces.extend(guard);
+                                        Ok(pointer)
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             } else if vt == ValueType::Function {
                                 let func: JsFunction = unsafe { value.cast() };
                                 match make_napi_delegate(
@@ -1752,10 +1812,16 @@ impl PropertyCall {
                                     delegate_param_types.clone(),
                                 ) {
                                     Some(ptr) => Ok(NativeValue { pointer: ptr }),
-                                    None => nv::napi_parse_pointer(env, &value),
+                                    None => nv::napi_parse_query_interface(env, &value, guid).map(|(pointer, guard)| {
+                                        queried_interfaces.extend(guard);
+                                        pointer
+                                    }),
                                 }
                             } else {
-                                nv::napi_parse_pointer(env, &value)
+                                nv::napi_parse_query_interface(env, &value, guid).map(|(pointer, guard)| {
+                                    queried_interfaces.extend(guard);
+                                    pointer
+                                })
                             }
                         }
                         PointerPlan::Interface(iid) => {
@@ -1788,6 +1854,7 @@ impl PropertyCall {
                         Ok(value) => value,
                         Err(_) => return fail3(),
                     };
+                    buffer_args.push((unsafe { napi::NapiRaw::raw(&value) }, unsafe { buffer_value.pointer }, byte_length));
                     self.argument_buf.push(NativeValue {
                         u32_value: byte_length,
                     });
@@ -1801,7 +1868,7 @@ impl PropertyCall {
                     // By-value struct: plain JS object → serialized bytes (scratch outlives
                     // the call); ArrayBuffer/view or wrapped instances → struct parse.
                     let mut handled: Option<NativeValue> = None;
-                    let is_buffer_like = nv::napi_parse_struct(env, &value).is_ok();
+                    let is_buffer_like = nv::buffer_data(env, &value).is_some();
                     if vt == ValueType::Object && !is_buffer_like {
                         let sig: &str = &self.si.param_sigs[i];
                         let lookup = crate::helpers::strip_generic_suffix(sig);
@@ -1817,6 +1884,8 @@ impl PropertyCall {
                                     {
                                         append_struct_object_bytes_napi(env, &mut sbuf, &obj, sd);
                                     }
+                                    let size = struct_declaration_size(&*lock);
+                                    sbuf.resize(sbuf.len().max(size).max(native_type.size()), 0);
                                 }
                                 if sbuf.is_empty() {
                                     sbuf.push(0);
@@ -1829,7 +1898,7 @@ impl PropertyCall {
                     }
                     match handled {
                         Some(nvv) => Ok(nvv),
-                        None => nv::napi_parse_struct(env, &value),
+                        None => nv::napi_parse_struct(env, &value, native_type.size()),
                     }
                 }
                 NativeType::String => nv::napi_parse_string(&value),
@@ -1857,6 +1926,10 @@ impl PropertyCall {
                 });
                 self.argument_parse_types.push(None);
             }
+        }
+
+        if !nv::buffers_unchanged(env, &buffer_args) {
+            return fail3();
         }
 
         let prep = match crate::ffi::prepare_string_storage(

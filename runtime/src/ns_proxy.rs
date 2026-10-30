@@ -241,17 +241,19 @@ pub(crate) fn this_instance(
 }
 
 /// The per-instance `DeclarationFFI` stored on a wrapper object. The pointee
-/// lives at least as long as the wrapper.
+/// lives at least as long as the wrapper. None for any other object: runtime
+/// wrappers have exactly two internal fields, while URL objects keep other data
+/// in their one field.
 #[inline]
 pub(crate) fn this_declaration_ffi(
     scope: &mut v8::PinScope<'_, '_>,
     this: v8::Local<v8::Object>,
 ) -> Option<*mut DeclarationFFI> {
-    if this.internal_field_count() < 1 {
+    if this.internal_field_count() != 2 {
         return None;
     }
     let field = this.get_internal_field(scope, 0)?;
-    let ext = unsafe { field.cast::<v8::External>() };
+    let ext = v8::Local::<v8::External>::try_from(field).ok()?;
     let ptr = ext.value() as *mut DeclarationFFI;
     if ptr.is_null() {
         return None;
@@ -1704,15 +1706,11 @@ fn v8_value_to_inspectable(
 
     if val.is_object() {
         if let Some(obj) = val.to_object(scope) {
-            if let Some(dec_field) = obj.get_internal_field(scope, 0) {
-                let dec_ptr =
-                    unsafe { dec_field.cast::<v8::External>() }.value() as *mut DeclarationFFI;
-                if !dec_ptr.is_null() {
-                    let wrapper = unsafe { &*dec_ptr };
-                    if let Some(inst) = &wrapper.instance {
-                        if let Ok(ins) = inst.clone().cast::<IInspectable>() {
-                            return Some(ins);
-                        }
+            if let Some(dec_ptr) = this_declaration_ffi(scope, obj) {
+                let wrapper = unsafe { &*dec_ptr };
+                if let Some(inst) = &wrapper.instance {
+                    if let Ok(ins) = inst.clone().cast::<IInspectable>() {
+                        return Some(ins);
                     }
                 }
             }

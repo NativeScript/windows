@@ -8,11 +8,11 @@ use std::sync::OnceLock;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetOption, WinHttpSetTimeouts, WinHttpWebSocketCompleteUpgrade,
+    WinHttpQueryHeaders, WinHttpQueryOption, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, WinHttpWebSocketCompleteUpgrade,
     WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_COOKIES, WINHTTP_FLAG_REFRESH,
     WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_DISABLE_FEATURE,
-    WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, WINHTTP_OPTION_URL, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_QUERY_FLAG_NUMBER,
     WINHTTP_QUERY_STATUS_CODE,
 };
 
@@ -74,6 +74,8 @@ pub(crate) struct Response {
     pub status: u32,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Where the response came from, after any redirects WinHTTP followed.
+    pub final_url: String,
 }
 
 /// Open a GET request (connected, not yet sent) for `url` with `extra_headers` (CRLF-separated).
@@ -175,12 +177,38 @@ fn content_type(request: &Handle) -> String {
     }
 }
 
+fn final_url(request: &Handle) -> String {
+    let mut len = 0u32;
+    unsafe {
+        let _ = WinHttpQueryOption(request.raw(), WINHTTP_OPTION_URL, None, &mut len);
+    }
+    let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+    if buf.is_empty() {
+        return String::new();
+    }
+    let ok = unsafe {
+        WinHttpQueryOption(
+            request.raw(),
+            WINHTTP_OPTION_URL,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut len,
+        )
+        .is_ok()
+    };
+    if !ok {
+        return String::new();
+    }
+    let chars = (len as usize / 2).min(buf.len());
+    String::from_utf16_lossy(&buf[..chars]).trim_end_matches('\0').to_string()
+}
+
 /// Blocking GET. `headers` are extra request headers, CRLF-separated.
 pub(crate) fn get(url: &str, headers: &str) -> Result<Response, String> {
     let (_connect, request) = open_get(url)?;
     send_and_receive(&request, headers)?;
     let status = status_code(&request);
     let content_type = content_type(&request);
+    let final_url = final_url(&request);
     let mut body = Vec::new();
     loop {
         let mut available = 0u32;
@@ -206,12 +234,22 @@ pub(crate) fn get(url: &str, headers: &str) -> Result<Response, String> {
             break;
         }
     }
-    Ok(Response { status, content_type, body })
+    Ok(Response { status, content_type, body, final_url })
+}
+
+/// RFC 9110 `token`: one or more visible ASCII characters other than delimiters.
+pub(crate) fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// Perform the WebSocket upgrade handshake for a `ws://`/`wss://` URL and return the socket
 /// handle (plus the connection handle, which must outlive it).
 pub(crate) fn websocket_connect(url: &str, protocols: &[String]) -> Result<(Handle, Handle), String> {
+    // Subprotocols go into a request header, so anything but an HTTP token could inject headers.
+    if let Some(bad) = protocols.iter().find(|p| !is_http_token(p)) {
+        return Err(format!("invalid WebSocket subprotocol {bad:?}"));
+    }
     let (connect, request) = open_get(url)?;
     unsafe { WinHttpSetOption(Some(request.raw()), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, None) }
         .map_err(|e| format!("WebSocket upgrade option failed: {}", e.message()))?;

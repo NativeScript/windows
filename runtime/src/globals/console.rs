@@ -441,6 +441,10 @@ pub(crate) fn write_console(value: &str) {
     if crate::is_log_to_console() || std::env::var("NS_DEBUG").is_ok() {
         crate::debug_output(value);
     }
+    // App console output can carry user data: release builds keep it out of the Event Log.
+    if !crate::esm_http::is_debug_build() {
+        return;
+    }
     let event_type: REPORT_EVENT_TYPE = if value.starts_with("[ERROR]") {
         EVENTLOG_ERROR_TYPE
     } else if value.starts_with("[WARN]") {

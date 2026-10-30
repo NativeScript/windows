@@ -259,7 +259,7 @@ pub struct MethodCall {
     func: *mut c_void,
     /// Scratch buffer used when a WinRT method returns a value type (e.g. GUID, Rect)
     /// that is larger than, or cannot be safely aliased through, a single pointer slot.
-    return_value_buf: [u8; 128],
+    return_value_buf: [u8; crate::helpers::RETURN_BUFFER_SIZE],
     /// Argument slots for the call; inline storage covers the common arities, so building a
     /// call does not allocate.
     argument_buf: SmallVec<[NativeValue; 8]>,
@@ -393,7 +393,7 @@ impl MethodCall {
             interface: ManuallyDrop::new(unsafe { IUnknown::from_raw(interface_ptr) }),
             owns_interface: false,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
             init_error: None,
@@ -462,7 +462,7 @@ impl MethodCall {
             }),
             owns_interface: false,
             func: prepared.func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
             init_error: None,
@@ -490,7 +490,7 @@ impl MethodCall {
             interface: ManuallyDrop::new(interface),
             owns_interface: true,
             func: std::ptr::null_mut(),
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
             init_error: Some(error_msg),
@@ -576,7 +576,7 @@ impl MethodCall {
                 interface: ManuallyDrop::new(queried_interface),
                 owns_interface: true,
                 func,
-                return_value_buf: [0u8; 128],
+                return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
                 argument_buf: SmallVec::new(),
                 argument_parse_types: SmallVec::new(),
                 init_error: None,
@@ -708,6 +708,16 @@ impl MethodCall {
         let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
+        if !crate::helpers::return_layout_supported(&return_type) {
+            return Self::new_init_error(
+                interface,
+                is_initializer,
+                is_sealed,
+                iid,
+                format!("Unsupported array return type: {return_type}"),
+            );
+        }
+
         for parameter in method.parameters().iter() {
             let type_ = parameter.type_();
             let Some(metadata) = parameter.metadata() else {
@@ -721,6 +731,15 @@ impl MethodCall {
             };
 
             let signature = Signature::to_string(metadata, &type_);
+            if !crate::helpers::parameter_layout_supported(&signature) {
+                return Self::new_init_error(
+                    interface,
+                    is_initializer,
+                    is_sealed,
+                    iid,
+                    format!("Unsupported array parameter type: {signature}"),
+                );
+            }
 
             let parse_native_type = match NativeType::try_from(signature.as_str()) {
                 Ok(value) => value,
@@ -877,7 +896,7 @@ impl MethodCall {
             interface: ManuallyDrop::new(queried_interface),
             owns_interface: true,
             func,
-            return_value_buf: [0u8; 128],
+            return_value_buf: [0u8; crate::helpers::RETURN_BUFFER_SIZE],
             argument_buf: SmallVec::new(),
             argument_parse_types: SmallVec::new(),
             init_error: None,
@@ -925,6 +944,7 @@ impl MethodCall {
         });
         self.argument_parse_types.push(None);
 
+        let mut buffer_args = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let parameter = &self.si.parameters[i];
             // Use the pre-computed signature string (cached at construction time) to avoid
@@ -1076,17 +1096,17 @@ impl MethodCall {
                                 {
                                     // Other structs: accept ArrayBuffer, struct instances, or plain JS objects.
                                     if value.is_array_buffer() || value.is_array_buffer_view() {
-                                        ffi_parse_struct_arg(scope, value)
+                                        let size = crate::property_call::struct_declaration_size(
+                                            &*declaration.read(),
+                                        );
+                                        ffi_parse_struct_arg(scope, value, size)
                                     } else if value.is_object() {
                                         let obj_v = value.to_object(scope).unwrap();
-                                        let has_internal = obj_v
-                                            .get_internal_field(scope, 0)
-                                            .map(|f| {
-                                                !unsafe { f.cast::<v8::External>() }
-                                                    .value()
-                                                    .is_null()
-                                            })
-                                            .unwrap_or(false);
+                                        let has_internal = (obj_v.internal_field_count() == 2)
+                                            .then(|| obj_v.get_internal_field(scope, 0))
+                                            .flatten()
+                                            .and_then(|f| v8::Local::<v8::External>::try_from(f).ok())
+                                            .is_some_and(|ext| !ext.value().is_null());
                                         if has_internal {
                                             ffi_parse_pointer_arg(scope, value)
                                         } else {
@@ -1102,6 +1122,8 @@ impl MethodCall {
                                                 {
                                                     crate::property_call::append_struct_object_bytes(&mut sbuf, scope, obj_v, sd);
                                                 }
+                                                let size = crate::property_call::struct_declaration_size(&*lock);
+                                                sbuf.resize(sbuf.len().max(size), 0);
                                             }
                                             if sbuf.is_empty() {
                                                 sbuf.push(0);
@@ -1126,7 +1148,13 @@ impl MethodCall {
                                     });
 
                                     if let Some(ptr) = handle_ptr {
-                                        Ok(NativeValue { pointer: ptr })
+                                        match crate::js_delegate_arg(ptr, guid) {
+                                            Ok((pointer, guard)) => {
+                                                queried_interfaces.extend(guard);
+                                                Ok(pointer)
+                                            }
+                                            Err(error) => Err(error),
+                                        }
                                     } else if let Ok(func) =
                                         v8::Local::<v8::Function>::try_from(value)
                                     {
@@ -1134,7 +1162,10 @@ impl MethodCall {
                                             pointer: crate::new_js_delegate(v8::Global::new(scope, func), *guid, delegate_param_types.clone()),
                                         })
                                     } else {
-                                        ffi_parse_pointer_arg(scope, value)
+                                        ffi_parse_query_interface_arg(scope, value, guid).map(|(pointer, guard)| {
+                                            queried_interfaces.extend(guard);
+                                            pointer
+                                        })
                                     }
                                 }
                         }
@@ -1145,7 +1176,7 @@ impl MethodCall {
                                     Ok(pointer)
                                 }
                                 Ok((pointer, None)) => Ok(pointer),
-                                Err(_) => ffi_parse_pointer_arg(scope, value),
+                                Err(error) => Err(error),
                             }
                         }
                         PointerPlan::Collection(plan) => {
@@ -1155,7 +1186,6 @@ impl MethodCall {
                                     Ok(pointer)
                                 }
                                 Ok((pointer, None)) => Ok(pointer),
-                                Err(_) if !value.is_array() => ffi_parse_pointer_arg(scope, value),
                                 Err(error) => Err(error),
                             }
                         }
@@ -1167,6 +1197,7 @@ impl MethodCall {
                         Ok(value) => value,
                         Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
+                    buffer_args.push((value, unsafe { buffer_value.pointer }, byte_length));
 
                     self.argument_buf.push(NativeValue {
                         u32_value: byte_length,
@@ -1177,7 +1208,7 @@ impl MethodCall {
                     continue;
                 }
                 NativeType::Function => ffi_parse_function_arg(scope, value),
-                NativeType::Struct(_) => ffi_parse_struct_arg(scope, value),
+                NativeType::Struct(_) => ffi_parse_struct_arg(scope, value, native_type.size()),
                 NativeType::String => ffi_parse_string_arg(scope, value),
             };
 
@@ -1229,6 +1260,10 @@ impl MethodCall {
                 });
                 self.argument_parse_types.push(None);
             }
+        }
+
+        if !crate::value::buffers_unchanged(scope, &buffer_args) {
+            return (call_failure(), std::ptr::null_mut(), Vec::new());
         }
 
         let prep = match crate::ffi::prepare_string_storage(
@@ -1575,6 +1610,7 @@ impl MethodCall {
         });
         self.argument_parse_types.push(None);
 
+        let mut buffer_args = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let parameter = &self.si.parameters[i];
             let param_sig = &self.si.param_sigs[i];
@@ -1706,10 +1742,11 @@ impl MethodCall {
                                 {
                                     // Other structs: ArrayBuffer bytes, wrapped struct
                                     // instances, or plain JS objects serialized field-by-field.
-                                    let is_buffer_like =
-                                        nv::napi_parse_struct(env, &value).is_ok();
-                                    if is_buffer_like {
-                                        nv::napi_parse_struct(env, &value)
+                                    if nv::buffer_data(env, &value).is_some() {
+                                        let size = crate::property_call::struct_declaration_size(
+                                            &*declaration.read(),
+                                        );
+                                        nv::napi_parse_struct(env, &value, size)
                                     } else if vt == ValueType::Object {
                                         let obj: JsObject = unsafe { value.cast() };
                                         let has_wrap =
@@ -1726,6 +1763,8 @@ impl MethodCall {
                                                 {
                                                     crate::property_call::append_struct_object_bytes_napi(env, &mut sbuf, &obj, sd);
                                                 }
+                                                let size = crate::property_call::struct_declaration_size(&*lock);
+                                                sbuf.resize(sbuf.len().max(size), 0);
                                             }
                                             if sbuf.is_empty() {
                                                 sbuf.push(0);
@@ -1752,7 +1791,13 @@ impl MethodCall {
                                     };
 
                                     if let Some(ptr) = handle_ptr {
-                                        Ok(NativeValue { pointer: ptr })
+                                        match crate::napi_engine::delegate::napi_delegate_arg(ptr, guid) {
+                                            Ok((pointer, guard)) => {
+                                                queried_interfaces.extend(guard);
+                                                Ok(pointer)
+                                            }
+                                            Err(error) => Err(error),
+                                        }
                                     } else if vt == ValueType::Function {
                                         let func: JsFunction = unsafe { value.cast() };
                                         match make_napi_delegate(
@@ -1762,10 +1807,16 @@ impl MethodCall {
                                             delegate_param_types.clone(),
                                         ) {
                                             Some(ptr) => Ok(NativeValue { pointer: ptr }),
-                                            None => nv::napi_parse_pointer(env, &value),
+                                            None => nv::napi_parse_query_interface(env, &value, guid).map(|(pointer, guard)| {
+                                                queried_interfaces.extend(guard);
+                                                pointer
+                                            }),
                                         }
                                     } else {
-                                        nv::napi_parse_pointer(env, &value)
+                                        nv::napi_parse_query_interface(env, &value, guid).map(|(pointer, guard)| {
+                                            queried_interfaces.extend(guard);
+                                            pointer
+                                        })
                                     }
                                 }
                         }
@@ -1776,7 +1827,7 @@ impl MethodCall {
                                     Ok(pointer)
                                 }
                                 Ok((pointer, None)) => Ok(pointer),
-                                Err(_) => nv::napi_parse_pointer(env, &value),
+                                Err(error) => Err(error),
                             }
                         }
                         PointerPlan::Collection(plan) => {
@@ -1786,7 +1837,7 @@ impl MethodCall {
                                     Ok(pointer)
                                 }
                                 Ok((pointer, None)) => Ok(pointer),
-                                Err(_) => nv::napi_parse_pointer(env, &value),
+                                Err(error) => Err(error),
                             }
                         }
                     }
@@ -1797,6 +1848,7 @@ impl MethodCall {
                         Ok(value) => value,
                         Err(_) => return fail3(),
                     };
+                    buffer_args.push((unsafe { napi::NapiRaw::raw(&value) }, unsafe { buffer_value.pointer }, byte_length));
                     self.argument_buf.push(NativeValue {
                         u32_value: byte_length,
                     });
@@ -1806,7 +1858,7 @@ impl MethodCall {
                     continue;
                 }
                 NativeType::Function => nv::napi_parse_function(env, &value),
-                NativeType::Struct(_) => nv::napi_parse_struct(env, &value),
+                NativeType::Struct(_) => nv::napi_parse_struct(env, &value, native_type.size()),
                 NativeType::String => nv::napi_parse_string(&value),
             };
 
@@ -1850,6 +1902,10 @@ impl MethodCall {
                 });
                 self.argument_parse_types.push(None);
             }
+        }
+
+        if !nv::buffers_unchanged(env, &buffer_args) {
+            return fail3();
         }
 
         let prep = match crate::ffi::prepare_string_storage(

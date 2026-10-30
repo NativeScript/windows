@@ -258,13 +258,27 @@ pub(crate) fn mark_keys_for_cache_bust(keys: &[String]) {
 
 /// Remote-module gate: debug hosts (`set_debug_build`) always allow; release builds need
 /// `security.allowRemoteModules` in the app's package.json, then an allowlist match
-/// (`security.remoteModuleAllowlist` URL prefixes; empty allows every URL).
+/// (`security.remoteModuleAllowlist` URLs; empty allows every URL).
 pub(crate) fn remote_url_allowed(url: &str) -> bool {
     if DEBUG_BUILD.load(std::sync::atomic::Ordering::Relaxed) || cfg!(test) {
         return true;
     }
     let (allowed, allowlist) = SECURITY.get().cloned().unwrap_or((false, Vec::new()));
-    allowed && (allowlist.is_empty() || allowlist.iter().any(|p| url.starts_with(p.as_str())))
+    allowed && (allowlist.is_empty() || allowlist.iter().any(|entry| allowlist_matches(url, entry)))
+}
+
+/// An allowlist entry admits URLs with its scheme, host and port whose path is the entry's path
+/// or lies under it, so `https://cdn.example.com` doesn't admit `https://cdn.example.com.evil`.
+pub(crate) fn allowlist_matches(url: &str, entry: &str) -> bool {
+    let (Ok(url), Ok(entry)) = (url::Url::parse(url), url::Url::parse(entry)) else {
+        return false;
+    };
+    if url.origin() != entry.origin() {
+        return false;
+    }
+    let prefix = entry.path().trim_end_matches('/');
+    let path = url.path();
+    path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('/'))
 }
 
 static SECURITY: OnceLock<(bool, Vec<String>)> = OnceLock::new();
@@ -275,6 +289,11 @@ static DEBUG_BUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// counterpart of the iOS runtime's `RuntimeConfig.IsDebug`. Set by the host before scripts run.
 pub fn set_debug_build(debug: bool) {
     DEBUG_BUILD.store(debug, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host marked itself as a debug build via [`set_debug_build`].
+pub(crate) fn is_debug_build() -> bool {
+    DEBUG_BUILD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Read the release-build security settings from the app's package.json, once.
@@ -340,6 +359,13 @@ pub(crate) fn fetch_module(url: &str, key: &str) -> Result<FetchedModule, String
     }
     let response = fetch_once(url, key).or_else(|_| fetch_once(url, key))
         .map_err(|e| format!("HTTP import failed: {url} ({e})"))?;
+    // WinHTTP follows redirects, so the gate must also admit where the response came from.
+    if !remote_url_allowed(&response.final_url) {
+        return Err(format!(
+            "HTTP import blocked: {url} redirected to {}, which is not allowed",
+            response.final_url
+        ));
+    }
     let status = response.status;
     if status == 204 || status == 205 {
         return Err(format!("HTTP import failed: {url} (status={status}, no content)"));
@@ -402,6 +428,32 @@ pub(crate) fn json_module_source(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowlist_matches_origin_and_path_boundary() {
+        let cdn = "https://cdn.example.com";
+        assert!(allowlist_matches("https://cdn.example.com/a.js", cdn));
+        assert!(allowlist_matches("https://cdn.example.com:443/a.js", cdn));
+        assert!(!allowlist_matches("https://cdn.example.com.evil.net/a.js", cdn));
+        assert!(!allowlist_matches("https://cdn.example.com@evil.net/a.js", cdn));
+        assert!(!allowlist_matches("http://cdn.example.com/a.js", cdn));
+        assert!(!allowlist_matches("https://cdn.example.com:8443/a.js", cdn));
+        let lib = "https://cdn.example.com/lib/";
+        assert!(allowlist_matches("https://cdn.example.com/lib/a.js", lib));
+        assert!(allowlist_matches("https://cdn.example.com/lib", lib));
+        assert!(!allowlist_matches("https://cdn.example.com/library.js", "https://cdn.example.com/lib"));
+        assert!(!allowlist_matches("https://cdn.example.com/lib/../evil.js", lib));
+        assert!(!allowlist_matches("", lib));
+    }
+
+    #[test]
+    fn websocket_subprotocols_must_be_tokens() {
+        assert!(crate::winhttp::is_http_token("graphql-ws"));
+        assert!(crate::winhttp::is_http_token("v1.chat"));
+        assert!(!crate::winhttp::is_http_token(""));
+        assert!(!crate::winhttp::is_http_token("a\r\nX-Injected: 1"));
+        assert!(!crate::winhttp::is_http_token("a, b"));
+    }
 
     #[test]
     fn canonical_keys_follow_the_configured_vocabulary() {

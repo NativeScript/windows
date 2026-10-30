@@ -190,6 +190,23 @@ pub unsafe fn release_delegate_raw(ptr: *mut c_void) -> u32 {
     ((*(*d).vtable).release)(d)
 }
 
+/// A `{ handle }` delegate argument: a JS delegate this runtime made passes as is, since a
+/// generic delegate's IID computed from its type name may be spelled differently from the
+/// parameter's. Anything else must implement the delegate interface `iid`.
+pub(crate) fn napi_delegate_arg(
+    ptr: *mut c_void,
+    iid: &GUID,
+) -> Result<(crate::value::NativeValue, Option<IUnknown>), crate::error::AnyError> {
+    // Every JS delegate vtable, typed ones included, shares this QueryInterface in slot 0.
+    let is_js_delegate = !ptr.is_null()
+        && unsafe { (**(ptr as *const *const NapiDelegateVtbl)).query_interface as usize }
+            == napi_delegate_query_interface as usize;
+    if is_js_delegate {
+        return Ok((crate::value::NativeValue { pointer: ptr }, None));
+    }
+    crate::value::query_interface_arg(ptr, iid)
+}
+
 unsafe extern "system" fn napi_delegate_query_interface(
     this: *mut NapiDelegate,
     iid: *const GUID,

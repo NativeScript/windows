@@ -328,12 +328,31 @@ pub fn install_interop(env: &Env) -> napi::Result<()> {
     })?;
     global.set_named_property("__nsArrayBufferFromBuffer", ab_fn)?;
 
+    let random_fn = env.create_function_from_closure("__nsRandomFill", |ctx| {
+        let value = ctx.get::<JsUnknown>(0)?;
+        let Some((data, length)) = buffer_data(&ctx.env, &value) else {
+            return Err(napi::Error::from_reason(
+                "__nsRandomFill expects an ArrayBufferView".to_string(),
+            ));
+        };
+        if length > 0 && !data.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, length) };
+            getrandom::getrandom(bytes).map_err(|_| {
+                napi::Error::from_reason("The OS random number generator is unavailable".to_string())
+            })?;
+        }
+        ctx.env.get_undefined()
+    })?;
+    global.set_named_property("__nsRandomFill", random_fn)?;
+
     let func_ctor: JsFunction = global.get_named_property("Function")?;
-    let body = env.create_string(INTEROP_HELPERS_JS)?;
-    let installer_obj = func_ctor.new_instance(&[body])?;
-    let installer: JsFunction =
-        unsafe { JsFunction::from_raw(env.raw(), installer_obj.raw()) }?;
-    installer.call_without_args(None)?;
+    for source in [INTEROP_HELPERS_JS, include_str!("../js/crypto.js")] {
+        let body = env.create_string(source)?;
+        let installer_obj = func_ctor.new_instance(&[body])?;
+        let installer: JsFunction =
+            unsafe { JsFunction::from_raw(env.raw(), installer_obj.raw()) }?;
+        installer.call_without_args(None)?;
+    }
     Ok(())
 }
 

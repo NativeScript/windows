@@ -103,6 +103,32 @@ pub fn ireference_inner_type(sig: &str) -> Option<&str> {
     rest.strip_suffix('>')
 }
 
+/// Whether the call layout can carry a parameter of this signature. The ABI passes an array as
+/// `(count, pointer)`, or pointers to both for a received (`ByRef`) array. Only byte arrays get
+/// that pair here, and any other array would shift every later argument.
+pub(crate) fn parameter_layout_supported(signature: &str) -> bool {
+    match signature.trim().strip_suffix("[]") {
+        None => true,
+        Some(element) => matches!(element, "UInt8" | "Uint8" | "Int8" | "Byte" | "SByte"),
+    }
+}
+
+/// Size of the scratch buffer a call writes its value-type return into.
+pub(crate) const RETURN_BUFFER_SIZE: usize = 128;
+
+/// Whether the call layout can carry a return of this type: an array return takes two out slots,
+/// and a value type must fit the return buffer.
+pub(crate) fn return_layout_supported(return_type: &str) -> bool {
+    let return_type = return_type.trim();
+    if return_type.ends_with("[]") {
+        return false;
+    }
+    let size = struct_native_type_for_sig(return_type)
+        .map_or(0, |t| t.size())
+        .max(crate::property_call::sig_size_align_pub(return_type).0);
+    size <= RETURN_BUFFER_SIZE
+}
+
 /// Shared mapping from WinRT signature string to FFI `NativeType`.
 /// Used by `MethodCall` and `PropertyCall` during construction.
 #[inline]

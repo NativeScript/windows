@@ -22,7 +22,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use windows::core::PCWSTR;
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LoadLibraryW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+};
 
 static DLL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
 
@@ -104,8 +106,15 @@ fn load_dll(name: &str) -> Result<usize, String> {
         return Ok(h);
     }
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // A bare name searches only the app directory and System32: the current directory and PATH
+    // can hold a planted DLL of the same name. A path loads exactly that file.
     let hmod = unsafe {
-        LoadLibraryW(PCWSTR(wide.as_ptr())).map_err(|e| format!("LoadLibraryW({name}): {e}"))?
+        if name.contains(['\\', '/']) {
+            LoadLibraryW(PCWSTR(wide.as_ptr()))
+        } else {
+            LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+        }
+        .map_err(|e| format!("LoadLibrary({name}): {e}"))?
     };
     let handle = hmod.0 as usize;
     cache.insert(name.to_string(), handle);
