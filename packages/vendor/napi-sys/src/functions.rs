@@ -782,6 +782,31 @@ pub use napi9::*;
 
 #[cfg(any(windows, feature = "dyn-symbols"))]
 pub(super) unsafe fn load_all() -> Result<libloading::Library, libloading::Error> {
+  // An embedder with no Node-API in its executable names the modules that provide it, separated
+  // by ';' and in priority order: each symbol comes from the first one that exports it. React
+  // Native for Windows has the engine half (js_native_api.h) in hermes.dll and needs the Node half
+  // (node_api.h: threadsafe functions, cleanup hooks, buffers) from the module that embeds the
+  // addon, so it sets NAPI_HOST_MODULES=<that module>;<hermes.dll>.
+  #[cfg(windows)]
+  if let Some(list) = std::env::var_os("NAPI_HOST_MODULES") {
+    let mut hosts = Vec::new();
+    for path in list.to_string_lossy().split(';').map(str::trim).filter(|p| !p.is_empty()) {
+      hosts.push(libloading::Library::from(libloading::os::windows::Library::new(path)?));
+    }
+    if !hosts.is_empty() {
+      // A symbol a library lacks keeps the value an earlier load gave it, so loading in reverse
+      // leaves each symbol from the first library that has it.
+      for host in hosts.iter().rev() {
+        load_groups(host)?;
+      }
+      let mut hosts = hosts.into_iter();
+      let first = hosts.next().unwrap();
+      // The other libraries must stay loaded for as long as their symbols are in use: for good.
+      hosts.for_each(std::mem::forget);
+      return Ok(first);
+    }
+  }
+
   #[cfg(windows)]
   let host = {
     use std::os::windows::ffi::OsStringExt;
@@ -823,24 +848,30 @@ pub(super) unsafe fn load_all() -> Result<libloading::Library, libloading::Error
   #[cfg(unix)]
   let host = libloading::os::unix::Library::this().into();
 
-  napi1::load(&host)?;
-  #[cfg(feature = "napi2")]
-  napi2::load(&host)?;
-  #[cfg(feature = "napi3")]
-  napi3::load(&host)?;
-  #[cfg(feature = "napi4")]
-  napi4::load(&host)?;
-  #[cfg(feature = "napi5")]
-  napi5::load(&host)?;
-  #[cfg(feature = "napi6")]
-  napi6::load(&host)?;
-  #[cfg(feature = "napi7")]
-  napi7::load(&host)?;
-  #[cfg(feature = "napi8")]
-  napi8::load(&host)?;
-  #[cfg(feature = "napi9")]
-  napi9::load(&host)?;
-  #[cfg(feature = "experimental")]
-  experimental::load(&host)?;
+  load_groups(&host)?;
   Ok(host)
+}
+
+#[cfg(any(windows, feature = "dyn-symbols"))]
+unsafe fn load_groups(host: &libloading::Library) -> Result<(), libloading::Error> {
+  napi1::load(host)?;
+  #[cfg(feature = "napi2")]
+  napi2::load(host)?;
+  #[cfg(feature = "napi3")]
+  napi3::load(host)?;
+  #[cfg(feature = "napi4")]
+  napi4::load(host)?;
+  #[cfg(feature = "napi5")]
+  napi5::load(host)?;
+  #[cfg(feature = "napi6")]
+  napi6::load(host)?;
+  #[cfg(feature = "napi7")]
+  napi7::load(host)?;
+  #[cfg(feature = "napi8")]
+  napi8::load(host)?;
+  #[cfg(feature = "napi9")]
+  napi9::load(host)?;
+  #[cfg(feature = "experimental")]
+  experimental::load(host)?;
+  Ok(())
 }
