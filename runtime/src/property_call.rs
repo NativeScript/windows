@@ -1239,6 +1239,7 @@ impl PropertyCall {
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // param_index (usize) replaces Option<String> — references self.param_sigs[i] directly,
@@ -1696,6 +1697,7 @@ impl PropertyCall {
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         let mut out_slots: Vec<(usize, NativeType, usize, Option<napi::JsObject>)> = Vec::new();

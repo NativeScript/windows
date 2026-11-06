@@ -931,9 +931,9 @@ pub fn napi_parse_pointer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, Any
         let s: JsString = unsafe { arg.cast() };
         let hstring = HSTRING::from_wide(&string_utf16(s)?);
         if let Ok(inspectable) = PropertyValue::CreateString(&hstring) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
@@ -944,40 +944,40 @@ pub fn napi_parse_pointer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, Any
         // need a specific IReference<T> call box_as_ireference() first.
         if n == n.trunc() && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
             if let Ok(inspectable) = PropertyValue::CreateInt32(n as i32) {
-                let ptr = inspectable.as_raw() as *mut c_void;
-                std::mem::forget(inspectable);
-                return Ok(NativeValue { pointer: ptr });
+                return Ok(NativeValue {
+                    pointer: crate::value::boxed_arg(inspectable),
+                });
             }
         } else if let Ok(inspectable) = PropertyValue::CreateDouble(n) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
     if vt == ValueType::Boolean {
         let b: JsBoolean = unsafe { arg.cast() };
         if let Ok(inspectable) = PropertyValue::CreateBoolean(b.get_value().unwrap_or(false)) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
     if vt == ValueType::Object {
         if let Some(inspectable) = box_array_arg(env, arg) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
     if vt == ValueType::Object {
         let obj: JsObject = unsafe { arg.cast() };
         if let Some(inspectable) = box_struct_shape(env, &obj) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 

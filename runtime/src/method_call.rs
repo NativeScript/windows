@@ -959,6 +959,7 @@ impl MethodCall {
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // Track out-parameter slots: (argument_buf index, parse_native_type, param_index, wrapper)
@@ -1546,6 +1547,7 @@ impl MethodCall {
         let is_void = self.si.is_void;
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1601,6 +1603,7 @@ impl MethodCall {
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1695,6 +1698,7 @@ impl MethodCall {
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // (argument_buf index, parse_native_type, param_index, out-wrapper object)

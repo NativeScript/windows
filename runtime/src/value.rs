@@ -1174,11 +1174,9 @@ pub fn ffi_parse_pointer_arg(
     if arg.is_string() {
         let hstring = hstring_from_v8_value(scope, arg);
         if let Ok(inspectable) = PropertyValue::CreateString(&hstring) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            // WinRT callees AddRef when storing; our reference is intentionally leaked
-            // here so the raw pointer stays valid through the FFI call.
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
@@ -1188,30 +1186,30 @@ pub fn ffi_parse_pointer_arg(
         // Callers that need a specific IReference<T> type call box_as_ireference() first.
         if n == n.trunc() && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
             if let Ok(inspectable) = PropertyValue::CreateInt32(n as i32) {
-                let ptr = inspectable.as_raw() as *mut c_void;
-                std::mem::forget(inspectable);
-                return Ok(NativeValue { pointer: ptr });
+                return Ok(NativeValue {
+                    pointer: crate::value::boxed_arg(inspectable),
+                });
             }
         } else if let Ok(inspectable) = PropertyValue::CreateDouble(n) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
     if arg.is_boolean() {
         let b = arg.boolean_value(scope);
         if let Ok(inspectable) = PropertyValue::CreateBoolean(b) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
     if let Some(inspectable) = box_array_arg(scope, arg) {
-        let ptr = inspectable.as_raw() as *mut c_void;
-        std::mem::forget(inspectable);
-        return Ok(NativeValue { pointer: ptr });
+        return Ok(NativeValue {
+            pointer: crate::value::boxed_arg(inspectable),
+        });
     }
 
     if let Some(inspectable) = arg
@@ -1220,9 +1218,9 @@ pub fn ffi_parse_pointer_arg(
         .flatten()
         .and_then(|obj| box_struct_shape(scope, obj))
     {
-        let ptr = inspectable.as_raw() as *mut c_void;
-        std::mem::forget(inspectable);
-        return Ok(NativeValue { pointer: ptr });
+        return Ok(NativeValue {
+            pointer: crate::value::boxed_arg(inspectable),
+        });
     }
 
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
@@ -1235,6 +1233,55 @@ pub fn ffi_parse_pointer_arg(
         ));
     };
     Ok(NativeValue { pointer })
+}
+
+thread_local! {
+    static BOXED_ARGS: std::cell::RefCell<Vec<windows::core::IInspectable>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static BOXED_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Keeps the values boxed for a call's arguments alive until the call returns. A call made
+/// while its arguments are parsed opens its own scope and releases only what it boxed.
+pub(crate) struct BoxedArgs {
+    start: usize,
+}
+
+impl BoxedArgs {
+    pub(crate) fn begin() -> Self {
+        let _ = BOXED_DEPTH.try_with(|depth| depth.set(depth.get() + 1));
+        let start = BOXED_ARGS.try_with(|boxed| boxed.borrow().len()).unwrap_or(0);
+        Self { start }
+    }
+}
+
+impl Drop for BoxedArgs {
+    fn drop(&mut self) {
+        let _ = BOXED_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+        // Released after the borrow ends, so a Release can't re-enter the list.
+        let released = BOXED_ARGS
+            .try_with(|boxed| {
+                let mut boxed = boxed.borrow_mut();
+                let start = self.start.min(boxed.len());
+                boxed.split_off(start)
+            })
+            .unwrap_or_default();
+        drop(released);
+    }
+}
+
+/// The pointer of a value boxed for an argument. Inside a call's [`BoxedArgs`] scope the
+/// reference is released when the call returns; outside one it is kept for good, since nothing
+/// bounds how long the pointer is used.
+pub(crate) fn boxed_arg(boxed: windows::core::IInspectable) -> *mut c_void {
+    let pointer = windows::core::Interface::as_raw(&boxed) as *mut c_void;
+    let in_call = BOXED_DEPTH.try_with(|depth| depth.get() > 0).unwrap_or(false);
+    if in_call {
+        let _ = BOXED_ARGS.try_with(|list| list.borrow_mut().push(boxed));
+    } else {
+        std::mem::forget(boxed);
+    }
+    pointer
 }
 
 /// `pointer` QI'd to `iid` (the guard holds the new reference), or a TypeError for an object
