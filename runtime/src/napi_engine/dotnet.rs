@@ -98,6 +98,17 @@ unsafe fn addref_native_ptr(ptr: u64) {
     ((*vtable).AddRef)(unknown.as_raw());
 }
 
+/// The COM instance of a WinRT wrapper (host object or proxy), borrowed: the wrapper keeps it
+/// alive while the bridge wraps it, and the managed wrapper takes its own reference.
+fn winrt_instance_ptr(env: &Env, obj: &JsObject) -> Option<u64> {
+    if let Ok(dec) = env.unwrap::<crate::DeclarationFFI>(obj) {
+        return dec.instance.as_ref().map(|i| i.as_raw() as u64);
+    }
+    let handle = obj.get_named_property::<JsUnknown>("handle").ok()?;
+    let ptr = crate::napi_engine::value::ptr_from_external(env, &handle)?;
+    (!ptr.is_null()).then_some(ptr as u64)
+}
+
 /// Pins `func` as a callback the bridge can invoke; returns its id.
 fn pin_js_callback(env: &Env, func: sys::napi_value) -> Option<i32> {
     let mut func_ref: sys::napi_ref = std::ptr::null_mut();
@@ -371,6 +382,12 @@ fn napi_bin_write_arg(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
                     return;
                 }
             }
+            // A WinRT object: tag 0x0A + its IUnknown (borrowed, see `winrt_instance_ptr`).
+            if let Some(ptr) = winrt_instance_ptr(env, &obj) {
+                buf.push(0x0A);
+                buf.extend_from_slice(&ptr.to_le_bytes());
+                return;
+            }
             if let Ok(pval) = obj.get_named_property::<JsUnknown>("__native_ptr") {
                 if let Ok(ValueType::BigInt) = pval.get_type() {
                     let b: JsBigInt = unsafe { pval.cast() };
@@ -455,6 +472,12 @@ fn napi_bin_write_value(env: &Env, buf: &mut Vec<u8>, arg: &JsUnknown) {
                     buf.extend_from_slice(&(n.get_double().unwrap_or(0.0) as i32).to_le_bytes());
                     return;
                 }
+            }
+            // A WinRT object: tag 0x0A + its IUnknown (borrowed, see `winrt_instance_ptr`).
+            if let Some(ptr) = winrt_instance_ptr(env, &obj) {
+                buf.push(0x0A);
+                buf.extend_from_slice(&ptr.to_le_bytes());
+                return;
             }
             if let Ok(pval) = obj.get_named_property::<JsUnknown>("__native_ptr") {
                 if let Ok(ValueType::BigInt) = pval.get_type() {
