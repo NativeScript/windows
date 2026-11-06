@@ -16,6 +16,32 @@ const winrt = require('@nativescript/windows-napi');
 
 Requires Windows (x64 or arm64) and Node >= 18 (or a Node-API-compatible runtime such as Bun or Deno).
 
+## XAML windows
+
+`XamlWindow` hosts `Windows.UI.Xaml` content (XAML Islands) in a Win32 window:
+
+```js
+const { Windows, XamlWindow } = require('@nativescript/windows-napi');
+
+const win = new XamlWindow({ style: 'dialog', owner: browserWindow.getNativeWindowHandle() });
+const button = new Windows.UI.Xaml.Controls.Button();
+button.Content = 'OK';
+button.Click = () => win.close();
+win.content = button;
+win.place({ width: 320, height: 120, over: browserWindow.getNativeWindowHandle() });
+win.show();
+```
+
+- `style`: `'dialog'` (title bar, close box) or `'popup'` (borderless, not in the taskbar or Alt+Tab).
+- Options: `owner`, `title`, `topmost`, `theme` (`'system'`, `'dark'`, `'light'`).
+- Events: `activate`, `deactivate`, `close` (title-bar X or Alt+F4; closes when unhandled), `closed`.
+- Helpers: `XamlWindow.foregroundWindow()`, `activateWindow(hwnd)`, `enableWindow(hwnd, enabled)`,
+  `windowProcessId(hwnd)`.
+
+The host executable's manifest must declare `<maxversiontested Id="10.0.18362.0"/>` or later;
+`electron.exe` does and `node.exe` doesn't, so `XamlWindow` throws in plain Node. XAML events run
+from the host's message loop, so a host with its own UI loop needs no `pumpMessages`.
+
 ## Development
 
 ```sh

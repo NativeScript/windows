@@ -113,6 +113,97 @@ const interop = globalThis.NSWinRT.interop;
 native.installDotnet();
 const dotnet = globalThis.NSWinRT.dotnet;
 
+// Windows.UI.Xaml content in a Win32 window (XAML Islands). Needs a thread that pumps messages.
+let xamlManager = null;
+
+function systemTheme() {
+  const vm = Windows.UI.ViewManagement;
+  const bg = new vm.UISettings().GetColorValue(vm.UIColorType.Background);
+  return bg.R < 128 ? 'dark' : 'light';
+}
+
+class XamlWindow {
+  /**
+   * @param {object} [options]
+   * @param {'dialog'|'popup'} [options.style] dialog: title bar and close box; popup: borderless,
+   *   not in the taskbar or Alt+Tab.
+   * @param {number|bigint|Buffer} [options.owner] owner window handle.
+   * @param {string} [options.title]
+   * @param {boolean} [options.topmost]
+   * @param {'system'|'dark'|'light'} [options.theme] title bar theme; read it back from `theme`.
+   */
+  constructor(options = {}) {
+    if (!xamlManager) {
+      try {
+        xamlManager = Windows.UI.Xaml.Hosting.WindowsXamlManager.InitializeForCurrentThread();
+      } catch (e) {
+        if (!/0x8000FFFF/i.test(String(e && e.message))) throw e;
+        throw new Error('XamlWindow: XAML Islands are unavailable in this process. The host ' +
+          'executable\'s manifest must declare <maxversiontested Id="10.0.18362.0"/> or later.');
+      }
+    }
+    const { theme = 'system', ...rest } = options;
+    this.theme = theme === 'system' ? systemTheme() : theme;
+    this.source = new Windows.UI.Xaml.Hosting.DesktopWindowXamlSource();
+    this.hwnd = native.xamlHostCreate(this.source, { ...rest, dark: this.theme === 'dark' });
+    this.closed = false;
+    this._handlers = { activate: [], deactivate: [], close: [], closed: [] };
+    native.xamlHostSetListener(this.hwnd, (type) => this._emit(type));
+  }
+
+  get content() { return this.source.Content; }
+  set content(element) { this.source.Content = element; }
+
+  get visible() { return !this.closed && native.xamlHostIsVisible(this.hwnd); }
+
+  /** `activate`, `deactivate`, `close` (title-bar X or Alt+F4; closes when unhandled), `closed`. */
+  on(type, fn) {
+    if (!this._handlers[type]) throw new TypeError(`XamlWindow: unknown event '${type}'`);
+    this._handlers[type].push(fn);
+    return this;
+  }
+
+  off(type, fn) {
+    const list = this._handlers[type];
+    if (list && list.includes(fn)) list.splice(list.indexOf(fn), 1);
+    return this;
+  }
+
+  /** Client size in DIPs; centered over `over`, or on the pointer's monitor at `y` (0..1). */
+  place({ width, height, over, y } = {}) {
+    native.xamlHostPlace(this.hwnd, { width, height, over, y });
+    return this;
+  }
+
+  /** Returns whether the window is in the foreground. */
+  show({ activate = true } = {}) { return native.xamlHostShow(this.hwnd, activate); }
+
+  hide() { if (!this.closed) native.xamlHostHide(this.hwnd); }
+
+  close() { if (!this.closed) native.xamlHostDestroy(this.hwnd); }
+
+  _emit(type) {
+    if (type === 'closed') {
+      this.closed = true;
+      try { this.source.Close(); } catch {}
+    }
+    const handlers = this._handlers[type].slice();
+    if (type === 'close' && handlers.length === 0) this.close();
+    for (const fn of handlers) {
+      // Rethrown outside the native callback so the host reports it as uncaught.
+      try { fn(); } catch (e) { setTimeout(() => { throw e; }); }
+    }
+  }
+
+  static systemTheme() { return systemTheme(); }
+  /** The foreground window of any process, as a number (0 if none). */
+  static foregroundWindow() { return native.foregroundWindow(); }
+  /** Bring a window to the foreground; `false` if Windows refuses. */
+  static activateWindow(hwnd) { return native.activateWindow(hwnd); }
+  static enableWindow(hwnd, enabled) { native.enableWindow(hwnd, enabled); }
+  static windowProcessId(hwnd) { return native.windowProcessId(hwnd); }
+}
+
 module.exports = {
   native,
   Windows,
@@ -122,4 +213,5 @@ module.exports = {
   disableAutoPump,
   interop,
   dotnet,
+  XamlWindow,
 };

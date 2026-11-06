@@ -87,6 +87,83 @@ pub fn set_window_title(env: Env, hwnd: napi::JsUnknown, title: String) -> napi:
     runtime::napi_engine::composition_window::set_window_title(&env, &hwnd, &title)
 }
 
+/// Create a hidden window hosting a `DesktopWindowXamlSource`; returns its HWND as a number.
+/// Options: `style` (`"dialog"` | `"popup"`), `owner`, `title`, `topmost`, `dark`.
+#[napi]
+pub fn xaml_host_create(
+    env: Env,
+    source: napi::JsUnknown,
+    options: Option<napi::JsObject>,
+) -> napi::Result<f64> {
+    runtime::napi_engine::xaml_host::create(&env, &source, options)
+}
+
+/// Set the listener for `"activate"`, `"deactivate"`, `"close"`, `"closed"`; `null` removes it.
+#[napi]
+pub fn xaml_host_set_listener(
+    env: Env,
+    hwnd: napi::JsUnknown,
+    listener: Option<napi::JsFunction>,
+) -> napi::Result<()> {
+    runtime::napi_engine::xaml_host::set_listener(&env, &hwnd, listener)
+}
+
+/// Size the client area in DIPs; center over `over`, or on the pointer's monitor at `y` (0..1).
+#[napi]
+pub fn xaml_host_place(
+    env: Env,
+    hwnd: napi::JsUnknown,
+    options: napi::JsObject,
+) -> napi::Result<()> {
+    runtime::napi_engine::xaml_host::place(&env, &hwnd, options)
+}
+
+/// Show the host; with `activate` it takes the foreground. Returns whether it is in front.
+#[napi]
+pub fn xaml_host_show(env: Env, hwnd: napi::JsUnknown, activate: bool) -> napi::Result<bool> {
+    runtime::napi_engine::xaml_host::show(&env, &hwnd, activate)
+}
+
+#[napi]
+pub fn xaml_host_hide(env: Env, hwnd: napi::JsUnknown) -> napi::Result<()> {
+    runtime::napi_engine::xaml_host::hide(&env, &hwnd)
+}
+
+#[napi]
+pub fn xaml_host_is_visible(env: Env, hwnd: napi::JsUnknown) -> napi::Result<bool> {
+    runtime::napi_engine::xaml_host::is_visible(&env, &hwnd)
+}
+
+/// Destroy the host window (its listener still receives `"closed"`).
+#[napi]
+pub fn xaml_host_destroy(env: Env, hwnd: napi::JsUnknown) -> napi::Result<()> {
+    runtime::napi_engine::xaml_host::destroy(&env, &hwnd)
+}
+
+/// The foreground window (any process) as a number, or 0.
+#[napi]
+pub fn foreground_window() -> f64 {
+    runtime::napi_engine::xaml_host::foreground_window()
+}
+
+/// Bring a window to the foreground; `false` when Windows refuses.
+#[napi]
+pub fn activate_window(env: Env, hwnd: napi::JsUnknown) -> napi::Result<bool> {
+    runtime::napi_engine::xaml_host::activate_window(&env, &hwnd)
+}
+
+/// Enable or disable input to a window (used to make an owner modal).
+#[napi]
+pub fn enable_window(env: Env, hwnd: napi::JsUnknown, enabled: bool) -> napi::Result<()> {
+    runtime::napi_engine::xaml_host::enable_window(&env, &hwnd, enabled)
+}
+
+/// The id of the process that owns a window, or 0.
+#[napi]
+pub fn window_process_id(env: Env, hwnd: napi::JsUnknown) -> napi::Result<u32> {
+    runtime::napi_engine::xaml_host::window_process_id(&env, &hwnd)
+}
+
 /// Whether the WinRT class `name` is sealed (metadata flag). Test hook: lets suites assert
 /// they are really covering the composable (non-sealed, null-outer) constructor path.
 #[napi]
