@@ -7,6 +7,12 @@ exclude = ["packages/common", "packages/demo", "packages/windows-quickjs", "pack
 [workspace.dependencies]
 windows = "0.62.2"
 
+# napi_* resolve from the module that provides them: the host .exe for Node, this cdylib for an
+# engine build, or the modules an embedder lists in NAPI_HOST_MODULES (React Native for Windows).
+# See packages/vendor/napi-sys/src/functions.rs (load_all).
+[patch.crates-io]
+napi-sys = { path = "packages/vendor/napi-sys" }
+
 [profile.dev]
 debug = true
 
