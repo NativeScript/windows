@@ -108,6 +108,29 @@ export declare function getWindowSize(hwnd: unknown): unknown
 /** Set the title-bar text of a `createWindow` window. */
 export declare function setWindowTitle(hwnd: unknown, title: string): void
 /**
+ * Create a hidden window hosting a `DesktopWindowXamlSource`; returns its HWND as a number.
+ * Options: `style` (`"dialog"` | `"popup"`), `owner`, `title`, `topmost`, `dark`.
+ */
+export declare function xamlHostCreate(source: unknown, options?: object | undefined | null): number
+/** Set the listener for `"activate"`, `"deactivate"`, `"close"`, `"closed"`; `null` removes it. */
+export declare function xamlHostSetListener(hwnd: unknown, listener?: (...args: any[]) => any | undefined | null): void
+/** Size the client area in DIPs; center over `over`, or on the pointer's monitor at `y` (0..1). */
+export declare function xamlHostPlace(hwnd: unknown, options: object): void
+/** Show the host; with `activate` it takes the foreground. Returns whether it is in front. */
+export declare function xamlHostShow(hwnd: unknown, activate: boolean): boolean
+export declare function xamlHostHide(hwnd: unknown): void
+export declare function xamlHostIsVisible(hwnd: unknown): boolean
+/** Destroy the host window (its listener still receives `"closed"`). */
+export declare function xamlHostDestroy(hwnd: unknown): void
+/** The foreground window (any process) as a number, or 0. */
+export declare function foregroundWindow(): number
+/** Bring a window to the foreground; `false` when Windows refuses. */
+export declare function activateWindow(hwnd: unknown): boolean
+/** Enable or disable input to a window (used to make an owner modal). */
+export declare function enableWindow(hwnd: unknown, enabled: boolean): void
+/** The id of the process that owns a window, or 0. */
+export declare function windowProcessId(hwnd: unknown): number
+/**
  * Whether the WinRT class `name` is sealed (metadata flag). Test hook: lets suites assert
  * they are really covering the composable (non-sealed, null-outer) constructor path.
  */

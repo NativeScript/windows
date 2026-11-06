@@ -26,6 +26,7 @@ pub mod timers;
 pub mod url;
 pub mod value;
 pub mod websocket;
+pub mod xaml_host;
 
 // Engine-neutral marshaling types the napi backend and standalone hosts build against.
 pub use crate::value::{NativeType, NativeValue};

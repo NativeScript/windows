@@ -14,6 +14,9 @@ use windows::core::{IUnknown, Interface, GUID};
 #[cfg(feature = "classic")]
 use windows::Foundation::PropertyValue;
 
+pub(crate) const IID_IAGILE_OBJECT: windows::core::GUID =
+    windows::core::GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90);
+
 pub(crate) const MAX_SAFE_INTEGER: isize = 9007199254740991;
 pub(crate) const MIN_SAFE_INTEGER: isize = -9007199254740991;
 

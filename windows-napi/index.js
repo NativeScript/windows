@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet } = nativeBinding
+const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, xamlHostCreate, xamlHostSetListener, xamlHostPlace, xamlHostShow, xamlHostHide, xamlHostIsVisible, xamlHostDestroy, foregroundWindow, activateWindow, enableWindow, windowProcessId, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet } = nativeBinding
 
 module.exports.formatValue = formatValue
 module.exports.tableFor = tableFor
@@ -340,6 +340,17 @@ module.exports.attachCompositorToWindow = attachCompositorToWindow
 module.exports.pollWindowEvents = pollWindowEvents
 module.exports.getWindowSize = getWindowSize
 module.exports.setWindowTitle = setWindowTitle
+module.exports.xamlHostCreate = xamlHostCreate
+module.exports.xamlHostSetListener = xamlHostSetListener
+module.exports.xamlHostPlace = xamlHostPlace
+module.exports.xamlHostShow = xamlHostShow
+module.exports.xamlHostHide = xamlHostHide
+module.exports.xamlHostIsVisible = xamlHostIsVisible
+module.exports.xamlHostDestroy = xamlHostDestroy
+module.exports.foregroundWindow = foregroundWindow
+module.exports.activateWindow = activateWindow
+module.exports.enableWindow = enableWindow
+module.exports.windowProcessId = windowProcessId
 module.exports.classIsSealed = classIsSealed
 module.exports.registerWinmd = registerWinmd
 module.exports.scanWinmdDir = scanWinmdDir
