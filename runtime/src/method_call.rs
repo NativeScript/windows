@@ -2,7 +2,7 @@ use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
 #[cfg(feature = "classic")]
 use crate::value::{
-    ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg,
+    ffi_parse_bool_arg, ffi_parse_f32_arg, ffi_parse_f64_arg,
     ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg,
     ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg,
     ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg,
@@ -932,6 +932,7 @@ impl MethodCall {
         let is_string_return = self.si.is_string_return;
 
         self.reset_args();
+        crate::error::clear_argument_error();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // Track out-parameter slots: (argument_buf index, parse_native_type, param_index, wrapper)
@@ -985,7 +986,10 @@ impl MethodCall {
                     if !init_val.is_undefined() && !init_val.is_null() {
                         match write_v8_value_to_ptr(scope, init_val, ptr, native_type) {
                             Ok(_) => {}
-                            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return (call_failure(), std::ptr::null_mut(), Vec::new());
+                            }
                         }
                     }
                 }
@@ -1192,18 +1196,35 @@ impl MethodCall {
                     }
                 }
                 NativeType::Buffer => {
-                    let parsed = ffi_parse_buffer_arg_with_length(scope, value);
-                    let (buffer_value, byte_length) = match parsed {
-                        Ok(value) => value,
-                        Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                    let element = crate::helpers::ArrayElement::of_signature(param_sig)
+                        .unwrap_or(crate::helpers::ArrayElement::U8);
+                    let array = crate::value::ffi_parse_array_arg(scope, value, element);
+                    let array = array.and_then(|array| {
+                        // A copy can't carry back what the callee writes into a fill array.
+                        if array.copy.is_some() && parameter.is_fill_array() {
+                            Err(element.fill_mismatch())
+                        } else {
+                            Ok(array)
+                        }
+                    });
+                    let array = match array {
+                        Ok(array) => array,
+                        Err(e) => {
+                            crate::error::set_argument_error(e);
+                            return (call_failure(), std::ptr::null_mut(), Vec::new());
+                        }
                     };
-                    buffer_args.push((value, unsafe { buffer_value.pointer }, byte_length));
-
+                    match array.copy {
+                        Some(bytes) => struct_scratch.push(bytes),
+                        None => buffer_args.push((value, array.pointer, array.byte_length)),
+                    }
                     self.argument_buf.push(NativeValue {
-                        u32_value: byte_length,
+                        u32_value: array.count,
                     });
                     self.argument_parse_types.push(Some(native_type.clone()));
-                    self.argument_buf.push(buffer_value);
+                    self.argument_buf.push(NativeValue {
+                        pointer: array.pointer,
+                    });
                     self.argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
@@ -1214,7 +1235,10 @@ impl MethodCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                Err(e) => {
+                    crate::error::set_argument_error(e);
+                    return (call_failure(), std::ptr::null_mut(), Vec::new());
+                }
             };
 
             self.argument_buf.push(value);
@@ -1263,6 +1287,9 @@ impl MethodCall {
         }
 
         if !crate::value::buffers_unchanged(scope, &buffer_args) {
+            crate::error::set_argument_error(
+                "An array argument was detached or resized while the arguments were read",
+            );
             return (call_failure(), std::ptr::null_mut(), Vec::new());
         }
 
@@ -1272,7 +1299,10 @@ impl MethodCall {
             &self.argument_parse_types,
         ) {
             Ok(value) => value,
-            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+            Err(e) => {
+                crate::error::set_argument_error(e);
+                return (call_failure(), std::ptr::null_mut(), Vec::new());
+            }
         };
 
         let func_to_call = self.func;
@@ -1445,6 +1475,7 @@ impl MethodCall {
 
         let is_void = self.si.is_void;
         self.reset_args();
+        crate::error::clear_argument_error();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1499,6 +1530,7 @@ impl MethodCall {
         }
 
         self.reset_args();
+        crate::error::clear_argument_error();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1591,6 +1623,7 @@ impl MethodCall {
         let is_string_return = self.si.is_string_return;
 
         self.reset_args();
+        crate::error::clear_argument_error();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // (argument_buf index, parse_native_type, param_index, out-wrapper object)
@@ -1637,7 +1670,10 @@ impl MethodCall {
                     if vt != ValueType::Undefined && vt != ValueType::Null {
                         match nv::write_js_value_to_ptr(env, &init_val, ptr, native_type) {
                             Ok(_) => {}
-                            Err(_) => return fail3(),
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return fail3();
+                            }
                         }
                     }
                 }
@@ -1834,17 +1870,37 @@ impl MethodCall {
                     }
                 }
                 NativeType::Buffer => {
-                    let parsed = nv::napi_parse_buffer_with_length(env, &value);
-                    let (buffer_value, byte_length) = match parsed {
-                        Ok(value) => value,
-                        Err(_) => return fail3(),
+                    let element = crate::helpers::ArrayElement::of_signature(param_sig)
+                        .unwrap_or(crate::helpers::ArrayElement::U8);
+                    let array = nv::napi_parse_array_arg(env, &value, element).and_then(|array| {
+                        // A copy can't carry back what the callee writes into a fill array.
+                        if array.copy.is_some() && parameter.is_fill_array() {
+                            Err(element.fill_mismatch())
+                        } else {
+                            Ok(array)
+                        }
+                    });
+                    let array = match array {
+                        Ok(array) => array,
+                        Err(e) => {
+                            crate::error::set_argument_error(e);
+                            return fail3();
+                        }
                     };
-                    buffer_args.push((unsafe { napi::NapiRaw::raw(&value) }, unsafe { buffer_value.pointer }, byte_length));
+                    match array.copy {
+                        Some(bytes) => struct_scratch.push(bytes),
+                        None => {
+                            let raw = unsafe { napi::NapiRaw::raw(&value) };
+                            buffer_args.push((raw, array.pointer, array.byte_length))
+                        }
+                    }
                     self.argument_buf.push(NativeValue {
-                        u32_value: byte_length,
+                        u32_value: array.count,
                     });
                     self.argument_parse_types.push(Some(native_type.clone()));
-                    self.argument_buf.push(buffer_value);
+                    self.argument_buf.push(NativeValue {
+                        pointer: array.pointer,
+                    });
                     self.argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
@@ -1855,7 +1911,10 @@ impl MethodCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(_) => return fail3(),
+                Err(e) => {
+                    crate::error::set_argument_error(e);
+                    return fail3();
+                }
             };
 
             self.argument_buf.push(value);
@@ -1896,6 +1955,9 @@ impl MethodCall {
         }
 
         if !nv::buffers_unchanged(env, &buffer_args) {
+            crate::error::set_argument_error(
+                "An array argument was detached or resized while the arguments were read",
+            );
             return fail3();
         }
 
@@ -1905,7 +1967,10 @@ impl MethodCall {
             &self.argument_parse_types,
         ) {
             Ok(value) => value,
-            Err(_) => return fail3(),
+            Err(e) => {
+                crate::error::set_argument_error(e);
+                return fail3();
+            }
         };
 
         let func_to_call = self.func;

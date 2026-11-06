@@ -265,6 +265,15 @@ impl GenericInstanceIdBuilder {
         };
         compute_winrt_piid(&signature)
     }
+
+    /// The IID of `IReference<D>` for the non-generic delegate type `D` whose IID is
+    /// `delegate_iid`: the interface a delegate boxed as an `Object` answers.
+    pub fn ireference_of_delegate(delegate_iid: &GUID) -> GUID {
+        compute_winrt_piid(&format!(
+            "pinterface({{61c17706-2d65-11e0-9ae8-d48564015472}};delegate({}))",
+            format_guid(delegate_iid)
+        ))
+    }
 }
 
 /// Recursively computes the canonical WinRT wire-format signature for a type
@@ -466,5 +475,26 @@ mod tests {
             "Windows.Foundation.IAsyncOperationWithProgress`2<Windows.Web.Http.HttpResponseMessage,Windows.Web.Http.HttpProgress>",
         );
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ireference_of_delegate_matches_the_os() {
+        use windows::core::Interface;
+        use windows::Foundation::DeferralCompletedHandler;
+        let names = [
+            HSTRING::from("Windows.Foundation.IReference`1"),
+            HSTRING::from("Windows.Foundation.DeferralCompletedHandler"),
+        ];
+        let elements: Vec<PCWSTR> = names.iter().map(|n| PCWSTR(n.as_ptr())).collect();
+        let locator = IRoMetaDataLocatorImpl;
+        let locator = IRoMetaDataLocator::new(&locator);
+        let mut expected = GUID::zeroed();
+        unsafe {
+            RoGetParameterizedTypeInstanceIID(&elements, &*locator, &mut expected, None).unwrap();
+        }
+        assert_eq!(
+            GenericInstanceIdBuilder::ireference_of_delegate(&DeferralCompletedHandler::IID),
+            expected,
+        );
     }
 }

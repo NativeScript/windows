@@ -3,7 +3,7 @@ use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
 use crate::method_call::{is_scalar_return_type, PointerPlan, QiCache};
 #[cfg(feature = "classic")]
 use crate::value::{
-    append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length,
+    append_struct_field_bytes, ffi_parse_bool_arg,
     ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg,
     ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg,
     ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg,
@@ -1238,6 +1238,7 @@ impl PropertyCall {
         let is_string_return = self.si.is_string_return;
 
         self.reset_args();
+        crate::error::clear_argument_error();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // param_index (usize) replaces Option<String> — references self.param_sigs[i] directly,
@@ -1287,7 +1288,10 @@ impl PropertyCall {
                     if !init_val.is_undefined() && !init_val.is_null() {
                         match write_v8_value_to_ptr(scope, init_val, ptr, native_type) {
                             Ok(_) => {}
-                            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return (call_failure(), std::ptr::null_mut(), Vec::new());
+                            }
                         }
                     }
                 }
@@ -1424,18 +1428,35 @@ impl PropertyCall {
                     }
                 }
                 NativeType::Buffer => {
-                    let parsed = ffi_parse_buffer_arg_with_length(scope, value);
-                    let (buffer_value, byte_length) = match parsed {
-                        Ok(value) => value,
-                        Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                    let element = crate::helpers::ArrayElement::of_signature(param_sig)
+                        .unwrap_or(crate::helpers::ArrayElement::U8);
+                    let array = crate::value::ffi_parse_array_arg(scope, value, element);
+                    let array = array.and_then(|array| {
+                        // A copy can't carry back what the callee writes into a fill array.
+                        if array.copy.is_some() && parameter.is_fill_array() {
+                            Err(element.fill_mismatch())
+                        } else {
+                            Ok(array)
+                        }
+                    });
+                    let array = match array {
+                        Ok(array) => array,
+                        Err(e) => {
+                            crate::error::set_argument_error(e);
+                            return (call_failure(), std::ptr::null_mut(), Vec::new());
+                        }
                     };
-                    buffer_args.push((value, unsafe { buffer_value.pointer }, byte_length));
-
+                    match array.copy {
+                        Some(bytes) => struct_scratch.push(bytes),
+                        None => buffer_args.push((value, array.pointer, array.byte_length)),
+                    }
                     self.argument_buf.push(NativeValue {
-                        u32_value: byte_length,
+                        u32_value: array.count,
                     });
                     self.argument_parse_types.push(Some(native_type.clone()));
-                    self.argument_buf.push(buffer_value);
+                    self.argument_buf.push(NativeValue {
+                        pointer: array.pointer,
+                    });
                     self.argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
@@ -1486,7 +1507,10 @@ impl PropertyCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                Err(e) => {
+                    crate::error::set_argument_error(e);
+                    return (call_failure(), std::ptr::null_mut(), Vec::new());
+                }
             };
 
             self.argument_buf.push(value);
@@ -1509,6 +1533,9 @@ impl PropertyCall {
         }
 
         if !crate::value::buffers_unchanged(scope, &buffer_args) {
+            crate::error::set_argument_error(
+                "An array argument was detached or resized while the arguments were read",
+            );
             return (call_failure(), std::ptr::null_mut(), Vec::new());
         }
 
@@ -1518,7 +1545,10 @@ impl PropertyCall {
             &self.argument_parse_types,
         ) {
             Ok(prep) => prep,
-            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+            Err(e) => {
+                crate::error::set_argument_error(e);
+                return (call_failure(), std::ptr::null_mut(), Vec::new());
+            }
         };
         let call_args =
             crate::ffi::build_call_args(&prep, &self.argument_buf, &self.si.parameter_types);
@@ -1665,6 +1695,7 @@ impl PropertyCall {
         let is_string_return = self.si.is_string_return;
 
         self.reset_args();
+        crate::error::clear_argument_error();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         let mut out_slots: Vec<(usize, NativeType, usize, Option<napi::JsObject>)> = Vec::new();
@@ -1680,7 +1711,10 @@ impl PropertyCall {
                 Some(v) => dup_arg(env, v),
                 None => match env.get_undefined() {
                     Ok(u) => unsafe { JsUnknown::from_raw_unchecked(env.raw(), u.raw()) },
-                    Err(_) => return fail3(),
+                    Err(e) => {
+                        crate::error::set_argument_error(e);
+                        return fail3();
+                    }
                 },
             };
             let vt = value.get_type().unwrap_or(ValueType::Undefined);
@@ -1714,7 +1748,10 @@ impl PropertyCall {
                     if ivt != ValueType::Undefined && ivt != ValueType::Null {
                         match nv::write_js_value_to_ptr(env, &init_val, ptr, native_type) {
                             Ok(_) => {}
-                            Err(_) => return fail3(),
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return fail3();
+                            }
                         }
                     }
                 }
@@ -1849,17 +1886,37 @@ impl PropertyCall {
                     }
                 }
                 NativeType::Buffer => {
-                    let parsed = nv::napi_parse_buffer_with_length(env, &value);
-                    let (buffer_value, byte_length) = match parsed {
-                        Ok(value) => value,
-                        Err(_) => return fail3(),
+                    let element = crate::helpers::ArrayElement::of_signature(param_sig)
+                        .unwrap_or(crate::helpers::ArrayElement::U8);
+                    let array = nv::napi_parse_array_arg(env, &value, element).and_then(|array| {
+                        // A copy can't carry back what the callee writes into a fill array.
+                        if array.copy.is_some() && parameter.is_fill_array() {
+                            Err(element.fill_mismatch())
+                        } else {
+                            Ok(array)
+                        }
+                    });
+                    let array = match array {
+                        Ok(array) => array,
+                        Err(e) => {
+                            crate::error::set_argument_error(e);
+                            return fail3();
+                        }
                     };
-                    buffer_args.push((unsafe { napi::NapiRaw::raw(&value) }, unsafe { buffer_value.pointer }, byte_length));
+                    match array.copy {
+                        Some(bytes) => struct_scratch.push(bytes),
+                        None => {
+                            let raw = unsafe { napi::NapiRaw::raw(&value) };
+                            buffer_args.push((raw, array.pointer, array.byte_length))
+                        }
+                    }
                     self.argument_buf.push(NativeValue {
-                        u32_value: byte_length,
+                        u32_value: array.count,
                     });
                     self.argument_parse_types.push(Some(native_type.clone()));
-                    self.argument_buf.push(buffer_value);
+                    self.argument_buf.push(NativeValue {
+                        pointer: array.pointer,
+                    });
                     self.argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
@@ -1906,7 +1963,10 @@ impl PropertyCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(_) => return fail3(),
+                Err(e) => {
+                    crate::error::set_argument_error(e);
+                    return fail3();
+                }
             };
 
             self.argument_buf.push(value);
@@ -1929,6 +1989,9 @@ impl PropertyCall {
         }
 
         if !nv::buffers_unchanged(env, &buffer_args) {
+            crate::error::set_argument_error(
+                "An array argument was detached or resized while the arguments were read",
+            );
             return fail3();
         }
 
@@ -1938,7 +2001,10 @@ impl PropertyCall {
             &self.argument_parse_types,
         ) {
             Ok(prep) => prep,
-            Err(_) => return fail3(),
+            Err(e) => {
+                crate::error::set_argument_error(e);
+                return fail3();
+            }
         };
         let call_args =
             crate::ffi::build_call_args(&prep, &self.argument_buf, &self.si.parameter_types);

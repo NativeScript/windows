@@ -40,6 +40,28 @@ declare global {
     ): new (...args: any[]) => Omit<TOverrides, 'interfaces' | 'init'>;
   }
 
+  interface NSWinRTArrayTypes {
+    UInt8: Uint8Array;
+    Byte: Uint8Array;
+    Boolean: Uint8Array;
+    Int8: Int8Array;
+    SByte: Int8Array;
+    UInt16: Uint16Array;
+    Char16: Uint16Array;
+    Int16: Int16Array;
+    UInt32: Uint32Array;
+    Int32: Int32Array;
+    UInt64: BigUint64Array;
+    Int64: BigInt64Array;
+    Single: Float32Array;
+    Double: Float64Array;
+  }
+
+  interface NSWinRTArray {
+    /** A zero-filled array of a primitive WinRT element type for `T[]` parameters. */
+    create<K extends keyof NSWinRTArrayTypes>(type: K, count: number): NSWinRTArrayTypes[K];
+  }
+
   interface NSWinRTPointer {
     handle: any | null;
     isNull(): boolean;
@@ -49,6 +71,7 @@ declare global {
 
   interface NSWinRTInterop {
     Pointer: { new(handle?: any | null): NSWinRTPointer };
+    Array: NSWinRTArray;
     pointer(value: any): NSWinRTPointer;
     isPointer(value: any): boolean;
     handleOf(value: any): any;

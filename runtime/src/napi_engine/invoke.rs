@@ -68,6 +68,11 @@ pub(crate) fn convert_call_result(
     result: *mut c_void,
 ) -> Result<JsUnknown, AnyError> {
     if hr.is_err() {
+        if hr == crate::error::ARGUMENT_FAILURE {
+            if let Some(message) = crate::error::take_argument_error() {
+                return Err(type_error(message));
+            }
+        }
         let detail = crate::error::format_hresult_message(hr);
         return Err(generic_error(format!("WinRT call failed: {detail}")));
     }

@@ -5,6 +5,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod class_helpers;
 mod collection_arg;
+mod delegate_box;
 mod delegate_invoke;
 pub mod esm_http;
 pub(crate) mod dotnet;
@@ -7703,13 +7704,15 @@ pub(crate) fn new_js_delegate(js_func: v8::Global<v8::Function>, guid: GUID, sig
     };
     let owner_isolate = DELEGATE_ISOLATE_PTR.with(|c| c.get());
     let data = Box::new(JsDelegateData { js_func, signature, typed, owner_isolate });
-    let delegate = Box::new(JsDelegate {
+    let delegate = Box::into_raw(Box::new(JsDelegate {
         vtable,
         ref_count: AtomicU32::new(1),
         guid,
         data: Box::into_raw(data),
-    });
-    Box::into_raw(delegate) as *mut c_void
+        boxed: crate::delegate_box::DelegateBox::new(guid),
+    }));
+    unsafe { (*delegate).boxed.set_owner(delegate as *mut c_void) };
+    delegate as *mut c_void
 }
 
 #[cfg(feature = "classic")]
@@ -7719,6 +7722,8 @@ pub(crate) struct JsDelegate {
     pub(crate) ref_count: AtomicU32,
     pub(crate) guid: GUID,
     pub(crate) data: *mut JsDelegateData,
+    /// Answers `IReference<D>` for a delegate passed as an `Object`.
+    pub(crate) boxed: crate::delegate_box::DelegateBox,
 }
 
 #[cfg(feature = "classic")]
@@ -7754,6 +7759,10 @@ unsafe extern "system" fn js_delegate_query_interface(
     // Agile: off-thread invokes run on the owner JS thread.
     if *iid == IUnknown::IID || *iid == d.guid || *iid == crate::value::IID_IAGILE_OBJECT {
         *out = this as *mut c_void;
+        js_delegate_add_ref(this);
+        HRESULT(0)
+    } else if let Some(boxed) = d.boxed.query(&*iid) {
+        *out = boxed;
         js_delegate_add_ref(this);
         HRESULT(0)
     } else {
@@ -9162,19 +9171,22 @@ mod js_delegate_tests {
         JS_DELEGATE_VTBL,
     };
     use std::ffi::c_void;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use windows::core::{IUnknown, Interface, GUID, HRESULT};
 
     /// Build a JsDelegate with a null data pointer for reference-count-only tests.
     /// Callers must ensure the delegate's ref_count never reaches 0 (which would
     /// try to free the null data pointer).
     unsafe fn make_test_delegate(guid: GUID) -> *mut JsDelegate {
-        Box::into_raw(Box::new(JsDelegate {
+        let ptr = Box::into_raw(Box::new(JsDelegate {
             vtable: &JS_DELEGATE_VTBL as *const _,
             ref_count: AtomicU32::new(1),
             guid,
             data: std::ptr::null_mut(),
-        }))
+            boxed: crate::delegate_box::DelegateBox::new(guid),
+        }));
+        (*ptr).boxed.set_owner(ptr as *mut c_void);
+        ptr
     }
 
     #[test]
@@ -9262,6 +9274,48 @@ mod js_delegate_tests {
                 "QI for unknown GUID should return E_NOINTERFACE"
             );
             assert!(out.is_null(), "out pointer should be null on E_NOINTERFACE");
+            let _ = Box::from_raw(ptr);
+        }
+    }
+
+    #[test]
+    fn js_delegate_boxes_itself_as_ireference() {
+        use windows::Foundation::{DeferralCompletedHandler, IReference};
+        let reference_iid =
+            metadata::generic_instance_id_builder::GenericInstanceIdBuilder::ireference_of_delegate(
+                &DeferralCompletedHandler::IID,
+            );
+        unsafe {
+            let ptr = make_test_delegate(DeferralCompletedHandler::IID);
+            let mut boxed: *mut c_void = std::ptr::null_mut();
+            let hr = js_delegate_query_interface(ptr, &reference_iid, &mut boxed);
+            assert_eq!(hr, HRESULT(0), "QI for IReference<D> should return S_OK");
+            assert_ne!(boxed, ptr as *mut c_void, "the box is a tear-off");
+            assert_eq!((*ptr).ref_count.load(AtomicOrdering::Relaxed), 2);
+
+            // get_Value hands back the delegate itself, AddRef'd.
+            let reference = std::mem::ManuallyDrop::new(
+                IReference::<DeferralCompletedHandler>::from_raw(boxed),
+            );
+            let mut value: *mut c_void = std::ptr::null_mut();
+            let hr = (Interface::vtable(&*reference).Value)(boxed, &mut value as *mut _ as *mut _);
+            assert_eq!(hr, HRESULT(0));
+            assert_eq!(value, ptr as *mut c_void);
+            assert_eq!((*ptr).ref_count.load(AtomicOrdering::Relaxed), 3);
+
+            // The box's IUnknown is the delegate's: COM identity holds across the tear-off.
+            let mut identity: *mut c_void = std::ptr::null_mut();
+            let unknown = std::mem::ManuallyDrop::new(IUnknown::from_raw(boxed));
+            let query = Interface::vtable(&*unknown).QueryInterface;
+            let hr = query(boxed, &IUnknown::IID, &mut identity);
+            assert_eq!(hr, HRESULT(0));
+            assert_eq!(identity, ptr as *mut c_void);
+
+            // Box release forwards to the delegate.
+            (Interface::vtable(&*unknown).Release)(boxed);
+            js_delegate_release(ptr);
+            js_delegate_release(ptr);
+            assert_eq!((*ptr).ref_count.load(AtomicOrdering::Relaxed), 1);
             let _ = Box::from_raw(ptr);
         }
     }

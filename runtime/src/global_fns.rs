@@ -1931,7 +1931,7 @@ const HELPER_SOURCE: &str = concat!(r#"
             globalThis.NSWinRT = globalThis.NSWinRT || {};
             globalThis.NSWinRT.interop = globalThis.NSWinRT.interop || globalThis.interop;
 
-"#, include_str!("js/dotnet_subclass.js"), r#"
+"#, include_str!("js/interop_array.js"), "\n", include_str!("js/dotnet_subclass.js"), r#"
 
             function asDelegate(handler) {
                 if (typeof handler === 'function') {
