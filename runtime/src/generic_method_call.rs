@@ -134,7 +134,9 @@ impl GenericMethodCall {
             let metadata = parameter.metadata().unwrap();
 
             let signature = Signature::to_string(metadata, &type_);
-            if !crate::helpers::parameter_layout_supported(&signature) {
+            if !crate::helpers::parameter_layout_supported(&signature)
+                || crate::helpers::ReferenceElement::of_signature(&signature).is_some()
+            {
                 init_error = Some(E_NOTIMPL);
             }
 

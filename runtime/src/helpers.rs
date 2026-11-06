@@ -113,7 +113,104 @@ pub(crate) fn parameter_layout_supported(signature: &str) -> bool {
     }
     match signature.strip_suffix("[]") {
         None => true,
-        Some(element) => ArrayElement::from_name(element).is_some(),
+        Some(element) => {
+            ArrayElement::from_name(element).is_some()
+                || ReferenceElement::of_signature(signature).is_some()
+        }
+    }
+}
+
+/// The element of a `String[]` or object-array parameter the caller passes or the callee fills:
+/// how a filled element converts back, and the interface each passed object is queried for.
+pub(crate) struct ReferenceElement {
+    pub(crate) kind: crate::ReturnKind,
+    pub(crate) type_name: std::sync::Arc<str>,
+    /// `None` for strings.
+    pub(crate) iid: Option<windows::core::GUID>,
+}
+
+thread_local! {
+    static REFERENCE_ELEMENTS: std::cell::RefCell<
+        ahash::AHashMap<String, Option<std::rc::Rc<ReferenceElement>>>,
+    > = std::cell::RefCell::new(ahash::AHashMap::new());
+}
+
+impl ReferenceElement {
+    /// The element of a pass or fill `T[]` signature whose `T` is a string or an object type.
+    pub(crate) fn of_signature(signature: &str) -> Option<std::rc::Rc<Self>> {
+        let signature = signature.trim();
+        if signature.starts_with("ByRef ") || !signature.ends_with("[]") {
+            return None;
+        }
+        if let Some(cached) = REFERENCE_ELEMENTS.with(|c| c.borrow().get(signature).cloned()) {
+            return cached;
+        }
+        let element = Self::resolve(&signature[..signature.len() - 2]).map(std::rc::Rc::new);
+        REFERENCE_ELEMENTS.with(|c| c.borrow_mut().insert(signature.to_string(), element.clone()));
+        element
+    }
+
+    fn resolve(element: &str) -> Option<Self> {
+        use crate::ReturnKind;
+        use metadata::declarations::class_declaration::ClassDeclaration;
+        use metadata::declarations::declaration::DeclarationKind;
+        use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+        use metadata::declarations::interface_declaration::InterfaceDeclaration;
+        use windows::core::Interface;
+        let kind = crate::classify_return(element, false);
+        let iid = match &kind {
+            ReturnKind::Primitive(NativeType::String) => None,
+            ReturnKind::DynamicObject => Some(windows::core::IInspectable::IID),
+            ReturnKind::Object { decl, .. } | ReturnKind::InterfaceObject { decl, .. } => {
+                let lock = decl.read();
+                let iid = match lock.kind() {
+                    DeclarationKind::Class => lock
+                        .as_any()
+                        .downcast_ref::<ClassDeclaration>()
+                        .and_then(|class| class.default_interface())
+                        .map(|iface| iface.id()),
+                    DeclarationKind::Interface => {
+                        lock.as_any().downcast_ref::<InterfaceDeclaration>().map(|i| i.id())
+                    }
+                    DeclarationKind::GenericInterfaceInstance => lock
+                        .as_any()
+                        .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+                        .map(|i| i.id()),
+                    _ => None,
+                };
+                Some(iid?)
+            }
+            _ => return None,
+        };
+        Some(Self { kind, type_name: std::sync::Arc::from(element), iid })
+    }
+}
+
+/// The native buffer behind a `String[]` or object-array argument: the strings or (queried)
+/// objects passed in, or zeroed slots the callee fills. Dropping it releases what it holds.
+pub(crate) enum ReferenceArray {
+    Strings(Vec<windows::core::HSTRING>),
+    Objects(Vec<Option<windows::core::IUnknown>>),
+    Fill(Vec<usize>),
+}
+
+impl ReferenceArray {
+    pub(crate) fn count(&self) -> u32 {
+        (match self {
+            Self::Strings(v) => v.len(),
+            Self::Objects(v) => v.len(),
+            Self::Fill(v) => v.len(),
+        }) as u32
+    }
+
+    /// The element buffer: `HSTRING` and `Option<IUnknown>` are pointer-sized, so each `Vec` is
+    /// the `T*` the ABI expects.
+    pub(crate) fn pointer(&mut self) -> *mut std::ffi::c_void {
+        match self {
+            Self::Strings(v) => v.as_mut_ptr() as *mut std::ffi::c_void,
+            Self::Objects(v) => v.as_mut_ptr() as *mut std::ffi::c_void,
+            Self::Fill(v) => v.as_mut_ptr() as *mut std::ffi::c_void,
+        }
     }
 }
 
@@ -470,8 +567,12 @@ pub(crate) fn ffi_native_type_from_signature(signature: &str) -> NativeType {
     let by_ref_inner = signature.strip_prefix("ByRef ").unwrap_or(signature);
 
     if let Some(element) = by_ref_inner.strip_suffix("[]") {
+        let pass_or_fill = by_ref_inner.len() == signature.len();
         return match ArrayElement::from_name(element) {
             Some(_) => NativeType::Buffer,
+            None if pass_or_fill && ReferenceElement::of_signature(signature).is_some() => {
+                NativeType::Buffer
+            }
             None => NativeType::Pointer,
         };
     }
@@ -528,7 +629,7 @@ mod array_element_tests {
         assert_eq!(ArrayElement::of_signature("ByRef Int32[]"), None);
         assert_eq!(ArrayElement::of_signature("String[]"), None);
         assert!(parameter_layout_supported("Double[]"));
-        assert!(!parameter_layout_supported("Windows.Foundation.Uri[]"));
+        assert!(!parameter_layout_supported("Var!0[]"));
     }
 
     #[test]
@@ -603,6 +704,24 @@ mod array_element_tests {
         let value: IPropertyValue = ints.cast().unwrap();
         assert_eq!(unsafe { value.Type() }.unwrap(), windows::Foundation::PropertyType::Int32Array);
         assert!(box_array(ArrayValues::Typed(TypedArrayKind::I8, vec![1])).is_none());
+    }
+
+    #[test]
+    fn string_and_object_arrays_are_reference_elements() {
+        use super::{ffi_native_type_from_signature, ReferenceElement};
+        use crate::value::NativeType;
+        use windows::core::Interface;
+        let strings = ReferenceElement::of_signature("String[]").unwrap();
+        assert!(strings.iid.is_none());
+        let objects = ReferenceElement::of_signature("Object[]").unwrap();
+        assert_eq!(objects.iid, Some(windows::core::IInspectable::IID));
+        let uris = ReferenceElement::of_signature("Windows.Foundation.Uri[]").unwrap();
+        assert_eq!(uris.iid, Some(windows::Foundation::Uri::IID));
+        assert!(ReferenceElement::of_signature("Int32[]").is_none());
+        assert!(ReferenceElement::of_signature("ByRef String[]").is_none());
+        assert!(matches!(ffi_native_type_from_signature("String[]"), NativeType::Buffer));
+        assert!(matches!(ffi_native_type_from_signature("ByRef String[]"), NativeType::Pointer));
+        assert!(parameter_layout_supported("Windows.Data.Json.IJsonValue[]"));
     }
 
     #[test]

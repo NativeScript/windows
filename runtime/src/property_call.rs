@@ -316,6 +316,8 @@ struct PropertyStaticInfo {
     /// the call's stable return buffer instead of the pointer slot.
     is_scalar_return: bool,
     is_string_return: bool,
+    /// The getter returns a `T[]`: its `(length, data)` out slots point into the return buffer.
+    is_array_return: bool,
 }
 
 /// Resolve the Pointer-parameter marshaling plans for a property/interface call's static info.
@@ -689,7 +691,9 @@ impl PropertyCall {
         let signature = method.return_type();
 
         let return_type = Signature::to_string(method.metadata()?, &signature);
-        if !crate::helpers::return_layout_supported(&return_type) {
+        let is_array_return =
+            matches!(crate::classify_return(&return_type, false), crate::ReturnKind::Array { .. });
+        if !is_array_return && !crate::helpers::return_layout_supported(&return_type) {
             return None;
         }
 
@@ -748,6 +752,9 @@ impl PropertyCall {
             parameter_types.push(NativeType::Pointer);
         } else {
             if !is_void {
+                parameter_types.push(NativeType::Pointer);
+            }
+            if is_array_return {
                 parameter_types.push(NativeType::Pointer);
             }
         }
@@ -818,6 +825,7 @@ impl PropertyCall {
             param_plans,
             is_scalar_return,
             is_string_return,
+            is_array_return,
         });
         PROPERTY_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -899,7 +907,9 @@ impl PropertyCall {
         let signature = method.return_type();
         let raw_return_type = Signature::to_string(method.metadata()?, &signature);
         let return_type = substitute_type_vars(&raw_return_type, &type_args);
-        if !crate::helpers::return_layout_supported(&return_type) {
+        let is_array_return =
+            matches!(crate::classify_return(&return_type, false), crate::ReturnKind::Array { .. });
+        if !is_array_return && !crate::helpers::return_layout_supported(&return_type) {
             return None;
         }
         let return_kind = crate::classify_return(&return_type, is_void);
@@ -941,6 +951,9 @@ impl PropertyCall {
         }
 
         if !is_void {
+            parameter_types.push(NativeType::Pointer);
+        }
+        if is_array_return {
             parameter_types.push(NativeType::Pointer);
         }
 
@@ -1005,6 +1018,7 @@ impl PropertyCall {
             param_plans,
             is_scalar_return,
             is_string_return,
+            is_array_return,
         });
         INTERFACE_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -1074,7 +1088,9 @@ impl PropertyCall {
         let signature = method.return_type();
         let raw_return_type = Signature::to_string(method.metadata()?, &signature);
         let return_type = substitute_type_vars(&raw_return_type, &type_args);
-        if !crate::helpers::return_layout_supported(&return_type) {
+        let is_array_return =
+            matches!(crate::classify_return(&return_type, false), crate::ReturnKind::Array { .. });
+        if !is_array_return && !crate::helpers::return_layout_supported(&return_type) {
             return None;
         }
         let return_kind = crate::classify_return(&return_type, is_void);
@@ -1115,6 +1131,9 @@ impl PropertyCall {
         }
 
         if !is_void {
+            parameter_types.push(NativeType::Pointer);
+        }
+        if is_array_return {
             parameter_types.push(NativeType::Pointer);
         }
 
@@ -1179,6 +1198,7 @@ impl PropertyCall {
             param_plans,
             is_scalar_return,
             is_string_return,
+            is_array_return,
         });
         INTERFACE_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -1236,6 +1256,7 @@ impl PropertyCall {
         // HSTRING out-params must also land in a stable buffer; the local
         // `result` variable goes out of scope before the caller can read it.
         let is_string_return = self.si.is_string_return;
+        let is_array_return = self.si.is_array_return;
 
         self.reset_args();
         crate::error::clear_argument_error();
@@ -1253,6 +1274,7 @@ impl PropertyCall {
         self.argument_parse_types.push(None);
 
         let mut buffer_args = Vec::new();
+        let mut reference_arrays = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let value = values
                 .get(i)
@@ -1429,6 +1451,25 @@ impl PropertyCall {
                     }
                 }
                 NativeType::Buffer => {
+                    let reference = crate::helpers::ReferenceElement::of_signature(param_sig);
+                    if let Some(element) = reference {
+                        let fill = parameter.is_fill_array();
+                        let parsed =
+                            crate::value::ffi_parse_reference_array(scope, value, &element, fill);
+                        let mut array = match parsed {
+                            Ok(array) => array,
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return (call_failure(), std::ptr::null_mut(), Vec::new());
+                            }
+                        };
+                        self.argument_buf.push(NativeValue { u32_value: array.count() });
+                        self.argument_parse_types.push(None);
+                        self.argument_buf.push(NativeValue { pointer: array.pointer() });
+                        self.argument_parse_types.push(None);
+                        reference_arrays.push((value, element, array, fill));
+                        continue;
+                    }
                     let element = crate::helpers::ArrayElement::of_signature(param_sig)
                         .unwrap_or(crate::helpers::ArrayElement::U8);
                     let array = crate::value::ffi_parse_array_arg(scope, value, element);
@@ -1521,7 +1562,17 @@ impl PropertyCall {
         let mut result: *mut c_void = std::ptr::null_mut();
 
         if !self.is_initializer && !is_void {
-            if is_value_type || is_scalar_return || is_string_return {
+            if is_array_return {
+                // (UINT32 length, T* data) land in the return buffer.
+                self.return_value_buf[..16].fill(0);
+                let base = self.return_value_buf.as_mut_ptr();
+                self.argument_buf.push(NativeValue { pointer: base as *mut c_void });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: unsafe { base.add(8) } as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            } else if is_value_type || is_scalar_return || is_string_return {
                 let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
                 self.argument_parse_types.push(None);
@@ -1581,12 +1632,17 @@ impl PropertyCall {
 
         if !self.is_initializer
             && !is_void
-            && (is_value_type || is_scalar_return || is_string_return)
+            && (is_value_type || is_scalar_return || is_string_return || is_array_return)
         {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
         // Marshal out-parameters back into V8 values using the recorded slots.
+        for (value, element, mut array, fill) in reference_arrays {
+            if fill && hr.is_ok() {
+                crate::value::ffi_write_back_reference_array(scope, value, &element, &mut array);
+            }
+        }
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
             let storage_ptr = unsafe {
@@ -1694,6 +1750,7 @@ impl PropertyCall {
         );
         let is_scalar_return = self.si.is_scalar_return;
         let is_string_return = self.si.is_string_return;
+        let is_array_return = self.si.is_array_return;
 
         self.reset_args();
         crate::error::clear_argument_error();
@@ -1708,6 +1765,7 @@ impl PropertyCall {
         self.argument_parse_types.push(None);
 
         let mut buffer_args = Vec::new();
+        let mut reference_arrays = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let value = match values.get(i) {
                 Some(v) => dup_arg(env, v),
@@ -1888,6 +1946,24 @@ impl PropertyCall {
                     }
                 }
                 NativeType::Buffer => {
+                    let reference = crate::helpers::ReferenceElement::of_signature(param_sig);
+                    if let Some(element) = reference {
+                        let fill = parameter.is_fill_array();
+                        let parsed = nv::napi_parse_reference_array(env, &value, &element, fill);
+                        let mut array = match parsed {
+                            Ok(array) => array,
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return fail3();
+                            }
+                        };
+                        self.argument_buf.push(NativeValue { u32_value: array.count() });
+                        self.argument_parse_types.push(None);
+                        self.argument_buf.push(NativeValue { pointer: array.pointer() });
+                        self.argument_parse_types.push(None);
+                        reference_arrays.push((value, element, array, fill));
+                        continue;
+                    }
                     let element = crate::helpers::ArrayElement::of_signature(param_sig)
                         .unwrap_or(crate::helpers::ArrayElement::U8);
                     let array = nv::napi_parse_array_arg(env, &value, element).and_then(|array| {
@@ -1978,7 +2054,17 @@ impl PropertyCall {
         let mut result: *mut c_void = std::ptr::null_mut();
 
         if !self.is_initializer && !is_void {
-            if is_value_type || is_scalar_return || is_string_return {
+            if is_array_return {
+                // (UINT32 length, T* data) land in the return buffer.
+                self.return_value_buf[..16].fill(0);
+                let base = self.return_value_buf.as_mut_ptr();
+                self.argument_buf.push(NativeValue { pointer: base as *mut c_void });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: unsafe { base.add(8) } as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            } else if is_value_type || is_scalar_return || is_string_return {
                 let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
                 self.argument_parse_types.push(None);
@@ -2033,7 +2119,7 @@ impl PropertyCall {
 
         if !self.is_initializer
             && !is_void
-            && (is_value_type || is_scalar_return || is_string_return)
+            && (is_value_type || is_scalar_return || is_string_return || is_array_return)
         {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
@@ -2042,6 +2128,11 @@ impl PropertyCall {
         // TODO(ns_proxy port): dotted-sig out params get typed wrappers
         // (create_struct_object_from_raw / create_ns_ctor_instance_object) once ported;
         // external fallback until then. Plain sigs keep exact v8 read parity.
+        for (value, element, mut array, fill) in reference_arrays {
+            if fill && hr.is_ok() {
+                nv::napi_write_back_reference_array(env, &value, &element, &mut array);
+            }
+        }
         let mut out_values: Vec<napi::JsUnknown> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
             let storage_ptr = unsafe {

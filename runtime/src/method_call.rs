@@ -973,6 +973,7 @@ impl MethodCall {
         self.argument_parse_types.push(None);
 
         let mut buffer_args = Vec::new();
+        let mut reference_arrays = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let parameter = &self.si.parameters[i];
             // Use the pre-computed signature string (cached at construction time) to avoid
@@ -1241,6 +1242,25 @@ impl MethodCall {
                     }
                 }
                 NativeType::Buffer => {
+                    let reference = crate::helpers::ReferenceElement::of_signature(param_sig);
+                    if let Some(element) = reference {
+                        let fill = parameter.is_fill_array();
+                        let parsed =
+                            crate::value::ffi_parse_reference_array(scope, value, &element, fill);
+                        let mut array = match parsed {
+                            Ok(array) => array,
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return (call_failure(), std::ptr::null_mut(), Vec::new());
+                            }
+                        };
+                        self.argument_buf.push(NativeValue { u32_value: array.count() });
+                        self.argument_parse_types.push(None);
+                        self.argument_buf.push(NativeValue { pointer: array.pointer() });
+                        self.argument_parse_types.push(None);
+                        reference_arrays.push((value, element, array, fill));
+                        continue;
+                    }
                     let element = crate::helpers::ArrayElement::of_signature(param_sig)
                         .unwrap_or(crate::helpers::ArrayElement::U8);
                     let array = crate::value::ffi_parse_array_arg(scope, value, element);
@@ -1438,6 +1458,11 @@ impl MethodCall {
         }
 
         // Marshal out-parameters back into V8 values using the recorded slots.
+        for (value, element, mut array, fill) in reference_arrays {
+            if fill && hr.is_ok() {
+                crate::value::ffi_write_back_reference_array(scope, value, &element, &mut array);
+            }
+        }
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
             if let Some(kind) = &self.si.received_arrays[param_idx] {
@@ -1710,6 +1735,7 @@ impl MethodCall {
         self.argument_parse_types.push(None);
 
         let mut buffer_args = Vec::new();
+        let mut reference_arrays = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let parameter = &self.si.parameters[i];
             let param_sig = &self.si.param_sigs[i];
@@ -1964,6 +1990,24 @@ impl MethodCall {
                     }
                 }
                 NativeType::Buffer => {
+                    let reference = crate::helpers::ReferenceElement::of_signature(param_sig);
+                    if let Some(element) = reference {
+                        let fill = parameter.is_fill_array();
+                        let parsed = nv::napi_parse_reference_array(env, &value, &element, fill);
+                        let mut array = match parsed {
+                            Ok(array) => array,
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return fail3();
+                            }
+                        };
+                        self.argument_buf.push(NativeValue { u32_value: array.count() });
+                        self.argument_parse_types.push(None);
+                        self.argument_buf.push(NativeValue { pointer: array.pointer() });
+                        self.argument_parse_types.push(None);
+                        reference_arrays.push((value, element, array, fill));
+                        continue;
+                    }
                     let element = crate::helpers::ArrayElement::of_signature(param_sig)
                         .unwrap_or(crate::helpers::ArrayElement::U8);
                     let array = nv::napi_parse_array_arg(env, &value, element).and_then(|array| {
@@ -2145,6 +2189,11 @@ impl MethodCall {
         // TODO(ns_proxy port): WinRT-typed out params (structs / class instances) get typed
         // wrappers once create_struct_object_from_raw / create_ns_ctor_instance_object are
         // ported; until then they surface as externals via the fallback below.
+        for (value, element, mut array, fill) in reference_arrays {
+            if fill && hr.is_ok() {
+                nv::napi_write_back_reference_array(env, &value, &element, &mut array);
+            }
+        }
         let mut out_values: Vec<napi::JsUnknown> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
             if let Some(kind) = &self.si.received_arrays[param_idx] {

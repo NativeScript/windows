@@ -1145,6 +1145,96 @@ pub fn napi_parse_buffer_with_length(
     ))
 }
 
+/// The buffer for a `String[]` or object-array argument: the strings or queried objects of a
+/// JS array, or for a fill array as many zeroed slots as the JS array is long. Null passes an
+/// empty array.
+pub(crate) fn napi_parse_reference_array(
+    env: &Env,
+    arg: &JsUnknown,
+    element: &crate::helpers::ReferenceElement,
+    fill: bool,
+) -> Result<crate::helpers::ReferenceArray, AnyError> {
+    use crate::helpers::ReferenceArray;
+    let mismatch = || {
+        type_error(format!(
+            "Expected an array or null for parameter type {}[]",
+            element.type_name
+        ))
+    };
+    let kind = value_type(arg)?;
+    if kind == ValueType::Null || kind == ValueType::Undefined {
+        return Ok(ReferenceArray::Fill(Vec::new()));
+    }
+    let mut is_array = false;
+    let status = unsafe { sys::napi_is_array(env.raw(), arg.raw(), &mut is_array) };
+    if status != sys::Status::napi_ok || !is_array {
+        return Err(mismatch());
+    }
+    let array: JsObject = unsafe { arg.cast() };
+    let length = array.get_array_length().map_err(|_| mismatch())? as usize;
+    if fill {
+        return Ok(ReferenceArray::Fill(vec![0; length]));
+    }
+    match element.iid {
+        None => {
+            let mut strings = Vec::with_capacity(length);
+            for index in 0..length {
+                let item: JsUnknown = array.get_element(index as u32).map_err(|_| mismatch())?;
+                match value_type(&item)? {
+                    ValueType::Null | ValueType::Undefined => strings.push(HSTRING::new()),
+                    ValueType::String => {
+                        let s: JsString = unsafe { item.cast() };
+                        strings.push(HSTRING::from_wide(&string_utf16(s)?));
+                    }
+                    _ => return Err(type_error(format!("Expected a string at index {index}"))),
+                }
+            }
+            Ok(ReferenceArray::Strings(strings))
+        }
+        Some(iid) => {
+            let mut objects = Vec::with_capacity(length);
+            for index in 0..length {
+                let item: JsUnknown = array.get_element(index as u32).map_err(|_| mismatch())?;
+                let (_, queried) = napi_parse_query_interface(env, &item, &iid)?;
+                objects.push(queried);
+            }
+            Ok(ReferenceArray::Objects(objects))
+        }
+    }
+}
+
+/// Writes what the callee put in a fill array's slots back into the JS array it came from.
+/// Each slot's string or object reference moves to its JS value.
+pub(crate) fn napi_write_back_reference_array(
+    env: &Env,
+    arg: &JsUnknown,
+    element: &crate::helpers::ReferenceElement,
+    array: &mut crate::helpers::ReferenceArray,
+) {
+    let crate::helpers::ReferenceArray::Fill(slots) = array else {
+        return;
+    };
+    let mut target: JsObject = unsafe { arg.cast() };
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let item = match element.iid {
+            None => slot as *mut usize as *mut c_void,
+            Some(_) => *slot as *mut c_void,
+        };
+        let converted = crate::napi_engine::invoke::convert_call_result(
+            env,
+            &element.kind,
+            false,
+            &element.type_name,
+            windows::core::HRESULT(0),
+            item,
+        );
+        *slot = 0;
+        if let Ok(value) = converted {
+            let _ = target.set_element(index as u32, value);
+        }
+    }
+}
+
 /// A typed array of `element` holding a copy of `bytes`.
 pub(crate) fn typed_array_from_bytes(
     env: &Env,

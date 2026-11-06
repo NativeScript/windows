@@ -146,8 +146,11 @@ impl TryFrom<&str> for NativeType {
         // Arrays of primitives travel as (count, pointer) over JS memory; other arrays are
         // opaque pointers.
         if let Some(element) = by_ref_inner.strip_suffix("[]") {
+            let pass_or_fill = by_ref_inner.len() == signature.len();
+            let reference = || crate::helpers::ReferenceElement::of_signature(signature).is_some();
             return Ok(match crate::helpers::ArrayElement::from_name(element) {
                 Some(_) => NativeType::Buffer,
+                None if pass_or_fill && reference() => NativeType::Buffer,
                 None => NativeType::Pointer,
             });
         }
@@ -1386,6 +1389,84 @@ pub fn ffi_parse_buffer_arg_with_length(
         ));
     };
     Ok((NativeValue { pointer }, byte_length))
+}
+
+/// The buffer for a `String[]` or object-array argument: the strings or queried objects of a
+/// JS array, or for a fill array as many zeroed slots as the JS array is long. Null passes an
+/// empty array.
+#[cfg(feature = "classic")]
+pub(crate) fn ffi_parse_reference_array(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    element: &crate::helpers::ReferenceElement,
+    fill: bool,
+) -> std::result::Result<crate::helpers::ReferenceArray, AnyError> {
+    use crate::helpers::ReferenceArray;
+    let mismatch = || {
+        type_error(format!(
+            "Expected an array or null for parameter type {}[]",
+            element.type_name
+        ))
+    };
+    if arg.is_null_or_undefined() {
+        return Ok(ReferenceArray::Fill(Vec::new()));
+    }
+    let array = v8::Local::<v8::Array>::try_from(arg).map_err(|_| mismatch())?;
+    let length = array.length() as usize;
+    if fill {
+        return Ok(ReferenceArray::Fill(vec![0; length]));
+    }
+    match element.iid {
+        None => {
+            let mut strings = Vec::with_capacity(length);
+            for index in 0..length {
+                let item = array.get_index(scope, index as u32).ok_or_else(mismatch)?;
+                if item.is_null_or_undefined() {
+                    strings.push(HSTRING::new());
+                } else if item.is_string() {
+                    strings.push(hstring_from_v8_value(scope, item));
+                } else {
+                    return Err(type_error(format!("Expected a string at index {index}")));
+                }
+            }
+            Ok(ReferenceArray::Strings(strings))
+        }
+        Some(iid) => {
+            let mut objects = Vec::with_capacity(length);
+            for index in 0..length {
+                let item = array.get_index(scope, index as u32).ok_or_else(mismatch)?;
+                let (_, queried) = ffi_parse_query_interface_arg(scope, item, &iid)?;
+                objects.push(queried);
+            }
+            Ok(ReferenceArray::Objects(objects))
+        }
+    }
+}
+
+/// Writes what the callee put in a fill array's slots back into the JS array it came from.
+/// Each slot's string or object reference moves to its JS value.
+#[cfg(feature = "classic")]
+pub(crate) fn ffi_write_back_reference_array(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    element: &crate::helpers::ReferenceElement,
+    array: &mut crate::helpers::ReferenceArray,
+) {
+    let crate::helpers::ReferenceArray::Fill(slots) = array else {
+        return;
+    };
+    let Ok(target) = v8::Local::<v8::Array>::try_from(arg) else {
+        return;
+    };
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let item = match element.iid {
+            None => slot as *mut usize as *mut c_void,
+            Some(_) => *slot as *mut c_void,
+        };
+        let value = crate::return_value_from_kind(&element.kind, item, None, scope);
+        *slot = 0;
+        target.set_index(scope, index as u32, value);
+    }
 }
 
 /// A typed array of `element` over `bytes`.
