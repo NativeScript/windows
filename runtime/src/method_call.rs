@@ -1390,16 +1390,7 @@ impl MethodCall {
                                     crate::create_struct_object_from_raw(declaration, inner, scope)
                                         .into()
                                 } else {
-                                    // Attempt to inspect runtime identity via IInspectable
                                     let instance = unsafe { IUnknown::from_raw(inner) };
-                                    match instance.clone().cast::<IInspectable>() {
-                                        Ok(ins) => {
-                                            let _ = ins.GetRuntimeClassName();
-                                        }
-                                        Err(e) => {
-                                            let _ = e;
-                                        }
-                                    }
                                     crate::ns_proxy::create_ns_ctor_instance_object(
                                         sig.as_str(),
                                         None,

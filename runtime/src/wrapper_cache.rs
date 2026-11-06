@@ -66,6 +66,31 @@ pub(crate) fn get<'s>(scope: &v8::PinScope<'s, '_, ()>, key: usize) -> Option<v8
         .map(|ptr| unsafe { std::mem::transmute::<NonNull<v8::Object>, v8::Local<'s, v8::Object>>(ptr) })
 }
 
+/// The live wrapper of the COM object behind `instance`, keyed by its IUnknown identity.
+#[inline]
+pub(crate) fn get_for<'s>(
+    scope: &v8::PinScope<'s, '_, ()>,
+    instance: &windows::core::IUnknown,
+) -> Option<v8::Local<'s, v8::Object>> {
+    use windows::core::Interface;
+    let identity = instance.cast::<windows::core::IUnknown>().ok()?;
+    get(scope, identity.as_raw() as usize)
+}
+
+/// `get_for` on an owned (+1) return pointer: on a hit the reference is released, on a miss
+/// the caller still owns it.
+#[inline]
+pub(crate) fn take_cached<'s>(
+    scope: &v8::PinScope<'s, '_, ()>,
+    owned: *mut c_void,
+) -> Option<v8::Local<'s, v8::Object>> {
+    use windows::core::Interface;
+    let instance = std::mem::ManuallyDrop::new(unsafe { windows::core::IUnknown::from_raw(owned) });
+    let local = get_for(scope, &instance)?;
+    drop(std::mem::ManuallyDrop::into_inner(instance));
+    Some(local)
+}
+
 /// Cache `object` as the wrapper of COM identity `key` and hand it `ffi`. Returns the address
 /// of the stored `DeclarationFFI` for internal field 0; it lives until V8 collects `object`.
 pub(crate) fn insert(

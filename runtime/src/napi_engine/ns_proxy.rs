@@ -207,6 +207,9 @@ struct InstanceCacheEntry {
     /// The wrapper is the JS object of a JS subclass instance: returned for this identity whatever
     /// class the caller expects (its runtime class, a managed type, isn't in the metadata).
     any_type: bool,
+    /// The wrapper was built for the object's class, so it serves any interface-typed return
+    /// of the same object.
+    is_class: bool,
     /// Serial of the InstanceState that owns this entry. On that state's Drop we remove the entry
     /// only if the serial still matches — so a newer proxy for a reused COM address is never evicted.
     serial: u64,
@@ -243,9 +246,24 @@ fn cached_instance(env: &Env, identity: usize, class_name: &str) -> Option<JsObj
     })
 }
 
+/// The cached class wrapper for `identity`, whatever class name it was built for.
+fn cached_class_instance(env: &Env, identity: usize) -> Option<JsObject> {
+    let type_name = NAPI_INSTANCE_CACHE.with(|c| {
+        c.borrow().get(&identity).filter(|e| e.is_class).map(|e| e.type_name.clone())
+    })?;
+    cached_instance(env, identity, &type_name)
+}
+
 /// Cache `proxy` under `identity` as a weak ref (refcount 0 — GC may reclaim; the entry is
 /// re-created on the next wrap if so).
-fn cache_instance(env: &Env, identity: usize, class_name: &str, serial: u64, proxy: &JsObject) {
+fn cache_instance(
+    env: &Env,
+    identity: usize,
+    class_name: &str,
+    is_class: bool,
+    serial: u64,
+    proxy: &JsObject,
+) {
     flush_ref_graveyard();
     let mut proxy_ref: napi::sys::napi_ref = std::ptr::null_mut();
     let st = unsafe { napi::sys::napi_create_reference(env.raw(), proxy.raw(), 0, &mut proxy_ref) };
@@ -258,6 +276,7 @@ fn cache_instance(env: &Env, identity: usize, class_name: &str, serial: u64, pro
                     proxy_ref,
                     type_name: class_name.to_string(),
                     any_type: false,
+                    is_class,
                     serial,
                 },
             );
@@ -1203,6 +1222,16 @@ pub fn create_instance_proxy(
 ) -> napi::Result<JsObject> {
     let identity = com_identity_key(&instance);
 
+    // An interface-typed return of an object that already has a class wrapper reuses it
+    // without asking for the runtime class again.
+    if let Some(id) = identity {
+        if crate::napi_engine::ns_hostobject::is_interface(&declaration) {
+            if let Some(existing) = cached_class_instance(env, id) {
+                return Ok(existing);
+            }
+        }
+    }
+
     // Hybrid fast path: wrap non-collection *class* instances as host objects (shared prototype,
     // no Proxy trap). The effective type is the class from the declaration when it is itself a
     // host-eligible class (`new` path), or — for interface-typed returns like `IJsonValue` whose
@@ -1227,7 +1256,7 @@ pub fn create_instance_proxy(
             env, &eff_name, instance, serial, identity,
         )?;
         if let Some(id) = identity {
-            cache_instance(env, id, &eff_name, serial, &obj);
+            cache_instance(env, id, &eff_name, true, serial, &obj);
         }
         return Ok(obj);
     }
@@ -1253,6 +1282,7 @@ pub fn create_instance_proxy(
         }
     }
     let serial = next_instance_serial();
+    let is_class = matches!(declaration.read().kind(), DeclarationKind::Class);
     let iface = interface_context(&declaration);
     let state = Rc::new(InstanceState {
         class_name: class_name.to_string(),
@@ -1544,7 +1574,7 @@ pub fn create_instance_proxy(
     let target = as_unknown(env, env.create_object()?);
     let proxy = make_proxy(env, target, handler)?;
     if let Some(id) = identity {
-        cache_instance(env, id, class_name, serial, &proxy);
+        cache_instance(env, id, class_name, is_class, serial, &proxy);
     }
     Ok(proxy)
 }
@@ -1623,7 +1653,7 @@ pub fn try_wrap_inspectable_pointer(env: &Env, raw: *mut c_void) -> Option<JsObj
     }
     let inspectable = owned.cast::<IInspectable>().ok()?;
     let class_name = unsafe { inspectable.GetRuntimeClassName() }.ok()?;
-    let name_str = class_name.to_string();
+    let name_str = class_name.to_string_lossy();
     let declaration = MetadataReader::find_by_name(&name_str)?;
     if declaration.read().kind() != DeclarationKind::Class {
         return None;

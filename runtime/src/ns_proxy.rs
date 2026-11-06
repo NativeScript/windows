@@ -465,11 +465,14 @@ pub(crate) fn try_wrap_inspectable_pointer<'a>(
     if let Some(v) = try_unbox_property_value(&instance, scope) {
         return Some(v);
     }
+    if let Some(local) = crate::wrapper_cache::get_for(scope, &instance) {
+        return Some(local.into());
+    }
     let resolved = instance
         .cast::<IInspectable>()
         .ok()
         .and_then(|insp| insp.GetRuntimeClassName().ok())
-        .map(|cn| cn.to_string())
+        .map(|cn| cn.to_string_lossy())
         .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
         .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
     match resolved {
@@ -552,11 +555,15 @@ pub(crate) fn set_ret_val_resolving_object(
 ) {
     if return_sig == "Object" && !result.is_null() {
         let instance = unsafe { IUnknown::from_raw(result) };
+        if let Some(local) = crate::wrapper_cache::get_for(scope, &instance) {
+            retval.set(local.into());
+            return;
+        }
         let resolved = instance
             .cast::<IInspectable>()
             .ok()
             .and_then(|insp| insp.GetRuntimeClassName().ok())
-            .map(|cn| cn.to_string())
+            .map(|cn| cn.to_string_lossy())
             .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
             .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
         match resolved {
@@ -782,13 +789,19 @@ pub(crate) fn handle_named_property_getter(
                                             } else {
                                                 let instance =
                                                     unsafe { IUnknown::from_raw(result) };
+                                                if let Some(local) =
+                                                    crate::wrapper_cache::get_for(scope, &instance)
+                                                {
+                                                    retval.set(local.into());
+                                                    return;
+                                                }
                                                 let resolved = instance
                                                     .cast::<IInspectable>()
                                                     .ok()
                                                     .and_then(|insp| {
                                                         insp.GetRuntimeClassName().ok()
                                                     })
-                                                    .map(|cn| cn.to_string())
+                                                    .map(|cn| cn.to_string_lossy())
                                                     .and_then(|n| {
                                                         MetadataReader::find_by_name(&n)
                                                             .map(|d| (n, d))
@@ -1098,13 +1111,15 @@ fn instance_method_dispatch(
         ReturnKind::DynamicObject => {
             if result.is_null() {
                 None
+            } else if let Some(local) = crate::wrapper_cache::take_cached(scope, result) {
+                Some(local.into())
             } else {
                 let instance = unsafe { IUnknown::from_raw(result) };
                 let resolved = instance
                     .cast::<IInspectable>()
                     .ok()
                     .and_then(|insp| insp.GetRuntimeClassName().ok())
-                    .map(|cn| cn.to_string())
+                    .map(|cn| cn.to_string_lossy())
                     .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
                     .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
                 match resolved {
@@ -1173,7 +1188,7 @@ fn find_runtime_class_property(
         .ok()?
         .GetRuntimeClassName()
         .ok()
-        .map(|s| s.to_string())?;
+        .map(|s| s.to_string_lossy())?;
 
     if runtime_name.is_empty() || runtime_name == static_type_name {
         return None;
@@ -1386,13 +1401,15 @@ pub(crate) fn handle_instance_property_getter(
             ReturnKind::InterfaceObject { decl, type_name } => {
                 if result.is_null() {
                     Some(v8::null(scope).into())
+                } else if let Some(local) = crate::wrapper_cache::take_cached(scope, result) {
+                    Some(local.into())
                 } else {
                     let instance = unsafe { IUnknown::from_raw(result) };
                     let (resolved_name, resolved_decl) = instance
                         .cast::<IInspectable>()
                         .ok()
                         .and_then(|insp| insp.GetRuntimeClassName().ok())
-                        .map(|cn| cn.to_string())
+                        .map(|cn| cn.to_string_lossy())
                         .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
                         .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
                         .unwrap_or_else(|| (type_name.to_string(), decl.clone()));
@@ -1867,7 +1884,7 @@ pub(crate) unsafe fn raw_result_to_local<'s>(
                     let unknown = IUnknown::from_raw(result);
                     if let Ok(inspectable) = unknown.cast::<IInspectable>() {
                         if let Ok(class_name) = inspectable.GetRuntimeClassName() {
-                            let name_str = class_name.to_string();
+                            let name_str = class_name.to_string_lossy();
                             if let Some(decl) = MetadataReader::find_by_name(&name_str) {
                                 let instance = unknown.clone();
                                 return Some(
@@ -2029,7 +2046,7 @@ pub(crate) fn resolve_runtime_class(
         .cast::<IInspectable>()
         .ok()
         .and_then(|insp| insp.GetRuntimeClassName().ok())
-        .map(|cn| cn.to_string())
+        .map(|cn| cn.to_string_lossy())
         .filter(|cn| !cn.is_empty() && cn != declared && !cn.contains('<'))
         .and_then(|cn| MetadataReader::find_by_name(&cn).map(|d| (cn, d)))
         .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))

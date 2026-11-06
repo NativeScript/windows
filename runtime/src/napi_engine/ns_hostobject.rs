@@ -168,7 +168,7 @@ pub fn is_interface(declaration: &Decl) -> bool {
 /// The metadata class named by `instance`'s GetRuntimeClassName.
 pub fn runtime_class(instance: &IUnknown) -> Option<(String, Decl)> {
     let inspectable = instance.cast::<IInspectable>().ok()?;
-    let name = unsafe { inspectable.GetRuntimeClassName() }.ok()?.to_string();
+    let name = unsafe { inspectable.GetRuntimeClassName() }.ok()?.to_string_lossy();
     let declaration = MetadataReader::find_by_name(&name)?;
     if !matches!(declaration.read().kind(), DeclarationKind::Class) {
         return None;

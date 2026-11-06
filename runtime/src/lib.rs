@@ -1193,6 +1193,10 @@ pub(crate) fn return_value_from_kind<'a>(
                 v8::null(scope).into()
             } else {
                 let instance = unsafe { IUnknown::from_raw(result) };
+                // An object that already has a wrapper skips the runtime-class lookup below.
+                if let Some(local) = crate::wrapper_cache::get_for(scope, &instance) {
+                    return local.into();
+                }
                 // Wrap by the runtime class: an interface such as IPropertySet declares no
                 // members itself and only requires the generic IMap/IIterable instances.
                 match crate::ns_proxy::resolve_runtime_class(&instance, type_name.as_ref()) {
@@ -4556,7 +4560,7 @@ fn create_ns_ctor_instance_object<'a>(
                                             .cast::<IInspectable>()
                                             .ok()
                                             .and_then(|insp| insp.GetRuntimeClassName().ok())
-                                            .map(|cn| cn.to_string())
+                                            .map(|cn| cn.to_string_lossy())
                                             .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
                                             .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
                                         match resolved {
@@ -4875,7 +4879,7 @@ fn create_ns_ctor_instance_object<'a>(
                                             .cast::<IInspectable>()
                                             .ok()
                                             .and_then(|insp| insp.GetRuntimeClassName().ok())
-                                            .map(|cn| cn.to_string())
+                                            .map(|cn| cn.to_string_lossy())
                                             .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
                                             .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
                                         match resolved {
@@ -5974,7 +5978,7 @@ unsafe fn raw_result_to_local<'s>(
                     let unknown = IUnknown::from_raw(result);
                     if let Ok(inspectable) = unknown.cast::<IInspectable>() {
                         if let Ok(class_name) = inspectable.GetRuntimeClassName() {
-                            let name_str = class_name.to_string();
+                            let name_str = class_name.to_string_lossy();
                             if let Some(decl) = MetadataReader::find_by_name(&name_str) {
                                 let instance = unknown.clone();
                                 return Some(
@@ -7986,7 +7990,7 @@ fn js_delegate_run(
                         }
                         let inspectable = owned.cast::<IInspectable>().ok()?;
                         let class_name = inspectable.GetRuntimeClassName().ok()?;
-                        let name_str = class_name.to_string();
+                        let name_str = class_name.to_string_lossy();
                         let decl = MetadataReader::find_by_name(&name_str)?;
                         Some(
                             create_ns_ctor_instance_object(
