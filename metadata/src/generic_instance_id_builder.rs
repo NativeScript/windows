@@ -51,23 +51,45 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .downcast_ref::<ClassDeclaration>()
                             .unwrap();
 
-                        let default_interface = class_declaration.default_interface().unwrap();
+                        let Ok(builder) = metadatadestination.ok() else {
+                            return Ok(());
+                        };
+                        let Some(default_interface) = class_declaration.default_interface() else {
+                            // A generic default interface goes by its parsed name elements.
+                            let Some(generic) = class_declaration.default_interface_full_name()
+                            else {
+                                return Ok(());
+                            };
+                            let generic = HSTRING::from(generic.replace(", ", ","));
+                            let mut count = 0u32;
+                            let mut parts: *mut HSTRING = std::ptr::null_mut();
+                            unsafe { RoParseTypeName(&generic, &mut count, &mut parts) }?;
+                            let parts_slice =
+                                unsafe { std::slice::from_raw_parts(parts, count as usize) };
+                            let elements: Vec<PCWSTR> =
+                                parts_slice.iter().map(|p| PCWSTR(p.as_ptr())).collect();
+                            let result = unsafe {
+                                builder.SetRuntimeClassParameterizedDefault(name, &elements)
+                            };
+                            for part in parts_slice {
+                                drop(unsafe { std::ptr::read(part) });
+                            }
+                            unsafe {
+                                windows::Win32::System::Com::CoTaskMemFree(Some(parts as *const _))
+                            };
+                            return result;
+                        };
                         let default_interface_id = default_interface.id();
                         let full_name = HSTRING::from(default_interface.full_name());
                         let full_name = PCWSTR::from_raw(full_name.as_ptr());
-
-                        if let Ok(builder) = metadatadestination.ok() {
-                            let result = unsafe {
-                                builder.SetRuntimeClassSimpleDefault(
-                                    name,
-                                    full_name,
-                                    Some(&default_interface_id),
-                                )
-                            };
-
-                            debug_assert!(result.is_ok());
-                        }
-
+                        let result = unsafe {
+                            builder.SetRuntimeClassSimpleDefault(
+                                name,
+                                full_name,
+                                Some(&default_interface_id),
+                            )
+                        };
+                        debug_assert!(result.is_ok());
                         return Ok(());
                     }
                     DeclarationKind::Interface => {
@@ -335,8 +357,15 @@ fn wire_signature_for_name(name: &str) -> Option<String> {
         }
         DeclarationKind::Class => {
             let class = lock.as_any().downcast_ref::<ClassDeclaration>()?;
-            let default_iface = class.default_interface()?;
-            Some(format!("rc({};{})", name, format_guid(&default_iface.id())))
+            let default_signature = match class.default_interface() {
+                Some(iface) => format_guid(&iface.id()),
+                // A generic default interface (`IVectorView<T>`) contributes its own signature.
+                None => {
+                    let generic = class.default_interface_full_name()?.replace(", ", ",");
+                    wire_signature_for_name(&generic)?
+                }
+            };
+            Some(format!("rc({};{})", name, default_signature))
         }
         DeclarationKind::Enum => {
             let enum_decl = lock.as_any().downcast_ref::<EnumDeclaration>()?;
@@ -466,6 +495,28 @@ fn compute_winrt_piid(signature: &str) -> GUID {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os_iid(names: &[&str]) -> GUID {
+        let names: Vec<HSTRING> = names.iter().map(|n| HSTRING::from(*n)).collect();
+        let elements: Vec<PCWSTR> = names.iter().map(|n| PCWSTR(n.as_ptr())).collect();
+        let locator = IRoMetaDataLocatorImpl;
+        let locator = IRoMetaDataLocator::new(&locator);
+        let mut iid = GUID::zeroed();
+        unsafe { RoGetParameterizedTypeInstanceIID(&elements, &*locator, &mut iid, None).unwrap() };
+        iid
+    }
+
+    #[test]
+    fn class_with_generic_default_interface_matches_the_os() {
+        let expected = os_iid(&[
+            "Windows.Foundation.IAsyncOperation`1",
+            "Windows.Devices.Enumeration.DeviceInformationCollection",
+        ]);
+        let actual = GenericInstanceIdBuilder::generate_id_from_name(
+            "Windows.Foundation.IAsyncOperation`1<Windows.Devices.Enumeration.DeviceInformationCollection>",
+        );
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn known_piid_iasyncoperationwithprogress_httpresponsemessage_httpprogress() {
