@@ -1091,6 +1091,109 @@ pub(crate) enum ReturnKind {
         value: Box<ReturnKind>,
         size: usize,
     },
+    /// A `T[]` WinRT allocates: `(length, data)` land in the return buffer, each `size`-byte
+    /// element converts as `element`, and the buffer is freed after conversion.
+    Array {
+        element: Box<ReturnKind>,
+        #[cfg_attr(not(feature = "napi_engine"), allow(dead_code))]
+        element_type: Arc<str>,
+        size: usize,
+    },
+}
+
+/// The [`ReturnKind::Array`] for an array of `element`, or `None` when its elements can't be
+/// converted.
+pub(crate) fn classify_array(element: &str) -> Option<ReturnKind> {
+    use crate::value::NativeType;
+    let element = crate::property_call::abi_type_arg(element);
+    let kind = classify_return(element, false);
+    let size = match &kind {
+        ReturnKind::Primitive(
+            NativeType::Void | NativeType::Pointer | NativeType::Buffer | NativeType::Function,
+        ) => return None,
+        ReturnKind::Primitive(NativeType::String) => std::mem::size_of::<usize>(),
+        ReturnKind::Primitive(nt) => nt.size(),
+        ReturnKind::Object { .. }
+        | ReturnKind::InterfaceObject { .. }
+        | ReturnKind::DynamicObject => std::mem::size_of::<usize>(),
+        ReturnKind::Struct(declaration) => {
+            crate::property_call::struct_declaration_size(&*declaration.read())
+        }
+        ReturnKind::Guid => 16,
+        _ => return None,
+    };
+    (size > 0).then(|| ReturnKind::Array {
+        element: Box::new(kind),
+        element_type: Arc::from(element),
+        size,
+    })
+}
+
+/// Reads a received array's `(length, data)` from the callee-written slots and converts it.
+///
+/// # Safety
+/// `length` and `data` point at the call's out slots, written by a successful call or zeroed.
+#[cfg(feature = "classic")]
+pub(crate) unsafe fn received_array_from_slots<'a>(
+    kind: &ReturnKind,
+    length: *const c_void,
+    data: *const c_void,
+    scope: &mut v8::PinScope<'a, '_>,
+) -> Local<'a, v8::Value> {
+    let length = std::ptr::read_unaligned(length as *const u32);
+    let data = std::ptr::read_unaligned(data as *const *mut c_void);
+    received_array_value(kind, length, data, scope)
+}
+
+/// Converts `length` elements at `data`, an array WinRT allocated, and frees it: primitives
+/// become a typed array, anything else a JS array whose elements take ownership of the strings
+/// and objects.
+#[cfg(feature = "classic")]
+pub(crate) unsafe fn received_array_value<'a>(
+    kind: &ReturnKind,
+    length: u32,
+    data: *mut c_void,
+    scope: &mut v8::PinScope<'a, '_>,
+) -> Local<'a, v8::Value> {
+    let ReturnKind::Array { element, size, .. } = kind else {
+        return v8::undefined(scope).into();
+    };
+    let count = if data.is_null() { 0 } else { length as usize };
+    let primitive = match element.as_ref() {
+        ReturnKind::Primitive(nt) => crate::helpers::ArrayElement::from_native(nt),
+        _ => None,
+    };
+    let value = match primitive {
+        Some(primitive) => {
+            let bytes = if count == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data as *const u8, count * size).to_vec()
+            };
+            crate::value::typed_array_from_bytes(scope, primitive, bytes)
+        }
+        None => {
+            let array = v8::Array::new(scope, count as i32);
+            for index in 0..count {
+                let slot = (data as *mut u8).add(index * size) as *mut c_void;
+                let item = match element.as_ref() {
+                    ReturnKind::Object { .. }
+                    | ReturnKind::InterfaceObject { .. }
+                    | ReturnKind::DynamicObject => {
+                        std::ptr::read_unaligned(slot as *const *mut c_void)
+                    }
+                    _ => slot,
+                };
+                let item = return_value_from_kind(element, item, None, scope);
+                array.set_index(scope, index as u32, item);
+            }
+            array.into()
+        }
+    };
+    if !data.is_null() {
+        windows::Win32::System::Com::CoTaskMemFree(Some(data as *const c_void));
+    }
+    value
 }
 
 fn classify_reference_return(inner: &str) -> Option<ReturnKind> {
@@ -1129,6 +1232,9 @@ pub(crate) fn classify_return(return_type: &str, is_void: bool) -> ReturnKind {
     }
     if return_type == "Object" {
         return ReturnKind::DynamicObject;
+    }
+    if let Some(element) = return_type.strip_suffix("[]") {
+        return classify_array(element).unwrap_or(ReturnKind::Void);
     }
     if return_type.contains('.') {
         // A closed generic name ("IAsyncOperation`1<Foo>") resolves to the instance declaration,
@@ -1189,6 +1295,10 @@ pub(crate) fn return_value_from_kind<'a>(
         ReturnKind::Struct(declaration) => {
             create_struct_object_from_raw(declaration.clone(), result, scope).into()
         }
+        ReturnKind::Array { .. } => unsafe {
+            let data = (result as *const u8).add(8) as *const c_void;
+            received_array_from_slots(kind, result, data, scope)
+        },
         ReturnKind::InterfaceObject { decl, type_name } => {
             if result.is_null() {
                 v8::null(scope).into()

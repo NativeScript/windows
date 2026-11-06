@@ -146,8 +146,11 @@ impl TryFrom<&str> for NativeType {
         // Arrays of primitives travel as (count, pointer) over JS memory; other arrays are
         // opaque pointers.
         if let Some(element) = by_ref_inner.strip_suffix("[]") {
+            let pass_or_fill = by_ref_inner.len() == signature.len();
+            let reference = || crate::helpers::ReferenceElement::of_signature(signature).is_some();
             return Ok(match crate::helpers::ArrayElement::from_name(element) {
                 Some(_) => NativeType::Buffer,
+                None if pass_or_fill && reference() => NativeType::Buffer,
                 None => NativeType::Pointer,
             });
         }
@@ -1174,11 +1177,9 @@ pub fn ffi_parse_pointer_arg(
     if arg.is_string() {
         let hstring = hstring_from_v8_value(scope, arg);
         if let Ok(inspectable) = PropertyValue::CreateString(&hstring) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            // WinRT callees AddRef when storing; our reference is intentionally leaked
-            // here so the raw pointer stays valid through the FFI call.
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
@@ -1188,24 +1189,30 @@ pub fn ffi_parse_pointer_arg(
         // Callers that need a specific IReference<T> type call box_as_ireference() first.
         if n == n.trunc() && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
             if let Ok(inspectable) = PropertyValue::CreateInt32(n as i32) {
-                let ptr = inspectable.as_raw() as *mut c_void;
-                std::mem::forget(inspectable);
-                return Ok(NativeValue { pointer: ptr });
+                return Ok(NativeValue {
+                    pointer: crate::value::boxed_arg(inspectable),
+                });
             }
         } else if let Ok(inspectable) = PropertyValue::CreateDouble(n) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
     }
 
     if arg.is_boolean() {
         let b = arg.boolean_value(scope);
         if let Ok(inspectable) = PropertyValue::CreateBoolean(b) {
-            let ptr = inspectable.as_raw() as *mut c_void;
-            std::mem::forget(inspectable);
-            return Ok(NativeValue { pointer: ptr });
+            return Ok(NativeValue {
+                pointer: crate::value::boxed_arg(inspectable),
+            });
         }
+    }
+
+    if let Some(inspectable) = box_array_arg(scope, arg) {
+        return Ok(NativeValue {
+            pointer: crate::value::boxed_arg(inspectable),
+        });
     }
 
     if let Some(inspectable) = arg
@@ -1214,9 +1221,9 @@ pub fn ffi_parse_pointer_arg(
         .flatten()
         .and_then(|obj| box_struct_shape(scope, obj))
     {
-        let ptr = inspectable.as_raw() as *mut c_void;
-        std::mem::forget(inspectable);
-        return Ok(NativeValue { pointer: ptr });
+        return Ok(NativeValue {
+            pointer: crate::value::boxed_arg(inspectable),
+        });
     }
 
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
@@ -1229,6 +1236,55 @@ pub fn ffi_parse_pointer_arg(
         ));
     };
     Ok(NativeValue { pointer })
+}
+
+thread_local! {
+    static BOXED_ARGS: std::cell::RefCell<Vec<windows::core::IInspectable>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static BOXED_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Keeps the values boxed for a call's arguments alive until the call returns. A call made
+/// while its arguments are parsed opens its own scope and releases only what it boxed.
+pub(crate) struct BoxedArgs {
+    start: usize,
+}
+
+impl BoxedArgs {
+    pub(crate) fn begin() -> Self {
+        let _ = BOXED_DEPTH.try_with(|depth| depth.set(depth.get() + 1));
+        let start = BOXED_ARGS.try_with(|boxed| boxed.borrow().len()).unwrap_or(0);
+        Self { start }
+    }
+}
+
+impl Drop for BoxedArgs {
+    fn drop(&mut self) {
+        let _ = BOXED_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+        // Released after the borrow ends, so a Release can't re-enter the list.
+        let released = BOXED_ARGS
+            .try_with(|boxed| {
+                let mut boxed = boxed.borrow_mut();
+                let start = self.start.min(boxed.len());
+                boxed.split_off(start)
+            })
+            .unwrap_or_default();
+        drop(released);
+    }
+}
+
+/// The pointer of a value boxed for an argument. Inside a call's [`BoxedArgs`] scope the
+/// reference is released when the call returns; outside one it is kept for good, since nothing
+/// bounds how long the pointer is used.
+pub(crate) fn boxed_arg(boxed: windows::core::IInspectable) -> *mut c_void {
+    let pointer = windows::core::Interface::as_raw(&boxed) as *mut c_void;
+    let in_call = BOXED_DEPTH.try_with(|depth| depth.get() > 0).unwrap_or(false);
+    if in_call {
+        let _ = BOXED_ARGS.try_with(|list| list.borrow_mut().push(boxed));
+    } else {
+        std::mem::forget(boxed);
+    }
+    pointer
 }
 
 /// `pointer` QI'd to `iid` (the guard holds the new reference), or a TypeError for an object
@@ -1335,6 +1391,114 @@ pub fn ffi_parse_buffer_arg_with_length(
     Ok((NativeValue { pointer }, byte_length))
 }
 
+/// The buffer for a `String[]` or object-array argument: the strings or queried objects of a
+/// JS array, or for a fill array as many zeroed slots as the JS array is long. Null passes an
+/// empty array.
+#[cfg(feature = "classic")]
+pub(crate) fn ffi_parse_reference_array(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    element: &crate::helpers::ReferenceElement,
+    fill: bool,
+) -> std::result::Result<crate::helpers::ReferenceArray, AnyError> {
+    use crate::helpers::ReferenceArray;
+    let mismatch = || {
+        type_error(format!(
+            "Expected an array or null for parameter type {}[]",
+            element.type_name
+        ))
+    };
+    if arg.is_null_or_undefined() {
+        return Ok(ReferenceArray::Fill(Vec::new()));
+    }
+    let array = v8::Local::<v8::Array>::try_from(arg).map_err(|_| mismatch())?;
+    let length = array.length() as usize;
+    if fill {
+        return Ok(ReferenceArray::Fill(vec![0; length]));
+    }
+    match element.iid {
+        None => {
+            let mut strings = Vec::with_capacity(length);
+            for index in 0..length {
+                let item = array.get_index(scope, index as u32).ok_or_else(mismatch)?;
+                if item.is_null_or_undefined() {
+                    strings.push(HSTRING::new());
+                } else if item.is_string() {
+                    strings.push(hstring_from_v8_value(scope, item));
+                } else {
+                    return Err(type_error(format!("Expected a string at index {index}")));
+                }
+            }
+            Ok(ReferenceArray::Strings(strings))
+        }
+        Some(iid) => {
+            let mut objects = Vec::with_capacity(length);
+            for index in 0..length {
+                let item = array.get_index(scope, index as u32).ok_or_else(mismatch)?;
+                let (_, queried) = ffi_parse_query_interface_arg(scope, item, &iid)?;
+                objects.push(queried);
+            }
+            Ok(ReferenceArray::Objects(objects))
+        }
+    }
+}
+
+/// Writes what the callee put in a fill array's slots back into the JS array it came from.
+/// Each slot's string or object reference moves to its JS value.
+#[cfg(feature = "classic")]
+pub(crate) fn ffi_write_back_reference_array(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    element: &crate::helpers::ReferenceElement,
+    array: &mut crate::helpers::ReferenceArray,
+) {
+    let crate::helpers::ReferenceArray::Fill(slots) = array else {
+        return;
+    };
+    let Ok(target) = v8::Local::<v8::Array>::try_from(arg) else {
+        return;
+    };
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let item = match element.iid {
+            None => slot as *mut usize as *mut c_void,
+            Some(_) => *slot as *mut c_void,
+        };
+        let value = crate::return_value_from_kind(&element.kind, item, None, scope);
+        *slot = 0;
+        target.set_index(scope, index as u32, value);
+    }
+}
+
+/// A typed array of `element` over `bytes`.
+#[cfg(feature = "classic")]
+pub(crate) fn typed_array_from_bytes<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    element: crate::helpers::ArrayElement,
+    bytes: Vec<u8>,
+) -> v8::Local<'a, v8::Value> {
+    use crate::helpers::ArrayElement as E;
+    let count = bytes.len() / element.size();
+    let buffer = if bytes.is_empty() {
+        v8::ArrayBuffer::new(scope, 0)
+    } else {
+        let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+        v8::ArrayBuffer::with_backing_store(scope, &store)
+    };
+    let view: Option<v8::Local<v8::Value>> = match element {
+        E::U8 | E::Bool => v8::Uint8Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I8 => v8::Int8Array::new(scope, buffer, 0, count).map(Into::into),
+        E::U16 | E::Char16 => v8::Uint16Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I16 => v8::Int16Array::new(scope, buffer, 0, count).map(Into::into),
+        E::U32 => v8::Uint32Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I32 => v8::Int32Array::new(scope, buffer, 0, count).map(Into::into),
+        E::U64 => v8::BigUint64Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I64 => v8::BigInt64Array::new(scope, buffer, 0, count).map(Into::into),
+        E::F32 => v8::Float32Array::new(scope, buffer, 0, count).map(Into::into),
+        E::F64 => v8::Float64Array::new(scope, buffer, 0, count).map(Into::into),
+    };
+    view.unwrap_or_else(|| v8::undefined(scope).into())
+}
+
 /// The value passed for a `T[]` parameter of primitive `element`: a typed array of the
 /// element's kind, an ArrayBuffer or DataView, a plain array (copied, each element converted the
 /// way the matching typed array stores it) or null.
@@ -1344,7 +1508,7 @@ pub(crate) fn ffi_parse_array_arg(
     arg: v8::Local<v8::Value>,
     element: crate::helpers::ArrayElement,
 ) -> std::result::Result<crate::helpers::ArrayArg, AnyError> {
-    use crate::helpers::{ArrayArg, ArrayElement, TypedArrayKind};
+    use crate::helpers::{ArrayArg, ArrayElement};
     if let Ok(array) = v8::Local::<v8::Array>::try_from(arg) {
         let length = array.length();
         let mut bytes = Vec::with_capacity(length as usize * element.size());
@@ -1362,7 +1526,21 @@ pub(crate) fn ffi_parse_array_arg(
         return Ok(ArrayArg::copied(bytes, element));
     }
     if arg.is_typed_array() {
-        let kind = if arg.is_uint8_array() {
+        let kind = typed_array_kind(arg);
+        if !element.accepts_view(kind) {
+            return Err(element.mismatch());
+        }
+    }
+    let (value, byte_length) =
+        ffi_parse_buffer_arg_with_length(scope, arg).map_err(|_| element.mismatch())?;
+    ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
+}
+
+#[cfg(feature = "classic")]
+fn typed_array_kind(arg: v8::Local<v8::Value>) -> crate::helpers::TypedArrayKind {
+    use crate::helpers::TypedArrayKind;
+    {
+        if arg.is_uint8_array() {
             TypedArrayKind::U8
         } else if arg.is_uint8_clamped_array() {
             TypedArrayKind::U8Clamped
@@ -1386,14 +1564,57 @@ pub(crate) fn ffi_parse_array_arg(
             TypedArrayKind::U64
         } else {
             TypedArrayKind::Other
-        };
-        if !element.accepts_view(kind) {
-            return Err(element.mismatch());
         }
     }
-    let (value, byte_length) =
-        ffi_parse_buffer_arg_with_length(scope, arg).map_err(|_| element.mismatch())?;
-    ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
+}
+
+/// A JS array or typed array boxed for an `Object` parameter. A plain array boxes when its
+/// elements are all strings, all numbers, all booleans or all WinRT objects (or null).
+#[cfg(feature = "classic")]
+fn box_array_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+) -> Option<windows::core::IInspectable> {
+    use crate::helpers::ArrayValues;
+    if arg.is_typed_array() {
+        let kind = typed_array_kind(arg);
+        let (value, length) = ffi_parse_buffer_arg_with_length(scope, arg).ok()?;
+        let bytes = match unsafe { value.pointer } {
+            pointer if pointer.is_null() || length == 0 => Vec::new(),
+            pointer => unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) }
+                .to_vec(),
+        };
+        return crate::helpers::box_array(ArrayValues::Typed(kind, bytes));
+    }
+    let array = v8::Local::<v8::Array>::try_from(arg).ok()?;
+    let length = array.length();
+    let first = (length > 0).then(|| array.get_index(scope, 0)).flatten();
+    let mut values = match first {
+        Some(v) if v.is_string() => ArrayValues::Strings(Vec::new()),
+        Some(v) if v.is_number() => ArrayValues::Numbers(Vec::new()),
+        Some(v) if v.is_boolean() => ArrayValues::Booleans(Vec::new()),
+        _ => ArrayValues::Objects(Vec::new()),
+    };
+    for index in 0..length {
+        let item = array.get_index(scope, index)?;
+        match &mut values {
+            ArrayValues::Strings(out) if item.is_string() => {
+                out.push(hstring_from_v8_value(scope, item));
+            }
+            ArrayValues::Numbers(out) if item.is_number() => out.push(item.number_value(scope)?),
+            ArrayValues::Booleans(out) if item.is_boolean() => out.push(item.boolean_value(scope)),
+            ArrayValues::Objects(out) if item.is_null_or_undefined() => out.push(None),
+            ArrayValues::Objects(out) if item.is_object() => {
+                let object = item.to_object(scope)?;
+                let pointer = try_get_external_handle(scope, object).filter(|p| !p.is_null())?;
+                let unknown =
+                    ManuallyDrop::new(unsafe { windows::core::IUnknown::from_raw(pointer) });
+                out.push(Some(unknown.cast::<windows::core::IInspectable>().ok()?));
+            }
+            _ => return None,
+        }
+    }
+    crate::helpers::box_array(values)
 }
 
 #[cfg(feature = "classic")]

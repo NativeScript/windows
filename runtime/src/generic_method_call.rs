@@ -134,7 +134,9 @@ impl GenericMethodCall {
             let metadata = parameter.metadata().unwrap();
 
             let signature = Signature::to_string(metadata, &type_);
-            if !crate::helpers::parameter_layout_supported(&signature) {
+            if !crate::helpers::parameter_layout_supported(&signature)
+                || crate::helpers::ReferenceElement::of_signature(&signature).is_some()
+            {
                 init_error = Some(E_NOTIMPL);
             }
 
@@ -268,6 +270,7 @@ impl GenericMethodCall {
         if let Some(hr) = self.init_error {
             return (hr, std::ptr::null_mut(), Vec::new());
         }
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let number_of_abi_parameters = self.number_of_abi_parameters;
         let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
         // Track parse-level types for each ABI argument slot.

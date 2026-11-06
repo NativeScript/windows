@@ -60,6 +60,11 @@ declare global {
   interface NSWinRTArray {
     /** A zero-filled array of a primitive WinRT element type for `T[]` parameters. */
     create<K extends keyof NSWinRTArrayTypes>(type: K, count: number): NSWinRTArrayTypes[K];
+    /** An array of nulls for a `String[]` or object-array parameter the callee fills. */
+    create<T = any>(
+      type: 'String' | 'Object' | string | (new (...args: any[]) => T),
+      count: number,
+    ): (T | null)[];
   }
 
   interface NSWinRTPointer {

@@ -192,6 +192,10 @@ struct MethodStaticInfo {
     /// the call's stable return buffer instead of the pointer slot.
     is_scalar_return: bool,
     is_string_return: bool,
+    /// The return is a `T[]`: its `(length, data)` out slots point into the return buffer.
+    is_array_return: bool,
+    /// Per parameter, the element conversion of a received array (`ByRef T[]`).
+    received_arrays: Vec<Option<ReturnKind>>,
 }
 
 impl MethodStaticInfo {
@@ -214,6 +218,8 @@ impl MethodStaticInfo {
             param_plans: Vec::new(),
             is_scalar_return: false,
             is_string_return: false,
+            is_array_return: false,
+            received_arrays: Vec::new(),
         })
     }
 }
@@ -708,7 +714,13 @@ impl MethodCall {
         let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
-        if !crate::helpers::return_layout_supported(&return_type) {
+        let is_array_return = !is_void && return_type.ends_with("[]");
+        let supported = if is_array_return {
+            matches!(crate::classify_return(&return_type, false), ReturnKind::Array { .. })
+        } else {
+            crate::helpers::return_layout_supported(&return_type)
+        };
+        if !supported {
             return Self::new_init_error(
                 interface,
                 is_initializer,
@@ -760,6 +772,10 @@ impl MethodCall {
             // space and pass the address for the callee to write into.
             if parameter.is_out() || signature.trim().starts_with("ByRef ") {
                 parameter_types.push(NativeType::Pointer);
+                // A received array is (UINT32* length, T** data).
+                if crate::helpers::received_array_element(&signature).is_some() {
+                    parameter_types.push(NativeType::Pointer);
+                }
             } else {
                 // If the parsed parameter is a WinRT `String`, treat its ABI as
                 // `NativeType::String` (handle-sized) rather than the generic
@@ -791,6 +807,9 @@ impl MethodCall {
             parameter_types.push(NativeType::Pointer);
         } else {
             if !is_void {
+                parameter_types.push(NativeType::Pointer);
+            }
+            if is_array_return {
                 parameter_types.push(NativeType::Pointer);
             }
         }
@@ -849,6 +868,10 @@ impl MethodCall {
         let return_kind = crate::classify_return(&return_type, is_void);
         let is_scalar_return = is_scalar_return_type(&return_type);
         let is_string_return = return_type == "String";
+        let received_arrays: Vec<Option<ReturnKind>> = param_sigs
+            .iter()
+            .map(|sig| crate::helpers::received_array_element(sig).and_then(crate::classify_array))
+            .collect();
 
         // Resolve each Pointer in-param's marshaling plan once; out/ByRef params and
         // non-pointer types never consult their slot.
@@ -885,6 +908,8 @@ impl MethodCall {
             param_plans,
             is_scalar_return,
             is_string_return,
+            is_array_return,
+            received_arrays,
         });
         METHOD_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -930,9 +955,11 @@ impl MethodCall {
         // HSTRING out-params must also land in a stable buffer so the returned
         // pointer remains valid after this call frame is unwound.
         let is_string_return = self.si.is_string_return;
+        let is_array_return = self.si.is_array_return;
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // Track out-parameter slots: (argument_buf index, parse_native_type, param_index, wrapper)
@@ -946,6 +973,7 @@ impl MethodCall {
         self.argument_parse_types.push(None);
 
         let mut buffer_args = Vec::new();
+        let mut reference_arrays = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let parameter = &self.si.parameters[i];
             // Use the pre-computed signature string (cached at construction time) to avoid
@@ -956,6 +984,24 @@ impl MethodCall {
             // Handle out (ByRef) parameters by allocating stable storage that
             // the callee can write into. Also treat a missing caller argument
             // for a `ByRef` signature as an implicit out-slot (e.g. TryParse).
+            if self.si.received_arrays[i].is_some() {
+                // (UINT32 length, T* data), written by the callee.
+                let slot_index = self.argument_buf.len();
+                let mut buf: Vec<u8> = vec![0u8; 16];
+                let base = buf.as_mut_ptr();
+                struct_scratch.push(buf);
+                self.argument_buf.push(NativeValue { pointer: base as *mut c_void });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: unsafe { base.add(8) } as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+                let wrapper_obj =
+                    try_unwrap_out_param(scope, args.get(i as i32)).map(|(obj, _)| obj);
+                out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
+                continue;
+            }
+
             if parameter.is_out() || is_sig_byref {
                 let slot_index = self.argument_buf.len();
                 let slot_size = match native_type {
@@ -1196,6 +1242,25 @@ impl MethodCall {
                     }
                 }
                 NativeType::Buffer => {
+                    let reference = crate::helpers::ReferenceElement::of_signature(param_sig);
+                    if let Some(element) = reference {
+                        let fill = parameter.is_fill_array();
+                        let parsed =
+                            crate::value::ffi_parse_reference_array(scope, value, &element, fill);
+                        let mut array = match parsed {
+                            Ok(array) => array,
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return (call_failure(), std::ptr::null_mut(), Vec::new());
+                            }
+                        };
+                        self.argument_buf.push(NativeValue { u32_value: array.count() });
+                        self.argument_parse_types.push(None);
+                        self.argument_buf.push(NativeValue { pointer: array.pointer() });
+                        self.argument_parse_types.push(None);
+                        reference_arrays.push((value, element, array, fill));
+                        continue;
+                    }
                     let element = crate::helpers::ArrayElement::of_signature(param_sig)
                         .unwrap_or(crate::helpers::ArrayElement::U8);
                     let array = crate::value::ffi_parse_array_arg(scope, value, element);
@@ -1274,7 +1339,17 @@ impl MethodCall {
             };
             self.argument_parse_types.push(None);
         } else if !is_void {
-            if is_value_type || is_scalar_return || is_string_return {
+            if is_array_return {
+                // (UINT32 length, T* data) land in the return buffer.
+                self.return_value_buf[..16].fill(0);
+                let base = self.return_value_buf.as_mut_ptr();
+                self.argument_buf.push(NativeValue { pointer: base as *mut c_void });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: unsafe { base.add(8) } as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            } else if is_value_type || is_scalar_return || is_string_return {
                 let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
                 self.argument_parse_types.push(None);
@@ -1373,15 +1448,36 @@ impl MethodCall {
             }
         }
 
-        if !is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+        if !is_initializer
+            && !is_void
+            && (is_value_type || is_scalar_return || is_string_return || is_array_return)
+        {
             // Point result at the scratch buffer — all three categories write
             // into return_value_buf, so the pointer is stable for the caller.
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
         // Marshal out-parameters back into V8 values using the recorded slots.
+        for (value, element, mut array, fill) in reference_arrays {
+            if fill && hr.is_ok() {
+                crate::value::ffi_write_back_reference_array(scope, value, &element, &mut array);
+            }
+        }
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
+            if let Some(kind) = &self.si.received_arrays[param_idx] {
+                let v = unsafe {
+                    let length = self.argument_buf[slot_index].pointer;
+                    let data = self.argument_buf[slot_index + 1].pointer;
+                    crate::received_array_from_slots(kind, length, data, scope)
+                };
+                if let Some(wrapper) = wrapper_obj {
+                    let _ = set_out_param_value(scope, wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
+                continue;
+            }
             let storage_ptr = unsafe {
                 self.argument_buf
                     .get(slot_index)
@@ -1476,6 +1572,7 @@ impl MethodCall {
         let is_void = self.si.is_void;
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1531,6 +1628,7 @@ impl MethodCall {
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
@@ -1621,9 +1719,11 @@ impl MethodCall {
         );
         let is_scalar_return = self.si.is_scalar_return;
         let is_string_return = self.si.is_string_return;
+        let is_array_return = self.si.is_array_return;
 
         self.reset_args();
         crate::error::clear_argument_error();
+        let _boxed_args = crate::value::BoxedArgs::begin();
         let mut queried_interfaces: SmallVec<[IUnknown; 2]> = SmallVec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // (argument_buf index, parse_native_type, param_index, out-wrapper object)
@@ -1635,10 +1735,30 @@ impl MethodCall {
         self.argument_parse_types.push(None);
 
         let mut buffer_args = Vec::new();
+        let mut reference_arrays = Vec::new();
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let parameter = &self.si.parameters[i];
             let param_sig = &self.si.param_sigs[i];
             let is_sig_byref = param_sig.starts_with("ByRef ");
+
+            if self.si.received_arrays[i].is_some() {
+                // (UINT32 length, T* data), written by the callee.
+                let slot_index = self.argument_buf.len();
+                let mut buf: Vec<u8> = vec![0u8; 16];
+                let base = buf.as_mut_ptr();
+                struct_scratch.push(buf);
+                self.argument_buf.push(NativeValue { pointer: base as *mut c_void });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: unsafe { base.add(8) } as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+                let wrapper_obj = arg_at(env, args, i)
+                    .and_then(|value| nv::try_unwrap_out_param(env, &value))
+                    .map(|(obj, _)| obj);
+                out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
+                continue;
+            }
 
             if parameter.is_out() || is_sig_byref {
                 let slot_index = self.argument_buf.len();
@@ -1870,6 +1990,24 @@ impl MethodCall {
                     }
                 }
                 NativeType::Buffer => {
+                    let reference = crate::helpers::ReferenceElement::of_signature(param_sig);
+                    if let Some(element) = reference {
+                        let fill = parameter.is_fill_array();
+                        let parsed = nv::napi_parse_reference_array(env, &value, &element, fill);
+                        let mut array = match parsed {
+                            Ok(array) => array,
+                            Err(e) => {
+                                crate::error::set_argument_error(e);
+                                return fail3();
+                            }
+                        };
+                        self.argument_buf.push(NativeValue { u32_value: array.count() });
+                        self.argument_parse_types.push(None);
+                        self.argument_buf.push(NativeValue { pointer: array.pointer() });
+                        self.argument_parse_types.push(None);
+                        reference_arrays.push((value, element, array, fill));
+                        continue;
+                    }
                     let element = crate::helpers::ArrayElement::of_signature(param_sig)
                         .unwrap_or(crate::helpers::ArrayElement::U8);
                     let array = nv::napi_parse_array_arg(env, &value, element).and_then(|array| {
@@ -1942,7 +2080,17 @@ impl MethodCall {
             });
             self.argument_parse_types.push(None);
         } else if !is_void {
-            if is_value_type || is_scalar_return || is_string_return {
+            if is_array_return {
+                // (UINT32 length, T* data) land in the return buffer.
+                self.return_value_buf[..16].fill(0);
+                let base = self.return_value_buf.as_mut_ptr();
+                self.argument_buf.push(NativeValue { pointer: base as *mut c_void });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: unsafe { base.add(8) } as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            } else if is_value_type || is_scalar_return || is_string_return {
                 let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
                 self.argument_parse_types.push(None);
@@ -2030,7 +2178,10 @@ impl MethodCall {
             }
         }
 
-        if !is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+        if !is_initializer
+            && !is_void
+            && (is_value_type || is_scalar_return || is_string_return || is_array_return)
+        {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
@@ -2038,8 +2189,29 @@ impl MethodCall {
         // TODO(ns_proxy port): WinRT-typed out params (structs / class instances) get typed
         // wrappers once create_struct_object_from_raw / create_ns_ctor_instance_object are
         // ported; until then they surface as externals via the fallback below.
+        for (value, element, mut array, fill) in reference_arrays {
+            if fill && hr.is_ok() {
+                nv::napi_write_back_reference_array(env, &value, &element, &mut array);
+            }
+        }
         let mut out_values: Vec<napi::JsUnknown> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
+            if let Some(kind) = &self.si.received_arrays[param_idx] {
+                let converted = unsafe {
+                    let length = self.argument_buf[slot_index].pointer;
+                    let data = self.argument_buf[slot_index + 1].pointer;
+                    crate::napi_engine::invoke::received_array_from_slots(env, kind, length, data)
+                };
+                let Ok(v) = converted else {
+                    return fail3();
+                };
+                if let Some(mut wrapper) = wrapper_obj {
+                    let _ = nv::set_out_param_value(&mut wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
+                continue;
+            }
             let storage_ptr = unsafe {
                 self.argument_buf
                     .get(slot_index)
