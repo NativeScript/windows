@@ -7747,7 +7747,8 @@ unsafe extern "system" fn js_delegate_query_interface(
     out: *mut *mut c_void,
 ) -> HRESULT {
     let d = &*this;
-    if *iid == IUnknown::IID || *iid == d.guid {
+    // Agile: off-thread invokes run on the owner JS thread.
+    if *iid == IUnknown::IID || *iid == d.guid || *iid == crate::value::IID_IAGILE_OBJECT {
         *out = this as *mut c_void;
         js_delegate_add_ref(this);
         HRESULT(0)

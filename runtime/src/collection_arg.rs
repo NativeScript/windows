@@ -22,7 +22,7 @@ const E_NOINTERFACE: HRESULT = HRESULT(0x80004002u32 as i32);
 const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 const S_OK: HRESULT = HRESULT(0);
 const IID_IINSPECTABLE: GUID = GUID::from_u128(0xAF86E2E0_B12D_4c6a_9C5A_D7AA65101E90);
-const IID_IAGILE_OBJECT: GUID = GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90);
+use crate::value::IID_IAGILE_OBJECT;
 
 const COLLECTIONS: &str = "Windows.Foundation.Collections.";
 

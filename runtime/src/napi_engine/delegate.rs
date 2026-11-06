@@ -213,7 +213,8 @@ unsafe extern "system" fn napi_delegate_query_interface(
     out: *mut *mut c_void,
 ) -> HRESULT {
     let d = &*this;
-    if *iid == IUnknown::IID || *iid == d.guid {
+    // Agile: off-thread invokes run on the owner JS thread.
+    if *iid == IUnknown::IID || *iid == d.guid || *iid == crate::value::IID_IAGILE_OBJECT {
         *out = this as *mut c_void;
         napi_delegate_add_ref(this);
         HRESULT(0)
@@ -624,7 +625,7 @@ const AS_DELEGATE_HELPER_JS: &str = r#"
 "#;
 
 /// Stringify a napi value (used for exception capture); None on failure.
-unsafe fn napi_value_to_rust_string(env: sys::napi_env, value: sys::napi_value) -> Option<String> {
+pub(crate) unsafe fn napi_value_to_rust_string(env: sys::napi_env, value: sys::napi_value) -> Option<String> {
     let mut coerced: sys::napi_value = std::ptr::null_mut();
     if sys::napi_coerce_to_string(env, value, &mut coerced) != sys::Status::napi_ok {
         return None;
