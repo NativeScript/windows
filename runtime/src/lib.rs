@@ -139,15 +139,12 @@ use windows::core::{IUnknown, Interface, GUID, HSTRING, PCWSTR};
 use windows::core::{Error, HRESULT};
 #[cfg(feature = "classic")]
 use windows::core::IInspectable;
-#[cfg(feature = "classic")]
-use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::WinRT::RoGetActivationFactory;
 #[cfg(feature = "classic")]
 use windows::Win32::System::WinRT::{
     IActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED,
 };
-#[cfg(feature = "classic")]
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
@@ -870,27 +867,32 @@ fn fill_class_members(
             }
         }
     };
-    let mut absorb_methods = |list: &[MethodDeclaration]| {
-        for m in list {
-            let key = if !m.overload_name().is_empty() {
-                m.overload_name()
-            } else {
-                m.name()
-            };
-            if !methods.contains_key(key) {
-                methods.insert(key.to_string(), m.clone());
-            }
-        }
-    };
+    let mut lists: Vec<&[MethodDeclaration]> = vec![class_declaration.methods()];
     absorb_props(class_declaration.properties());
-    absorb_methods(class_declaration.methods());
     if let Some(di) = class_declaration.default_interface() {
         absorb_props(di.properties());
-        absorb_methods(di.methods());
+        lists.push(di.methods());
     }
     for iface in class_declaration.implemented_interfaces() {
         absorb_props(iface.properties());
-        absorb_methods(iface.methods());
+        lists.push(iface.methods());
+    }
+    for m in lists.iter().flat_map(|l| l.iter()) {
+        let key = if !m.overload_name().is_empty() {
+            m.overload_name()
+        } else {
+            m.name()
+        };
+        if !methods.contains_key(key) {
+            methods.insert(key.to_string(), m.clone());
+        }
+    }
+    // The public name must reach overloads that all carry an `[Overload]` name
+    // (`StorageFile.CopyAsync` is `CopyOverload*`); callers switch arity from there.
+    for m in lists.iter().flat_map(|l| l.iter()) {
+        if !methods.contains_key(m.name()) {
+            methods.insert(m.name().to_string(), m.clone());
+        }
     }
     if !class_declaration.base_full_name().is_empty() {
         if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
@@ -1186,10 +1188,34 @@ pub(crate) fn return_value_from_kind<'a>(
         ReturnKind::Struct(declaration) => {
             create_struct_object_from_raw(declaration.clone(), result, scope).into()
         }
+        ReturnKind::InterfaceObject { decl, type_name } => {
+            if result.is_null() {
+                v8::null(scope).into()
+            } else {
+                let instance = unsafe { IUnknown::from_raw(result) };
+                // Wrap by the runtime class: an interface such as IPropertySet declares no
+                // members itself and only requires the generic IMap/IIterable instances.
+                match crate::ns_proxy::resolve_runtime_class(&instance, type_name.as_ref()) {
+                    Some((name, class)) => {
+                        let instance = Some(instance);
+                        create_ns_ctor_instance_object(&name, None, None, class, instance, scope)
+                            .into()
+                    }
+                    None => create_ns_ctor_instance_object(
+                        type_name.as_ref(),
+                        None,
+                        parent,
+                        decl.clone(),
+                        Some(instance),
+                        scope,
+                    )
+                    .into(),
+                }
+            }
+        }
         ReturnKind::Object {
             decl, type_name, ..
-        }
-        | ReturnKind::InterfaceObject { decl, type_name } => {
+        } => {
             if result.is_null() {
                 v8::null(scope).into()
             } else {
@@ -1733,18 +1759,60 @@ pub(crate) fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     }
 }
 
-/// `IInitializeWithWindow` support probe for a freshly constructed object. A raw QueryInterface:
-/// `cast` builds a `windows_core::Error` (which calls GetErrorInfo) for the E_NOINTERFACE
-/// outcome that almost every class produces, on every construct.
-#[cfg(feature = "classic")]
-fn query_initialize_with_window(unk: &IUnknown) -> Option<IInitializeWithWindow> {
+/// Gives a freshly constructed object that supports `IInitializeWithWindow` (pickers, dialogs)
+/// the app's window as its owner. A raw QueryInterface: `cast` builds a `windows_core::Error`
+/// (which calls GetErrorInfo) for the E_NOINTERFACE outcome that almost every class produces,
+/// on every construct.
+pub(crate) fn initialize_with_owner_window(unk: &IUnknown) {
     let mut out: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { unk.query(&IInitializeWithWindow::IID, &mut out) };
-    if hr.is_ok() && !out.is_null() {
-        Some(unsafe { IInitializeWithWindow::from_raw(out) })
-    } else {
-        None
+    if hr.is_err() || out.is_null() {
+        return;
     }
+    let init = unsafe { IInitializeWithWindow::from_raw(out) };
+    if let Some(hwnd) = owner_window() {
+        let _ = unsafe { init.Initialize(hwnd) };
+    }
+}
+
+/// A visible, unowned top-level window of this thread, else of this process, else the console.
+fn owner_window() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible,
+        GW_OWNER,
+    };
+
+    unsafe extern "system" fn pick(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let unowned = GetWindow(hwnd, GW_OWNER).map_or(true, |owner| owner.is_invalid());
+        if IsWindowVisible(hwnd).as_bool() && unowned {
+            *(found.0 as *mut HWND) = hwnd;
+            return false.into();
+        }
+        true.into()
+    }
+    unsafe extern "system" fn pick_in_process(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != GetCurrentProcessId() {
+            return true.into();
+        }
+        pick(hwnd, found)
+    }
+
+    let mut found = HWND::default();
+    let slot = LPARAM(&mut found as *mut HWND as isize);
+    unsafe {
+        let _ = EnumThreadWindows(GetCurrentThreadId(), Some(pick), slot);
+        if found.is_invalid() {
+            let _ = EnumWindows(Some(pick_in_process), slot);
+        }
+        if found.is_invalid() {
+            found = windows::Win32::System::Console::GetConsoleWindow();
+        }
+    }
+    (!found.is_invalid()).then_some(found)
 }
 
 pub(crate) fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
@@ -6196,12 +6264,7 @@ fn create_ns_ctor_object<'a>(
                                         }
                                     };
 
-                                    if let Some(init) = query_initialize_with_window(&result) {
-                                        let hwnd = unsafe { GetConsoleWindow() };
-                                        if !hwnd.is_invalid() {
-                                            let _ = unsafe { init.Initialize(hwnd) };
-                                        }
-                                    }
+                                    crate::initialize_with_owner_window(&result);
 
                                     {
                                         let declaration = Arc::clone(&class_declaration);
@@ -6259,12 +6322,7 @@ fn create_ns_ctor_object<'a>(
                         }
                         let result = unsafe { IUnknown::from_raw(qi_ptr) };
 
-                        if let Some(init) = query_initialize_with_window(&result) {
-                            let hwnd = unsafe { GetConsoleWindow() };
-                            if !hwnd.is_invalid() {
-                                let _ = unsafe { init.Initialize(hwnd) };
-                            }
-                        }
+                        crate::initialize_with_owner_window(&result);
 
                         {
                                         let declaration = Arc::clone(&class_declaration);
@@ -9088,6 +9146,9 @@ mod instance_cache_test;
 
 #[cfg(all(test, feature = "classic"))]
 mod interop_test;
+
+#[cfg(all(test, feature = "classic"))]
+mod projection_test;
 
 #[cfg(all(test, feature = "classic"))]
 mod js_delegate_tests {

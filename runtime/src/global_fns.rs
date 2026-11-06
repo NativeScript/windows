@@ -3374,6 +3374,14 @@ fn bin_write_v8_arg(
 
     if arg.is_object() {
         if let Some(obj) = arg.to_object(scope) {
+            // A WinRT object: tag 0x0A + its IUnknown. Borrowed: the wrapper keeps it alive
+            // while the bridge wraps it, and the managed wrapper takes its own reference.
+            if let Some(instance) = crate::ns_proxy::this_instance(scope, obj) {
+                let ptr = instance.as_raw() as u64;
+                buf.push(0x0A);
+                buf.extend_from_slice(&ptr.to_le_bytes());
+                return;
+            }
             // Dotnet bridge handle: { __handle: i32 }
             if let Some(key) = v8::String::new(scope, "__handle") {
                 if let Some(hval) = obj.get(scope, key.into()) {
@@ -3645,6 +3653,14 @@ fn bin_write_v8_value(
 
     if arg.is_object() {
         if let Some(obj) = arg.to_object(scope) {
+            // A WinRT object: tag 0x0A + its IUnknown. Borrowed: the wrapper keeps it alive
+            // while the bridge wraps it, and the managed wrapper takes its own reference.
+            if let Some(instance) = crate::ns_proxy::this_instance(scope, obj) {
+                let ptr = instance.as_raw() as u64;
+                buf.push(0x0A);
+                buf.extend_from_slice(&ptr.to_le_bytes());
+                return;
+            }
             // Dotnet bridge handle: { __handle: i32 }
             if let Some(key) = v8::String::new(scope, "__handle") {
                 if let Some(hval) = obj.get(scope, key.into()) {

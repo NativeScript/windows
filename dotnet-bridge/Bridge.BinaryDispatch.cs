@@ -579,6 +579,12 @@ public static partial class Bridge
             {
                 return original;
             }
+            // The C#/WinRT projection (FileOpenPicker, StorageFile, ...) when the app loads
+            // C#/WinRT, so the object casts to its projected type and works with
+            // WinRT.Interop.InitializeWithWindow.
+            var projected = TryProjectWinRT(nativePtr);
+            if (projected is not null && targetType.IsInstanceOfType(projected))
+                return projected;
             // 1. Typed QI first: works for COM/CsWinRT interface types that carry a
             //    [Guid] attribute.  More precise than a generic RCW for strongly-typed
             //    parameters such as Windows.UI.Xaml.UIElement.

@@ -669,6 +669,30 @@ public static partial class Bridge
         }
     }
 
+    private static MethodInfo? s_marshalInspectableFromAbi;
+
+    // WinRT.MarshalInspectable<object>.FromAbi(ptr), found by reflection: the C#/WinRT projection
+    // of a native WinRT object. Null when C#/WinRT isn't loaded or can't project it.
+    private static object? TryProjectWinRT(IntPtr ptr)
+    {
+        try
+        {
+            if (s_marshalInspectableFromAbi is null)
+            {
+                var open = AppDomain.CurrentDomain.GetAssemblies()
+                    .Select(a => a.GetType("WinRT.MarshalInspectable`1"))
+                    .FirstOrDefault(t => t is not null);
+                s_marshalInspectableFromAbi = open?.MakeGenericType(typeof(object)).GetMethod(
+                    "FromAbi", BindingFlags.Public | BindingFlags.Static, [typeof(IntPtr)]);
+            }
+            return s_marshalInspectableFromAbi?.Invoke(null, [ptr]);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     [UnmanagedCallersOnly(EntryPoint = "Invoke",
         CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
     public static unsafe int Invoke(

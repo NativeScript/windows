@@ -947,9 +947,11 @@ pub(crate) fn activate_instance(class_name: &str) -> Result<IUnknown, AnyError> 
         .map_err(|e| generic_error(format!("{class_name} is not default-activatable: {e}")))?;
     let inspectable: IInspectable = unsafe { af.ActivateInstance() }
         .map_err(|e| generic_error(format!("ActivateInstance failed for {class_name}: {e}")))?;
-    inspectable
+    let instance = inspectable
         .cast::<IUnknown>()
-        .map_err(|e| generic_error(format!("activated-instance cast failed: {e}")))
+        .map_err(|e| generic_error(format!("activated-instance cast failed: {e}")))?;
+    crate::initialize_with_owner_window(&instance);
+    Ok(instance)
 }
 
 /// Backing state for an instance proxy, shared by its traps (Rc'd into each closure).
@@ -1229,6 +1231,20 @@ pub fn create_instance_proxy(
         }
         return Ok(obj);
     }
+
+    // An interface such as IPropertySet declares no members itself (only the generic IMap and
+    // IIterable it requires), so proxy the runtime class when metadata has it.
+    let resolved = if !class_name.contains('<')
+        && crate::napi_engine::ns_hostobject::is_interface(&declaration)
+    {
+        crate::napi_engine::ns_hostobject::runtime_class(&instance)
+    } else {
+        None
+    };
+    let (class_name, declaration) = match &resolved {
+        Some((name, decl)) => (name.as_str(), decl.clone()),
+        None => (class_name, declaration),
+    };
 
     // Proxy path (interfaces, collections, or host disabled). Identity by the declared type.
     if let Some(id) = identity {
