@@ -1,5 +1,5 @@
 node_modules/
-# napi-rs binary outputs (CI builds per-triple; npm/<triple>/ receives them at publish time)
+# napi-rs binary outputs (the release build packs one per triple)
 *.node
 artifacts/
 # index.js / index.d.ts / package-lock.json are generated but COMMITTED: the publish CI job

@@ -34,7 +34,6 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "artifacts": "napi artifacts",
     "test": "node test/run-tests.js"
   },
   "repository": {
@@ -44,9 +43,5 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
-  },
-  "optionalDependencies": {
-    "@nativescript/windows-napi-win32-x64-msvc": "0.1.0",
-    "@nativescript/windows-napi-win32-arm64-msvc": "0.1.0"
   }
 }

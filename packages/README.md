@@ -142,14 +142,10 @@ for the engine (above), then `npm publish` the package (each is `os:["win32"], c
 classic package also ships arm64 + devtools). The CLI picks one, like android's `jsEngine` — and
 because the packages are interchangeable, switching is a dependency swap.
 
-**`@nativescript/windows-napi` — the Node/Bun/Deno `.node`** (`../windows-napi`):
-napi-rs flow, **implemented in `.github/workflows/windows-napi.yml`**: a build matrix per triple
-(`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`) runs `napi build --platform --release
---target <triple>` → `windows.<triple>.node` artifacts (the x64 job also runs the 366-check test
-suite, non-blocking on server SKUs); pushing a **`windows-napi-v*` tag** triggers the publish job:
-`napi artifacts` distributes the .node files into the committed `windows-napi/npm/<triple>/`
-sub-packages, `napi prepublish` (the `prepublishOnly` script) publishes those, then the root
-package publishes with them as `optionalDependencies`. Needs the `NPM_TOKEN` repo secret.
-`index.js`/`index.d.ts`/`package-lock.json` are generated but committed (the publish job doesn't
-build). If arm64 proves unbuildable (rusty_v8/libffi cross), drop the triple from the workflow
-matrix, `napi.triples`, `optionalDependencies`, and `npm/win32-arm64-msvc/`.
+**`@nativescript/windows-napi` — the Node/Bun/Deno `.node`** (`../windows-napi`): released by
+`.github/workflows/npm_release.yml` with the packages above (`engine: napi`, also part of `all`).
+The build runs `napi build --platform --release --target <triple>` for `x86_64-pc-windows-msvc`
+and `aarch64-pc-windows-msvc` and packs both `windows.<triple>.node` files into the one package;
+the generated loader picks the one for the running CPU. `.github/workflows/windows-napi.yml`
+builds both triples and runs the test suite on pull requests. `index.js`/`index.d.ts`/
+`package-lock.json` are generated but committed.

@@ -32,36 +32,18 @@ const PACKAGES = {
   jsc: { dir: "packages/windows-jsc", name: "@nativescript/windows-jsc" },
   quickjs: { dir: "packages/windows-quickjs", name: "@nativescript/windows-quickjs" },
   v8: { dir: "packages/windows-v8", name: "@nativescript/windows-v8" },
+  // The Node-API addon: one package carrying a `windows.<triple>.node` per target.
+  napi: { dir: "windows-napi", name: "@nativescript/windows-napi" },
 };
-
-// `napi`: the @nativescript/windows-napi addon, published napi-rs style as a JS root package plus
-// one binary package per triple. Each is its own matrix entry; `kind` selects the build steps.
-const NAPI = [
-  {
-    key: "napi-x64",
-    dir: "windows-napi/npm/win32-x64-msvc",
-    name: "@nativescript/windows-napi-win32-x64-msvc",
-    kind: "napi-binding",
-    target: "x86_64-pc-windows-msvc",
-  },
-  {
-    key: "napi-arm64",
-    dir: "windows-napi/npm/win32-arm64-msvc",
-    name: "@nativescript/windows-napi-win32-arm64-msvc",
-    kind: "napi-binding",
-    target: "aarch64-pc-windows-msvc",
-  },
-  { key: "napi", dir: "windows-napi", name: "@nativescript/windows-napi", kind: "napi-root" },
-];
-const ENGINES = [...Object.keys(PACKAGES), "napi"];
+const ENGINES = Object.keys(PACKAGES);
 
 const USAGE = `Usage: node scripts/resolve-release.mjs [--version <version>] [--engine <engine>] [--skip-arm64]
 
   --version     release version to cut (leading "v" allowed); empty or omitted resolves from
                 GITHUB_REF (v* tag) or falls back to a rolling "next" prerelease
   --engine      all (default) | ${ENGINES.join(" | ")}
-  --skip-arm64  build classic x64-only and skip the windows-napi arm64 package (the engine
-                variants are x64-only regardless)
+  --skip-arm64  build classic and windows-napi x64-only (the engine variants are x64-only
+                regardless)
   -h, --help    show this help`;
 
 let values;
@@ -144,11 +126,10 @@ if (inputVersion) {
   // that is already released takes a patch bump, so the "next" channel never trails "latest".
   let base;
   for (const e of engines) {
-    const dir = e === "napi" ? "windows-napi" : PACKAGES[e].dir;
-    const manifest = path.join(repoRoot, dir, "package.json");
+    const manifest = path.join(repoRoot, PACKAGES[e].dir, "package.json");
     const declared = parseVersion(
       JSON.parse(fs.readFileSync(manifest, "utf8")).version,
-      `${dir}/package.json version`
+      `${PACKAGES[e].dir}/package.json version`
     );
     if (!base || isNewer(declared, base)) base = declared;
   }
@@ -160,51 +141,30 @@ if (inputVersion) {
 const tag = npmTag(parseVersion(version, "Release version"), version);
 
 // One matrix entry per package. Besides the engine key the workflow needs, for each package:
-//   kind             framework (classic and engine variants) | napi-binding | napi-root
 //   dir              where package.json lives (npm version / npm pack run there)
 //   npm_name         the published name
 //   tarball          what `npm pack` emits ("@scope/name" -> "scope-name-<version>.tgz")
-//   napi_target      the Rust triple a napi-binding entry builds
-//   rust_targets     extra Rust targets the toolchain must install (classic cross-compiles arm64)
+//   rust_targets     Rust targets to install and build: classic and napi also build arm64, and
+//                    napi builds one `.node` per target
 //   rust_workspaces  the Swatinem/rust-cache `workspaces` mapping; the engine packages are excluded
 //                    from the root workspace and build into their own target/ dir
-const tarball = (name) => `${name.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
-const include = [];
-for (const e of engines) {
-  if (e === "napi") {
-    for (const n of NAPI) {
-      if (n.target === "aarch64-pc-windows-msvc" && values["skip-arm64"]) continue;
-      include.push({
-        engine: n.key,
-        kind: n.kind,
-        dir: n.dir,
-        npm_name: n.name,
-        tarball: tarball(n.name),
-        napi_target: n.target || "",
-        rust_targets: n.target || "",
-        rust_workspaces: ". -> target",
-      });
-    }
-    continue;
-  }
-  const pkg = PACKAGES[e];
-  const classic = e === "classic";
-  include.push({
-    engine: e,
-    kind: "framework",
-    dir: pkg.dir,
-    npm_name: pkg.name,
-    tarball: tarball(pkg.name),
-    napi_target: "",
-    rust_targets: classic
-      ? values["skip-arm64"]
-        ? "x86_64-pc-windows-msvc"
-        : "x86_64-pc-windows-msvc,aarch64-pc-windows-msvc"
-      : "",
-    rust_workspaces: classic ? ". -> target" : `. -> target\n${pkg.dir} -> target`,
-  });
-}
-const matrix = { include };
+const allArchs = values["skip-arm64"]
+  ? "x86_64-pc-windows-msvc"
+  : "x86_64-pc-windows-msvc,aarch64-pc-windows-msvc";
+const matrix = {
+  include: engines.map((e) => {
+    const pkg = PACKAGES[e];
+    const inRootWorkspace = e === "classic" || e === "napi";
+    return {
+      engine: e,
+      dir: pkg.dir,
+      npm_name: pkg.name,
+      tarball: `${pkg.name.replace(/^@/, "").replace("/", "-")}-${version}.tgz`,
+      rust_targets: inRootWorkspace ? allArchs : "",
+      rust_workspaces: inRootWorkspace ? ". -> target" : `. -> target\n${pkg.dir} -> target`,
+    };
+  }),
+};
 
 if (process.env.GITHUB_OUTPUT) {
   fs.appendFileSync(
@@ -213,5 +173,5 @@ if (process.env.GITHUB_OUTPUT) {
   );
 }
 console.log(
-  `Resolved ${version} (dist-tag: ${tag}) for ${include.map((i) => i.npm_name).join(", ")}`
+  `Resolved ${version} (dist-tag: ${tag}) for ${engines.map((e) => PACKAGES[e].name).join(", ")}`
 );
