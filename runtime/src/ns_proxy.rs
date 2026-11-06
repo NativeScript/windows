@@ -39,9 +39,7 @@ use v8::{FunctionTemplate, Local};
 use windows::core::{IInspectable, IUnknown, Interface, HSTRING};
 use windows::Foundation::Collections::IPropertySet;
 use windows::Foundation::PropertyValue;
-use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::WinRT::IActivationFactory;
-use windows::Win32::UI::Shell::IInitializeWithWindow;
 
 // Track constructors currently being built on this thread to avoid re-entrant
 // template/property mutations that can corrupt V8 descriptor arrays.
@@ -2018,6 +2016,25 @@ pub(crate) fn create_ns_object<'a>(
     object.into()
 }
 
+/// The metadata class named by `instance`'s GetRuntimeClassName, when it differs from
+/// `declared` and neither name is a generic instance.
+pub(crate) fn resolve_runtime_class(
+    instance: &IUnknown,
+    declared: &str,
+) -> Option<(String, Arc<RwLock<dyn Declaration>>)> {
+    if declared.contains('<') {
+        return None;
+    }
+    instance
+        .cast::<IInspectable>()
+        .ok()
+        .and_then(|insp| insp.GetRuntimeClassName().ok())
+        .map(|cn| cn.to_string())
+        .filter(|cn| !cn.is_empty() && cn != declared && !cn.contains('<'))
+        .and_then(|cn| MetadataReader::find_by_name(&cn).map(|d| (cn, d)))
+        .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
+}
+
 pub(crate) fn create_ns_ctor_instance_object<'a>(
     name: &str,
     factory: Option<IUnknown>,
@@ -2035,18 +2052,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
         }
     }
 
-    let resolved_concrete: Option<(String, Arc<RwLock<dyn Declaration>>)> = if name.contains('<') {
-        None
-    } else {
-        instance
-            .as_ref()
-            .and_then(|unk| unk.cast::<IInspectable>().ok())
-            .and_then(|insp| insp.GetRuntimeClassName().ok())
-            .map(|cn| cn.to_string())
-            .filter(|cn| !cn.is_empty() && cn != name && !cn.contains('<'))
-            .and_then(|cn| MetadataReader::find_by_name(&cn).map(|d| (cn, d)))
-            .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
-    };
+    let resolved_concrete = instance
+        .as_ref()
+        .and_then(|unk| resolve_runtime_class(unk, name));
     let (name, declaration): (&str, Arc<RwLock<dyn Declaration>>) = match &resolved_concrete {
         Some((cn, d)) => (cn.as_str(), d.clone()),
         None => (name, declaration),
@@ -2119,6 +2127,8 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                     } else {
                         method.overload_name().to_string()
                     };
+                    // The prototype binds one overload per name; the callback switches on argc.
+                    crate::class_helpers::register_overload_siblings(clazz, &method_name, method);
                     let is_static = method.is_static();
                     let key = format!(
                         "{}:{}",
@@ -2154,6 +2164,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                        let argc = args.length() as usize;
+                        let alt = crate::class_helpers::overload_for_argc(method, argc);
+                        let method = alt.as_ref().unwrap_or(method);
                         let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
                             return;
                         };
@@ -3306,12 +3319,7 @@ pub(crate) fn create_ns_ctor_object<'a>(
                                         // when XAML later calls UIElement vtable slots on it.
                                         let result: IUnknown = instance.into();
 
-                                        if let Ok(init) = result.cast::<IInitializeWithWindow>() {
-                                            let hwnd = unsafe { GetConsoleWindow() };
-                                            if !hwnd.is_invalid() {
-                                                let _ = unsafe { init.Initialize(hwnd) };
-                                            }
-                                        }
+                                        crate::initialize_with_owner_window(&result);
 
                                         let instance = create_ns_ctor_instance_object(
                                             clazz.name(),
@@ -3363,12 +3371,7 @@ pub(crate) fn create_ns_ctor_object<'a>(
                                 // when XAML calls UIElement vtable slots on the stored object.
                                 let result = IUnknown::from_raw(result);
 
-                                if let Ok(init) = result.cast::<IInitializeWithWindow>() {
-                                    let hwnd = unsafe { GetConsoleWindow() };
-                                    if !hwnd.is_invalid() {
-                                        let _ = unsafe { init.Initialize(hwnd) };
-                                    }
-                                }
+                                crate::initialize_with_owner_window(&result);
 
                                 let instance = create_ns_ctor_instance_object(
                                     clazz.name(),

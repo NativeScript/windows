@@ -165,15 +165,24 @@ pub fn is_interface(declaration: &Decl) -> bool {
     )
 }
 
+/// The metadata class named by `instance`'s GetRuntimeClassName.
+pub fn runtime_class(instance: &IUnknown) -> Option<(String, Decl)> {
+    let inspectable = instance.cast::<IInspectable>().ok()?;
+    let name = unsafe { inspectable.GetRuntimeClassName() }.ok()?.to_string();
+    let declaration = MetadataReader::find_by_name(&name)?;
+    if !matches!(declaration.read().kind(), DeclarationKind::Class) {
+        return None;
+    }
+    Some((name, declaration))
+}
+
 /// For an interface-typed instance, ask the concrete object for its runtime class and, if that class
 /// is host-eligible, return its (name, declaration) so it can be host-wrapped instead of Proxy'd.
 pub fn runtime_class_host_target(instance: &IUnknown) -> Option<(String, Decl)> {
     if !host_enabled() {
         return None;
     }
-    let inspectable = instance.cast::<IInspectable>().ok()?;
-    let name = unsafe { inspectable.GetRuntimeClassName() }.ok()?.to_string();
-    let declaration = MetadataReader::find_by_name(&name)?;
+    let (name, declaration) = runtime_class(instance)?;
     let eligible = {
         let lock = declaration.read();
         match lock.as_any().downcast_ref::<ClassDeclaration>() {
@@ -324,9 +333,11 @@ fn activate_prepared(
     };
     let inspectable: IInspectable = unsafe { af.ActivateInstance() }
         .map_err(|e| generic_error(format!("ActivateInstance failed for {class_name}: {e}")))?;
-    inspectable
+    let instance = inspectable
         .cast::<IUnknown>()
-        .map_err(|e| generic_error(format!("activated-instance cast failed: {e}")))
+        .map_err(|e| generic_error(format!("activated-instance cast failed: {e}")))?;
+    crate::initialize_with_owner_window(&instance);
+    Ok(instance)
 }
 
 /// Parameterized construction (`new Class(args)`): pick the initializer by arity, prepare it on
