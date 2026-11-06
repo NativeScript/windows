@@ -529,7 +529,10 @@ fn try_unbox_property_value<'a>(
         PropertyType::Rect => boxed_struct(scope, "Windows.Foundation.Rect", &pv.GetRect().ok()?),
         PropertyType::TimeSpan => boxed_struct(scope, "Windows.Foundation.TimeSpan", &pv.GetTimeSpan().ok()?),
         PropertyType::DateTime => boxed_struct(scope, "Windows.Foundation.DateTime", &pv.GetDateTime().ok()?),
-        _ => None,
+        kind => {
+            let (kind, length, data) = crate::helpers::boxed_array(&pv, kind)?;
+            Some(unsafe { crate::received_array_value(&kind, length, data, scope) })
+        }
     }
 }
 
@@ -744,7 +747,8 @@ pub(crate) fn handle_named_property_getter(
                                         .return_kind()
                                     {
                                         ReturnKind::Void => None,
-                                        kind @ ReturnKind::Reference { .. } => {
+                                        kind @ (ReturnKind::Reference { .. }
+                                        | ReturnKind::Array { .. }) => {
                                             Some(crate::return_value_from_kind(
                                                 kind, result, None, scope,
                                             ))
@@ -1080,7 +1084,7 @@ fn instance_method_dispatch(
 
     let return_value_opt: Option<Local<v8::Value>> = match method.return_kind() {
         ReturnKind::Void => None,
-        kind @ ReturnKind::Reference { .. } => {
+        kind @ (ReturnKind::Reference { .. } | ReturnKind::Array { .. }) => {
             Some(crate::return_value_from_kind(kind, result, None, scope))
         }
         ReturnKind::Guid => {
@@ -1370,7 +1374,7 @@ pub(crate) fn handle_instance_property_getter(
 
         let ret_val: Option<Local<v8::Value>> = match property_call.return_kind() {
             ReturnKind::Void => None,
-            kind @ ReturnKind::Reference { .. } => {
+            kind @ (ReturnKind::Reference { .. } | ReturnKind::Array { .. }) => {
                 Some(crate::return_value_from_kind(kind, result, None, scope))
             }
             ReturnKind::Guid => {
@@ -2198,7 +2202,8 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         } else if !method.is_void() {
                             let ret_v: Option<Local<v8::Value>> = match method.return_kind() {
                                 ReturnKind::Void => None,
-                                kind @ ReturnKind::Reference { .. } => {
+                                kind @ (ReturnKind::Reference { .. }
+                                | ReturnKind::Array { .. }) => {
                                     Some(crate::return_value_from_kind(kind, result, None, scope))
                                 }
                                 ReturnKind::Guid => {
@@ -2349,7 +2354,8 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             } else if !method.is_void() {
                                 let ret_v: Option<Local<v8::Value>> = match method.return_kind() {
                                     ReturnKind::Void => None,
-                                    kind @ ReturnKind::Reference { .. } => Some(
+                                    kind @ (ReturnKind::Reference { .. }
+                                    | ReturnKind::Array { .. }) => Some(
                                         crate::return_value_from_kind(kind, result, None, scope),
                                     ),
                                     ReturnKind::Guid => {

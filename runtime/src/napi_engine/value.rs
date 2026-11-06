@@ -965,6 +965,14 @@ pub fn napi_parse_pointer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, Any
     }
 
     if vt == ValueType::Object {
+        if let Some(inspectable) = box_array_arg(env, arg) {
+            let ptr = inspectable.as_raw() as *mut c_void;
+            std::mem::forget(inspectable);
+            return Ok(NativeValue { pointer: ptr });
+        }
+    }
+
+    if vt == ValueType::Object {
         let obj: JsObject = unsafe { arg.cast() };
         if let Some(inspectable) = box_struct_shape(env, &obj) {
             let ptr = inspectable.as_raw() as *mut c_void;
@@ -1137,6 +1145,46 @@ pub fn napi_parse_buffer_with_length(
     ))
 }
 
+/// A typed array of `element` holding a copy of `bytes`.
+pub(crate) fn typed_array_from_bytes(
+    env: &Env,
+    element: crate::helpers::ArrayElement,
+    bytes: &[u8],
+) -> Result<JsUnknown, AnyError> {
+    use crate::helpers::ArrayElement as E;
+    let kind: sys::napi_typedarray_type = match element {
+        E::I8 => 0,
+        E::U8 | E::Bool => 1,
+        E::I16 => 3,
+        E::U16 | E::Char16 => 4,
+        E::I32 => 5,
+        E::U32 => 6,
+        E::F32 => 7,
+        E::F64 => 8,
+        E::I64 => 9,
+        E::U64 => 10,
+    };
+    let raw_env = env.raw();
+    let mut data: *mut c_void = std::ptr::null_mut();
+    let mut buffer: sys::napi_value = std::ptr::null_mut();
+    let mut view: sys::napi_value = std::ptr::null_mut();
+    unsafe {
+        let status = sys::napi_create_arraybuffer(raw_env, bytes.len(), &mut data, &mut buffer);
+        if status != sys::Status::napi_ok {
+            return Err(type_error("Could not allocate an ArrayBuffer for a received array"));
+        }
+        if !bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data as *mut u8, bytes.len());
+        }
+        let count = bytes.len() / element.size();
+        let status = sys::napi_create_typedarray(raw_env, kind, count, buffer, 0, &mut view);
+        if status != sys::Status::napi_ok {
+            return Err(type_error("Could not create a typed array for a received array"));
+        }
+        Ok(JsUnknown::from_raw_unchecked(raw_env, view))
+    }
+}
+
 /// The value passed for a `T[]` parameter of primitive `element`: a typed array of the
 /// element's kind, an ArrayBuffer or DataView, a plain array (copied, each element converted the
 /// way the matching typed array stores it) or null.
@@ -1145,7 +1193,7 @@ pub(crate) fn napi_parse_array_arg(
     arg: &JsUnknown,
     element: crate::helpers::ArrayElement,
 ) -> Result<crate::helpers::ArrayArg, AnyError> {
-    use crate::helpers::{ArrayArg, ArrayElement, TypedArrayKind};
+    use crate::helpers::{ArrayArg, ArrayElement};
     let raw_env = env.raw();
     let raw = unsafe { arg.raw() };
     let mut is_array = false;
@@ -1183,33 +1231,7 @@ pub(crate) fn napi_parse_array_arg(
         }
         return Ok(ArrayArg::copied(bytes, element));
     }
-    let mut is_typed = false;
-    let status = unsafe { sys::napi_is_typedarray(raw_env, raw, &mut is_typed) };
-    if status == sys::Status::napi_ok && is_typed {
-        let mut kind: sys::napi_typedarray_type = -1;
-        let mut length = 0usize;
-        let mut data: *mut c_void = std::ptr::null_mut();
-        let mut buffer: sys::napi_value = std::ptr::null_mut();
-        let mut offset = 0usize;
-        unsafe {
-            sys::napi_get_typedarray_info(
-                raw_env, raw, &mut kind, &mut length, &mut data, &mut buffer, &mut offset,
-            )
-        };
-        let kind = match kind {
-            0 => TypedArrayKind::I8,
-            1 => TypedArrayKind::U8,
-            2 => TypedArrayKind::U8Clamped,
-            3 => TypedArrayKind::I16,
-            4 => TypedArrayKind::U16,
-            5 => TypedArrayKind::I32,
-            6 => TypedArrayKind::U32,
-            7 => TypedArrayKind::F32,
-            8 => TypedArrayKind::F64,
-            9 => TypedArrayKind::I64,
-            10 => TypedArrayKind::U64,
-            _ => TypedArrayKind::Other,
-        };
+    if let Some((kind, _, _)) = typed_array_info(env, arg) {
         if !element.accepts_view(kind) {
             return Err(element.mismatch());
         }
@@ -1217,6 +1239,112 @@ pub(crate) fn napi_parse_array_arg(
     let (value, byte_length) =
         napi_parse_buffer_with_length(env, arg).map_err(|_| element.mismatch())?;
     ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
+}
+
+/// The kind, data and byte length of a typed array; `None` for anything else.
+fn typed_array_info(
+    env: &Env,
+    arg: &JsUnknown,
+) -> Option<(crate::helpers::TypedArrayKind, *mut c_void, usize)> {
+    use crate::helpers::TypedArrayKind;
+    let raw_env = env.raw();
+    let raw = unsafe { arg.raw() };
+    let mut is_typed = false;
+    let status = unsafe { sys::napi_is_typedarray(raw_env, raw, &mut is_typed) };
+    if status != sys::Status::napi_ok || !is_typed {
+        return None;
+    }
+    let mut kind: sys::napi_typedarray_type = -1;
+    let mut length = 0usize;
+    let mut data: *mut c_void = std::ptr::null_mut();
+    let mut buffer: sys::napi_value = std::ptr::null_mut();
+    let mut offset = 0usize;
+    unsafe {
+        sys::napi_get_typedarray_info(
+            raw_env, raw, &mut kind, &mut length, &mut data, &mut buffer, &mut offset,
+        )
+    };
+    let kind = match kind {
+        0 => TypedArrayKind::I8,
+        1 => TypedArrayKind::U8,
+        2 => TypedArrayKind::U8Clamped,
+        3 => TypedArrayKind::I16,
+        4 => TypedArrayKind::U16,
+        5 => TypedArrayKind::I32,
+        6 => TypedArrayKind::U32,
+        7 => TypedArrayKind::F32,
+        8 => TypedArrayKind::F64,
+        9 => TypedArrayKind::I64,
+        10 => TypedArrayKind::U64,
+        _ => TypedArrayKind::Other,
+    };
+    let element_size = match kind {
+        TypedArrayKind::I8 | TypedArrayKind::U8 | TypedArrayKind::U8Clamped => 1,
+        TypedArrayKind::I16 | TypedArrayKind::U16 => 2,
+        TypedArrayKind::I32 | TypedArrayKind::U32 | TypedArrayKind::F32 => 4,
+        TypedArrayKind::I64 | TypedArrayKind::U64 | TypedArrayKind::F64 => 8,
+        TypedArrayKind::Other => 0,
+    };
+    Some((kind, data, length * element_size))
+}
+
+/// A JS array or typed array boxed for an `Object` parameter. A plain array boxes when its
+/// elements are all strings, all numbers, all booleans or all WinRT objects (or null).
+fn box_array_arg(env: &Env, arg: &JsUnknown) -> Option<windows::core::IInspectable> {
+    use crate::helpers::ArrayValues;
+    if let Some((kind, data, length)) = typed_array_info(env, arg) {
+        let bytes = if data.is_null() || length == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(data as *const u8, length) }.to_vec()
+        };
+        return crate::helpers::box_array(ArrayValues::Typed(kind, bytes));
+    }
+    let mut is_array = false;
+    let status = unsafe { sys::napi_is_array(env.raw(), arg.raw(), &mut is_array) };
+    if status != sys::Status::napi_ok || !is_array {
+        return None;
+    }
+    let array: JsObject = unsafe { arg.cast() };
+    let length = array.get_array_length().ok()?;
+    let first = if length > 0 {
+        array.get_element::<JsUnknown>(0).ok()?.get_type().ok()
+    } else {
+        None
+    };
+    let mut values = match first {
+        Some(ValueType::String) => ArrayValues::Strings(Vec::new()),
+        Some(ValueType::Number) => ArrayValues::Numbers(Vec::new()),
+        Some(ValueType::Boolean) => ArrayValues::Booleans(Vec::new()),
+        _ => ArrayValues::Objects(Vec::new()),
+    };
+    for index in 0..length {
+        let item: JsUnknown = array.get_element(index).ok()?;
+        let kind = item.get_type().ok()?;
+        match (&mut values, kind) {
+            (ArrayValues::Strings(out), ValueType::String) => {
+                let s: JsString = unsafe { item.cast() };
+                out.push(HSTRING::from_wide(&string_utf16(s).ok()?));
+            }
+            (ArrayValues::Numbers(out), ValueType::Number) => {
+                let n: JsNumber = unsafe { item.cast() };
+                out.push(n.get_double().ok()?);
+            }
+            (ArrayValues::Booleans(out), ValueType::Boolean) => {
+                let b: JsBoolean = unsafe { item.cast() };
+                out.push(b.get_value().ok()?);
+            }
+            (ArrayValues::Objects(out), ValueType::Null | ValueType::Undefined) => out.push(None),
+            (ArrayValues::Objects(out), ValueType::Object) => {
+                let object: JsObject = unsafe { item.cast() };
+                let pointer = try_get_external_handle(env, &object).filter(|p| !p.is_null())?;
+                let unknown = ManuallyDrop::new(unsafe { IUnknown::from_raw(pointer) });
+                out.push(Some(unknown.cast::<windows::core::IInspectable>().ok()?));
+            }
+            _ => return None,
+        }
+    }
+    crate::helpers::box_array(values)
 }
 
 pub fn napi_parse_struct(
@@ -1577,7 +1705,10 @@ pub fn try_unbox_property_value(env: &Env, raw: *mut c_void) -> Option<JsUnknown
         PropertyType::Rect => boxed_struct(env, "Windows.Foundation.Rect", &unsafe { pv.GetRect() }.ok()?),
         PropertyType::TimeSpan => boxed_struct(env, "Windows.Foundation.TimeSpan", &unsafe { pv.GetTimeSpan() }.ok()?),
         PropertyType::DateTime => boxed_struct(env, "Windows.Foundation.DateTime", &unsafe { pv.GetDateTime() }.ok()?),
-        _ => None,
+        kind => {
+            let (kind, length, data) = crate::helpers::boxed_array(&pv, kind)?;
+            unsafe { crate::napi_engine::invoke::received_array(env, &kind, length, data) }.ok()
+        }
     }
 }
 

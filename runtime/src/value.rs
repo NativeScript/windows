@@ -1208,6 +1208,12 @@ pub fn ffi_parse_pointer_arg(
         }
     }
 
+    if let Some(inspectable) = box_array_arg(scope, arg) {
+        let ptr = inspectable.as_raw() as *mut c_void;
+        std::mem::forget(inspectable);
+        return Ok(NativeValue { pointer: ptr });
+    }
+
     if let Some(inspectable) = arg
         .is_object()
         .then(|| arg.to_object(scope))
@@ -1335,6 +1341,36 @@ pub fn ffi_parse_buffer_arg_with_length(
     Ok((NativeValue { pointer }, byte_length))
 }
 
+/// A typed array of `element` over `bytes`.
+#[cfg(feature = "classic")]
+pub(crate) fn typed_array_from_bytes<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    element: crate::helpers::ArrayElement,
+    bytes: Vec<u8>,
+) -> v8::Local<'a, v8::Value> {
+    use crate::helpers::ArrayElement as E;
+    let count = bytes.len() / element.size();
+    let buffer = if bytes.is_empty() {
+        v8::ArrayBuffer::new(scope, 0)
+    } else {
+        let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+        v8::ArrayBuffer::with_backing_store(scope, &store)
+    };
+    let view: Option<v8::Local<v8::Value>> = match element {
+        E::U8 | E::Bool => v8::Uint8Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I8 => v8::Int8Array::new(scope, buffer, 0, count).map(Into::into),
+        E::U16 | E::Char16 => v8::Uint16Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I16 => v8::Int16Array::new(scope, buffer, 0, count).map(Into::into),
+        E::U32 => v8::Uint32Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I32 => v8::Int32Array::new(scope, buffer, 0, count).map(Into::into),
+        E::U64 => v8::BigUint64Array::new(scope, buffer, 0, count).map(Into::into),
+        E::I64 => v8::BigInt64Array::new(scope, buffer, 0, count).map(Into::into),
+        E::F32 => v8::Float32Array::new(scope, buffer, 0, count).map(Into::into),
+        E::F64 => v8::Float64Array::new(scope, buffer, 0, count).map(Into::into),
+    };
+    view.unwrap_or_else(|| v8::undefined(scope).into())
+}
+
 /// The value passed for a `T[]` parameter of primitive `element`: a typed array of the
 /// element's kind, an ArrayBuffer or DataView, a plain array (copied, each element converted the
 /// way the matching typed array stores it) or null.
@@ -1344,7 +1380,7 @@ pub(crate) fn ffi_parse_array_arg(
     arg: v8::Local<v8::Value>,
     element: crate::helpers::ArrayElement,
 ) -> std::result::Result<crate::helpers::ArrayArg, AnyError> {
-    use crate::helpers::{ArrayArg, ArrayElement, TypedArrayKind};
+    use crate::helpers::{ArrayArg, ArrayElement};
     if let Ok(array) = v8::Local::<v8::Array>::try_from(arg) {
         let length = array.length();
         let mut bytes = Vec::with_capacity(length as usize * element.size());
@@ -1362,7 +1398,21 @@ pub(crate) fn ffi_parse_array_arg(
         return Ok(ArrayArg::copied(bytes, element));
     }
     if arg.is_typed_array() {
-        let kind = if arg.is_uint8_array() {
+        let kind = typed_array_kind(arg);
+        if !element.accepts_view(kind) {
+            return Err(element.mismatch());
+        }
+    }
+    let (value, byte_length) =
+        ffi_parse_buffer_arg_with_length(scope, arg).map_err(|_| element.mismatch())?;
+    ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
+}
+
+#[cfg(feature = "classic")]
+fn typed_array_kind(arg: v8::Local<v8::Value>) -> crate::helpers::TypedArrayKind {
+    use crate::helpers::TypedArrayKind;
+    {
+        if arg.is_uint8_array() {
             TypedArrayKind::U8
         } else if arg.is_uint8_clamped_array() {
             TypedArrayKind::U8Clamped
@@ -1386,14 +1436,57 @@ pub(crate) fn ffi_parse_array_arg(
             TypedArrayKind::U64
         } else {
             TypedArrayKind::Other
-        };
-        if !element.accepts_view(kind) {
-            return Err(element.mismatch());
         }
     }
-    let (value, byte_length) =
-        ffi_parse_buffer_arg_with_length(scope, arg).map_err(|_| element.mismatch())?;
-    ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
+}
+
+/// A JS array or typed array boxed for an `Object` parameter. A plain array boxes when its
+/// elements are all strings, all numbers, all booleans or all WinRT objects (or null).
+#[cfg(feature = "classic")]
+fn box_array_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+) -> Option<windows::core::IInspectable> {
+    use crate::helpers::ArrayValues;
+    if arg.is_typed_array() {
+        let kind = typed_array_kind(arg);
+        let (value, length) = ffi_parse_buffer_arg_with_length(scope, arg).ok()?;
+        let bytes = match unsafe { value.pointer } {
+            pointer if pointer.is_null() || length == 0 => Vec::new(),
+            pointer => unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) }
+                .to_vec(),
+        };
+        return crate::helpers::box_array(ArrayValues::Typed(kind, bytes));
+    }
+    let array = v8::Local::<v8::Array>::try_from(arg).ok()?;
+    let length = array.length();
+    let first = (length > 0).then(|| array.get_index(scope, 0)).flatten();
+    let mut values = match first {
+        Some(v) if v.is_string() => ArrayValues::Strings(Vec::new()),
+        Some(v) if v.is_number() => ArrayValues::Numbers(Vec::new()),
+        Some(v) if v.is_boolean() => ArrayValues::Booleans(Vec::new()),
+        _ => ArrayValues::Objects(Vec::new()),
+    };
+    for index in 0..length {
+        let item = array.get_index(scope, index)?;
+        match &mut values {
+            ArrayValues::Strings(out) if item.is_string() => {
+                out.push(hstring_from_v8_value(scope, item));
+            }
+            ArrayValues::Numbers(out) if item.is_number() => out.push(item.number_value(scope)?),
+            ArrayValues::Booleans(out) if item.is_boolean() => out.push(item.boolean_value(scope)),
+            ArrayValues::Objects(out) if item.is_null_or_undefined() => out.push(None),
+            ArrayValues::Objects(out) if item.is_object() => {
+                let object = item.to_object(scope)?;
+                let pointer = try_get_external_handle(scope, object).filter(|p| !p.is_null())?;
+                let unknown =
+                    ManuallyDrop::new(unsafe { windows::core::IUnknown::from_raw(pointer) });
+                out.push(Some(unknown.cast::<windows::core::IInspectable>().ok()?));
+            }
+            _ => return None,
+        }
+    }
+    crate::helpers::box_array(values)
 }
 
 #[cfg(feature = "classic")]

@@ -59,6 +59,78 @@ fn class_declaration(
 /// Scalars/strings are read from the stable return buffer; enum returns are the slot value
 /// itself; reference types resolve to typed instance proxies (external fallback for structs
 /// and unresolvable types). Shared by method and property invocation.
+/// Reads a received array's `(length, data)` from the callee-written slots and converts it.
+///
+/// # Safety
+/// `length` and `data` point at the call's out slots, written by a successful call or zeroed.
+pub(crate) unsafe fn received_array_from_slots(
+    env: &Env,
+    kind: &ReturnKind,
+    length: *const c_void,
+    data: *const c_void,
+) -> Result<JsUnknown, AnyError> {
+    let length = std::ptr::read_unaligned(length as *const u32);
+    let data = std::ptr::read_unaligned(data as *const *mut c_void);
+    received_array(env, kind, length, data)
+}
+
+/// Converts `length` elements at `data`, an array WinRT allocated, and frees it.
+///
+/// # Safety
+/// `data` is null or a CoTaskMem array of `length` elements of `kind`'s element type.
+pub(crate) unsafe fn received_array(
+    env: &Env,
+    kind: &ReturnKind,
+    length: u32,
+    data: *mut c_void,
+) -> Result<JsUnknown, AnyError> {
+    let converted = received_array_value(env, kind, length, data);
+    if !data.is_null() {
+        windows::Win32::System::Com::CoTaskMemFree(Some(data as *const c_void));
+    }
+    converted
+}
+
+/// Converts `length` elements at `data`, an array WinRT allocated (the caller frees it):
+/// primitives become a typed array, anything else a JS array whose elements take ownership of
+/// the strings and objects.
+unsafe fn received_array_value(
+    env: &Env,
+    kind: &ReturnKind,
+    length: u32,
+    data: *mut c_void,
+) -> Result<JsUnknown, AnyError> {
+    let ReturnKind::Array { element, element_type, size } = kind else {
+        return Err(type_error("not an array return"));
+    };
+    let count = if data.is_null() { 0 } else { length as usize };
+    let primitive = match element.as_ref() {
+        ReturnKind::Primitive(nt) => crate::helpers::ArrayElement::from_native(nt),
+        _ => None,
+    };
+    if let Some(primitive) = primitive {
+        let bytes = if count == 0 {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(data as *const u8, count * size)
+        };
+        return nv::typed_array_from_bytes(env, primitive, bytes);
+    }
+    let mut array = env.create_array_with_length(count).map_err(|e| type_error(e.to_string()))?;
+    for index in 0..count {
+        let slot = (data as *mut u8).add(index * size) as *mut c_void;
+        let item = match element.as_ref() {
+            ReturnKind::Object { .. }
+            | ReturnKind::InterfaceObject { .. }
+            | ReturnKind::DynamicObject => std::ptr::read_unaligned(slot as *const *mut c_void),
+            _ => slot,
+        };
+        let value = convert_call_result(env, element, false, element_type, HRESULT(0), item)?;
+        array.set_element(index as u32, value).map_err(|e| type_error(e.to_string()))?;
+    }
+    Ok(nv::as_unknown(env, array))
+}
+
 pub(crate) fn convert_call_result(
     env: &Env,
     kind: &ReturnKind,
@@ -86,6 +158,10 @@ pub(crate) fn convert_call_result(
     // come back as a derived runtime class; interfaces; enums; structs; Guid; Object; pointer
     // primitives) takes the string-driven resolution below.
     match kind {
+        ReturnKind::Array { .. } => {
+            let data = unsafe { (result as *const u8).add(8) } as *const c_void;
+            return unsafe { received_array_from_slots(env, kind, result, data) };
+        }
         ReturnKind::Object {
             decl,
             type_name,
