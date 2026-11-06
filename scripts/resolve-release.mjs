@@ -11,7 +11,7 @@
 //
 // One version covers every package in a run: the classic runtime and the four engine variants are
 // the same framework built from the same commit and differ only in the runtime DLL, so they
-// release in lockstep.
+// release in lockstep. The windows-napi addon is built from the same runtime crate and follows.
 //
 // The repo has no root package.json, so this stays dependency-free — no semver/dayjs, and no
 // `npm install` step in front of it.
@@ -32,6 +32,8 @@ const PACKAGES = {
   jsc: { dir: "packages/windows-jsc", name: "@nativescript/windows-jsc" },
   quickjs: { dir: "packages/windows-quickjs", name: "@nativescript/windows-quickjs" },
   v8: { dir: "packages/windows-v8", name: "@nativescript/windows-v8" },
+  // The Node-API addon: one package carrying a `windows.<triple>.node` per target.
+  napi: { dir: "windows-napi", name: "@nativescript/windows-napi" },
 };
 const ENGINES = Object.keys(PACKAGES);
 
@@ -40,7 +42,8 @@ const USAGE = `Usage: node scripts/resolve-release.mjs [--version <version>] [--
   --version     release version to cut (leading "v" allowed); empty or omitted resolves from
                 GITHUB_REF (v* tag) or falls back to a rolling "next" prerelease
   --engine      all (default) | ${ENGINES.join(" | ")}
-  --skip-arm64  build the classic package x64-only (the engine variants are x64-only regardless)
+  --skip-arm64  build classic and windows-napi x64-only (the engine variants are x64-only
+                regardless)
   -h, --help    show this help`;
 
 let values;
@@ -141,24 +144,24 @@ const tag = npmTag(parseVersion(version, "Release version"), version);
 //   dir              where package.json lives (npm version / npm pack run there)
 //   npm_name         the published name
 //   tarball          what `npm pack` emits ("@scope/name" -> "scope-name-<version>.tgz")
-//   rust_targets     extra Rust targets the toolchain must install (classic cross-compiles arm64)
+//   rust_targets     Rust targets to install and build: classic and napi also build arm64, and
+//                    napi builds one `.node` per target
 //   rust_workspaces  the Swatinem/rust-cache `workspaces` mapping; the engine packages are excluded
 //                    from the root workspace and build into their own target/ dir
+const allArchs = values["skip-arm64"]
+  ? "x86_64-pc-windows-msvc"
+  : "x86_64-pc-windows-msvc,aarch64-pc-windows-msvc";
 const matrix = {
   include: engines.map((e) => {
     const pkg = PACKAGES[e];
-    const classic = e === "classic";
+    const inRootWorkspace = e === "classic" || e === "napi";
     return {
       engine: e,
       dir: pkg.dir,
       npm_name: pkg.name,
       tarball: `${pkg.name.replace(/^@/, "").replace("/", "-")}-${version}.tgz`,
-      rust_targets: classic
-        ? values["skip-arm64"]
-          ? "x86_64-pc-windows-msvc"
-          : "x86_64-pc-windows-msvc,aarch64-pc-windows-msvc"
-        : "",
-      rust_workspaces: classic ? ". -> target" : `. -> target\n${pkg.dir} -> target`,
+      rust_targets: inRootWorkspace ? allArchs : "",
+      rust_workspaces: inRootWorkspace ? ". -> target" : `. -> target\n${pkg.dir} -> target`,
     };
   }),
 };
