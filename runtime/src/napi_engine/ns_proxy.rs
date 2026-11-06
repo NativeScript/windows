@@ -219,7 +219,8 @@ impl Drop for InstanceCacheEntry {
     fn drop(&mut self) {
         // Entries are dropped from InstanceState::Drop, which runs inside a GC finalizer. Deleting
         // the napi_ref here would call into napi mid-GC (fatal on the V8 shim), so defer it.
-        REF_GRAVEYARD.with(|g| g.borrow_mut().push((self.env, self.proxy_ref)));
+        // During thread teardown the graveyard may already be gone; the reference goes with it.
+        let _ = REF_GRAVEYARD.try_with(|g| g.borrow_mut().push((self.env, self.proxy_ref)));
     }
 }
 
@@ -291,7 +292,7 @@ fn cache_instance(
 /// (`o.SetNamedValue is not a function`). The serial guard prevents evicting a newer proxy that
 /// already re-cached the same address.
 pub(crate) fn evict_instance(identity: usize, serial: u64) {
-    NAPI_INSTANCE_CACHE.with(|c| {
+    let _ = NAPI_INSTANCE_CACHE.try_with(|c| {
         let mut cache = c.borrow_mut();
         if cache.get(&identity).map(|e| e.serial) == Some(serial) {
             cache.remove(&identity);
