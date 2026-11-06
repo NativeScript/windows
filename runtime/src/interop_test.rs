@@ -526,7 +526,7 @@ fn native_wrong_type_throws() {
                 // If none of the WinRT types are present, skip (pass) the test.
                 if (!PropertySetCtor && !CryptBuf && !UriCtor) return;
 
-                const hrex = /HRESULT 0x[0-9A-Fa-f]{8}/;
+                const hrex = /HRESULT 0x[0-9A-Fa-f]{8}|^Error: Expected /;
 
                 if (PropertySetCtor) {
                     try {
@@ -545,7 +545,7 @@ fn native_wrong_type_throws() {
                     try {
                         CryptBuf.CreateFromByteArray('not-an-array');
                     } catch (e) {
-                        if (hrex.test(String(e)) || /HRESULT/.test(String(e))) return;
+                        if (hrex.test(String(e))) return;
                         throw new Error('CryptographicBuffer.CreateFromByteArray threw without HRESULT: ' + String(e));
                     }
                 }
@@ -643,7 +643,7 @@ fn propertyset_marshalling_broad_validation() {
                     } catch (e) {
                         threw = true;
                         const s = String(e || '');
-                        if (!hrex.test(s) && !/HRESULT/.test(s)) {
+                        if (!hrex.test(s) && !/HRESULT|^Error: Expected /.test(s)) {
                             throw new Error('Assignment threw without HRESULT for key ' + c.k + ': ' + s);
                         }
                     }

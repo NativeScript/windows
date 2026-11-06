@@ -975,13 +975,13 @@ pub fn napi_parse_pointer(env: &Env, arg: &JsUnknown) -> Result<NativeValue, Any
 
     let pointer = if vt == ValueType::External {
         ptr_from_external(env, arg).ok_or_else(|| {
-            type_error("Invalid FFI pointer type, expected null, External, or { handle: External|null }")
+            type_error("Expected a WinRT object or null")
         })?
     } else if vt == ValueType::Null || vt == ValueType::Undefined {
         std::ptr::null_mut()
     } else {
         return Err(type_error(
-            "Invalid FFI pointer type, expected null, External, or { handle: External|null }",
+            "Expected a WinRT object or null",
         ));
     };
     Ok(NativeValue { pointer })
@@ -1133,8 +1133,90 @@ pub fn napi_parse_buffer_with_length(
         ));
     }
     Err(type_error(
-        "Invalid FFI buffer type, expected null, ArrayBuffer, or ArrayBufferView",
+        "Expected an ArrayBuffer, a typed array or null",
     ))
+}
+
+/// The value passed for a `T[]` parameter of primitive `element`: a typed array of the
+/// element's kind, an ArrayBuffer or DataView, a plain array (copied, each element converted the
+/// way the matching typed array stores it) or null.
+pub(crate) fn napi_parse_array_arg(
+    env: &Env,
+    arg: &JsUnknown,
+    element: crate::helpers::ArrayElement,
+) -> Result<crate::helpers::ArrayArg, AnyError> {
+    use crate::helpers::{ArrayArg, ArrayElement, TypedArrayKind};
+    let raw_env = env.raw();
+    let raw = unsafe { arg.raw() };
+    let mut is_array = false;
+    let status = unsafe { sys::napi_is_array(raw_env, raw, &mut is_array) };
+    if status == sys::Status::napi_ok && is_array {
+        let array: JsObject = unsafe { arg.cast() };
+        let length = array.get_array_length().map_err(|_| element.mismatch())?;
+        let mut bytes = Vec::with_capacity(length as usize * element.size());
+        for index in 0..length {
+            let item: JsUnknown = array.get_element(index).map_err(|_| element.mismatch())?;
+            match item.get_type().map_err(|_| element.mismatch())? {
+                ValueType::BigInt => {
+                    let (mut value, mut lossless) = (0u64, false);
+                    unsafe {
+                        let item = item.raw();
+                        sys::napi_get_value_bigint_uint64(raw_env, item, &mut value, &mut lossless)
+                    };
+                    element.push_bigint(&mut bytes, value);
+                }
+                _ if element == ArrayElement::Bool => {
+                    let flag = item
+                        .coerce_to_bool()
+                        .and_then(|b| b.get_value())
+                        .map_err(|_| element.mismatch())?;
+                    element.push_number(&mut bytes, flag as u8 as f64);
+                }
+                _ => {
+                    let number = item
+                        .coerce_to_number()
+                        .and_then(|n| n.get_double())
+                        .map_err(|_| element.mismatch())?;
+                    element.push_number(&mut bytes, number);
+                }
+            }
+        }
+        return Ok(ArrayArg::copied(bytes, element));
+    }
+    let mut is_typed = false;
+    let status = unsafe { sys::napi_is_typedarray(raw_env, raw, &mut is_typed) };
+    if status == sys::Status::napi_ok && is_typed {
+        let mut kind: sys::napi_typedarray_type = -1;
+        let mut length = 0usize;
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let mut buffer: sys::napi_value = std::ptr::null_mut();
+        let mut offset = 0usize;
+        unsafe {
+            sys::napi_get_typedarray_info(
+                raw_env, raw, &mut kind, &mut length, &mut data, &mut buffer, &mut offset,
+            )
+        };
+        let kind = match kind {
+            0 => TypedArrayKind::I8,
+            1 => TypedArrayKind::U8,
+            2 => TypedArrayKind::U8Clamped,
+            3 => TypedArrayKind::I16,
+            4 => TypedArrayKind::U16,
+            5 => TypedArrayKind::I32,
+            6 => TypedArrayKind::U32,
+            7 => TypedArrayKind::F32,
+            8 => TypedArrayKind::F64,
+            9 => TypedArrayKind::I64,
+            10 => TypedArrayKind::U64,
+            _ => TypedArrayKind::Other,
+        };
+        if !element.accepts_view(kind) {
+            return Err(element.mismatch());
+        }
+    }
+    let (value, byte_length) =
+        napi_parse_buffer_with_length(env, arg).map_err(|_| element.mismatch())?;
+    ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
 }
 
 pub fn napi_parse_struct(

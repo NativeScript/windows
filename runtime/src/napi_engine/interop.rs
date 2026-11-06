@@ -359,7 +359,7 @@ pub fn install_interop(env: &Env) -> napi::Result<()> {
 /// The JS half of `interop.*`, mirroring the classic runtime's `NSWinRT.interop` block in
 /// `global_fns.rs` HELPER_SOURCE — keep the two in sync. No BigInt literals or modern syntax
 /// so it runs on every engine (the DateTime tick helpers fall back to Number without BigInt).
-const INTEROP_HELPERS_JS: &str = r#"
+const INTEROP_HELPERS_JS: &str = concat!(r#"
 'use strict';
 var g = globalThis;
 if (g.NSWinRT && g.NSWinRT.interop) { return; }
@@ -676,4 +676,4 @@ g.NSWinRT.interop = interop;
 if (g.interop == null) {
     g.interop = interop;
 }
-"#;
+"#, include_str!("../js/interop_array.js"));

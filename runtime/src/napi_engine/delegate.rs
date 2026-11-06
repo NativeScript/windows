@@ -75,6 +75,8 @@ pub(crate) struct NapiDelegate {
     ref_count: AtomicU32,
     guid: GUID,
     data: *mut NapiDelegateData,
+    /// Answers `IReference<D>` for a delegate passed as an `Object`.
+    boxed: crate::delegate_box::DelegateBox,
 }
 
 unsafe impl Send for NapiDelegate {}
@@ -161,13 +163,15 @@ pub(crate) fn make_napi_delegate_typed(
         typed,
         owner_thread: std::thread::current().id(),
     });
-    let delegate = Box::new(NapiDelegate {
+    let delegate = Box::into_raw(Box::new(NapiDelegate {
         vtable,
         ref_count: AtomicU32::new(1),
         guid,
         data: Box::into_raw(data),
-    });
-    Some(Box::into_raw(delegate) as *mut c_void)
+        boxed: crate::delegate_box::DelegateBox::new(guid),
+    }));
+    unsafe { (*delegate).boxed.set_owner(delegate as *mut c_void) };
+    Some(delegate as *mut c_void)
 }
 
 /// Invoke a NapiDelegate COM pointer through its vtable — what a WinRT event source does when
@@ -216,6 +220,10 @@ unsafe extern "system" fn napi_delegate_query_interface(
     // Agile: off-thread invokes run on the owner JS thread.
     if *iid == IUnknown::IID || *iid == d.guid || *iid == crate::value::IID_IAGILE_OBJECT {
         *out = this as *mut c_void;
+        napi_delegate_add_ref(this);
+        HRESULT(0)
+    } else if let Some(boxed) = d.boxed.query(&*iid) {
+        *out = boxed;
         napi_delegate_add_ref(this);
         HRESULT(0)
     } else {

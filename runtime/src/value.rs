@@ -143,13 +143,12 @@ impl TryFrom<&str> for NativeType {
         let signature = native_type.trim();
         let by_ref_inner = signature.strip_prefix("ByRef ").unwrap_or(signature);
 
-        // Array signatures are represented as "T[]" by metadata::Signature.
-        // Byte arrays are best treated as buffer sources in JS; all other arrays
-        // are opaque pointers in this bridge.
+        // Arrays of primitives travel as (count, pointer) over JS memory; other arrays are
+        // opaque pointers.
         if let Some(element) = by_ref_inner.strip_suffix("[]") {
-            return Ok(match element {
-                "UInt8" | "Uint8" | "Int8" | "Byte" | "SByte" => NativeType::Buffer,
-                _ => NativeType::Pointer,
+            return Ok(match crate::helpers::ArrayElement::from_name(element) {
+                Some(_) => NativeType::Buffer,
+                None => NativeType::Pointer,
             });
         }
 
@@ -1226,7 +1225,7 @@ pub fn ffi_parse_pointer_arg(
         std::ptr::null_mut()
     } else {
         return Err(type_error(
-            "Invalid FFI pointer type, expected null, External, or { handle: External|null }",
+            "Expected a WinRT object or null",
         ));
     };
     Ok(NativeValue { pointer })
@@ -1330,10 +1329,71 @@ pub fn ffi_parse_buffer_arg_with_length(
         (std::ptr::null_mut(), 0)
     } else {
         return Err(type_error(
-            "Invalid FFI buffer type, expected null, ArrayBuffer, or ArrayBufferView",
+            "Expected an ArrayBuffer, a typed array or null",
         ));
     };
     Ok((NativeValue { pointer }, byte_length))
+}
+
+/// The value passed for a `T[]` parameter of primitive `element`: a typed array of the
+/// element's kind, an ArrayBuffer or DataView, a plain array (copied, each element converted the
+/// way the matching typed array stores it) or null.
+#[cfg(feature = "classic")]
+pub(crate) fn ffi_parse_array_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    element: crate::helpers::ArrayElement,
+) -> std::result::Result<crate::helpers::ArrayArg, AnyError> {
+    use crate::helpers::{ArrayArg, ArrayElement, TypedArrayKind};
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(arg) {
+        let length = array.length();
+        let mut bytes = Vec::with_capacity(length as usize * element.size());
+        for index in 0..length {
+            let item = array.get_index(scope, index).ok_or_else(|| element.mismatch())?;
+            if let Ok(big) = v8::Local::<v8::BigInt>::try_from(item) {
+                element.push_bigint(&mut bytes, big.u64_value().0);
+            } else if element == ArrayElement::Bool {
+                element.push_number(&mut bytes, item.boolean_value(scope) as u8 as f64);
+            } else {
+                let number = item.number_value(scope).ok_or_else(|| element.mismatch())?;
+                element.push_number(&mut bytes, number);
+            }
+        }
+        return Ok(ArrayArg::copied(bytes, element));
+    }
+    if arg.is_typed_array() {
+        let kind = if arg.is_uint8_array() {
+            TypedArrayKind::U8
+        } else if arg.is_uint8_clamped_array() {
+            TypedArrayKind::U8Clamped
+        } else if arg.is_int8_array() {
+            TypedArrayKind::I8
+        } else if arg.is_uint16_array() {
+            TypedArrayKind::U16
+        } else if arg.is_int16_array() {
+            TypedArrayKind::I16
+        } else if arg.is_uint32_array() {
+            TypedArrayKind::U32
+        } else if arg.is_int32_array() {
+            TypedArrayKind::I32
+        } else if arg.is_float32_array() {
+            TypedArrayKind::F32
+        } else if arg.is_float64_array() {
+            TypedArrayKind::F64
+        } else if arg.is_big_int64_array() {
+            TypedArrayKind::I64
+        } else if arg.is_big_uint64_array() {
+            TypedArrayKind::U64
+        } else {
+            TypedArrayKind::Other
+        };
+        if !element.accepts_view(kind) {
+            return Err(element.mismatch());
+        }
+    }
+    let (value, byte_length) =
+        ffi_parse_buffer_arg_with_length(scope, arg).map_err(|_| element.mismatch())?;
+    ArrayArg::borrowed(unsafe { value.pointer }, byte_length, element)
 }
 
 #[cfg(feature = "classic")]

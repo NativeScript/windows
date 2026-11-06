@@ -12,6 +12,7 @@ pub struct ParameterDeclaration {
     token: CorTokenType,
     parameter_type: PCCOR_SIGNATURE,
     full_name: String,
+    attributes: u32,
 }
 
 impl ParameterDeclaration {
@@ -24,6 +25,7 @@ impl ParameterDeclaration {
         assert_eq!(type_from_token(token), mdtParamDef.0);
         assert_ne!(token.0, 0);
 
+        let mut attributes = 0u32;
         let full_name = match metadata {
             None => String::new(),
             Some(metadata) => {
@@ -37,7 +39,7 @@ impl ParameterDeclaration {
                         0 as _,
                         Some(&mut full_name_data),
                         &mut length,
-                        0 as _,
+                        &mut attributes,
                         0 as _,
                         0 as _,
                         0 as _,
@@ -55,7 +57,14 @@ impl ParameterDeclaration {
             token,
             parameter_type: sig_type,
             full_name,
+            attributes,
         }
+    }
+
+    /// Marked `[out]` without being ByRef: a caller-allocated array the callee fills.
+    pub fn is_fill_array(&self) -> bool {
+        const PD_OUT: u32 = 0x2;
+        self.attributes & PD_OUT != 0 && !self.is_out()
     }
 
     pub fn is_out(&self) -> bool {
