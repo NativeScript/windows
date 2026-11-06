@@ -2344,7 +2344,8 @@ const HELPER_SOURCE: &str = concat!(r#"
             globalThis.URLPattern = URLPattern;
         })();
 
-"#, include_str!("js/dotnet.js"), "\n", include_str!("js/crypto.js"), r#"
+"#, include_str!("js/dotnet.js"), "\n", include_str!("js/events.js"), "\n",
+include_str!("js/crypto.js"), r#"
 
         (function () {
             if (typeof globalThis.__nsWin32Call !== 'function') return;

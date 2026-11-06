@@ -346,7 +346,12 @@ pub fn install_interop(env: &Env) -> napi::Result<()> {
     global.set_named_property("__nsRandomFill", random_fn)?;
 
     let func_ctor: JsFunction = global.get_named_property("Function")?;
-    for source in [INTEROP_HELPERS_JS, include_str!("../js/crypto.js")] {
+    let sources = [
+        INTEROP_HELPERS_JS,
+        include_str!("../js/events.js"),
+        include_str!("../js/crypto.js"),
+    ];
+    for source in sources {
         let body = env.create_string(source)?;
         let installer_obj = func_ctor.new_instance(&[body])?;
         let installer: JsFunction =
