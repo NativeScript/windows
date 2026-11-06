@@ -12,6 +12,11 @@
     "windows.win32-arm64-msvc.node"
   ],
   "description": "Node-API WinRT interop for Windows.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NativeScript/windows",
+    "directory": "windows-napi/npm/win32-arm64-msvc"
+  },
   "engines": {
     "node": ">= 18"
   }

@@ -35,12 +35,11 @@
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
     "artifacts": "napi artifacts",
-    "prepublishOnly": "napi prepublish -t npm --skip-gh-release",
     "test": "node test/run-tests.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/triniwiz/windows-runtime.git",
+    "url": "https://github.com/NativeScript/windows",
     "directory": "windows-napi"
   },
   "devDependencies": {

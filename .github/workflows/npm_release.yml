@@ -1,17 +1,18 @@
 name: npm release
 
-# Publishes the classic runtime — @nativescript/windows — and the four engine variants —
-# @nativescript/windows-{hermes,jsc,quickjs,v8} — to npm via OIDC trusted publishing. npm matches
-# a trusted publisher on repository + workflow FILENAME + environment, so `npm_release.yml` and the
-# `npm-publish` environment below are part of the credential: renaming either breaks publishing for
-# all five packages, and every package needs its own trusted-publisher entry on npmjs.com.
+# Publishes the classic runtime (@nativescript/windows), the four engine variants
+# (@nativescript/windows-{hermes,jsc,quickjs,v8}) and the Node-API addon (@nativescript/windows-napi
+# plus its two binary packages) to npm via OIDC trusted publishing. npm matches a trusted publisher
+# on repository + workflow FILENAME + environment, so `npm_release.yml` and the `npm-publish`
+# environment below are part of the credential: renaming either breaks publishing for every
+# package, and every package needs its own trusted-publisher entry on npmjs.com.
 #
 # NOTE: `paths` filters deliberately do NOT accompany the tag trigger — a tag push can have an
 # empty changed-file set, and paths+tags together silently skip the run.
 on:
   push:
     tags:
-      - "v*" # -> all five packages at the tag's version
+      - "v*" # -> every package at the tag's version
   workflow_dispatch:
     inputs:
       engine:
@@ -19,7 +20,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, classic, hermes, jsc, quickjs, v8]
+        options: [all, classic, hermes, jsc, quickjs, v8, napi]
       version:
         description: "Release version to cut, e.g. 0.1.0-alpha.2 (dist-tag follows the prerelease id; a plain version publishes 'latest'). Leave empty for a rolling 'next' build."
         required: false
@@ -30,7 +31,7 @@ on:
         required: false
         default: false
       skip_arm64:
-        description: "Classic only: build x64-only, skipping the arm64 cross-compiles (the engine variants are x64-only regardless)."
+        description: "Classic and napi: build x64-only, skipping the arm64 cross-compiles (the engine variants are x64-only regardless)."
         type: boolean
         required: false
         default: false
@@ -49,6 +50,10 @@ permissions:
 #   variant  `template/build.ps1 -Engine <engine>` copies the shared scaffolding out of
 #            template/framework and builds the engine cdylib into packages/windows-<engine>/framework
 #            as framework/libs/x64/nativescript.dll (x64 only, no devtools).
+#
+# windows-napi is three packages: one per triple carrying `windows.<triple>.node` (napi-binding,
+# built with `napi build --target`) and the JS root (napi-root), whose optionalDependencies are
+# pinned to the release version.
 #
 # A release is: setup (resolve version + package matrix) -> build (one Windows job per package,
 # npm pack) -> publish (npm, OIDC). Everything the variants need is committed under
@@ -95,13 +100,14 @@ jobs:
     needs: setup
     strategy:
       fail-fast: false
-      # { include: [{ engine, dir, npm_name, tarball, rust_targets, rust_workspaces }, ...] } — the
-      # packages selected in `setup` (see scripts/resolve-release.mjs).
+      # { include: [{ engine, kind, dir, npm_name, tarball, napi_target, rust_targets,
+      #   rust_workspaces }, ...] }: the packages selected in `setup` (scripts/resolve-release.mjs).
       matrix: ${{ fromJSON(needs.setup.outputs.build_matrix) }}
     env:
       NPM_VERSION: ${{ needs.setup.outputs.npm_version }}
       ENGINE: ${{ matrix.engine }}
       PACKAGE_DIR: ${{ matrix.dir }}
+      NAPI_TARGET: ${{ matrix.napi_target }}
       SKIP_ARM64: ${{ inputs.skip_arm64 && 'true' || 'false' }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -115,12 +121,15 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+      # The windows-napi root package is JS only.
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        if: ${{ matrix.kind != 'napi-root' }}
         with:
           toolchain: stable
           # classic cross-compiles the arm64 runtime and tools; the variants build for the host.
           targets: ${{ matrix.rust_targets }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: ${{ matrix.kind != 'napi-root' }}
         with:
           # The engine packages are excluded from the root workspace (their C builds / prebuilt
           # engine links must not run on a plain `cargo build`), so each has its own target dir.
@@ -134,6 +143,7 @@ jobs:
       # profile dir is target/release for a host build and target/<triple>/<profile> for the
       # classic cross builds, so every v8 build dir under the target roots is checked.
       - name: Re-fetch rusty_v8's static lib when the cache pruned it
+        if: ${{ matrix.kind == 'framework' }}
         shell: pwsh
         run: |
           foreach ($root in @('target', (Join-Path $env:PACKAGE_DIR 'target'))) {
@@ -169,14 +179,14 @@ jobs:
       # The classic build publishes ManifestMerger and dotnet-typings-gen with `dotnet publish`
       # every time; a variant only needs the SDK when it regenerates the shared framework.
       - name: Setup .NET
-        if: ${{ matrix.engine == 'classic' || github.event_name == 'push' || inputs.rebuild_framework }}
+        if: ${{ matrix.kind == 'framework' && (matrix.engine == 'classic' || github.event_name == 'push' || inputs.rebuild_framework) }}
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           # dotnet-typings-gen targets net10.0; ManifestMerger is netstandard2.0 and builds on it.
           dotnet-version: "10.x"
       - name: Rebuild shared framework
         # Tag releases always rebuild, so a published variant never ships binaries built off CI.
-        if: ${{ matrix.engine != 'classic' && (github.event_name == 'push' || inputs.rebuild_framework) }}
+        if: ${{ matrix.kind == 'framework' && matrix.engine != 'classic' && (github.event_name == 'push' || inputs.rebuild_framework) }}
         shell: pwsh
         # -SkipRelease -SkipDevtools: the classic V8 nativescript.dll is not staged into a variant
         # (the engine cdylib takes its place), so building it here would be thrown away.
@@ -210,7 +220,34 @@ jobs:
         shell: pwsh
         working-directory: ${{ matrix.dir }}
         run: npm version $env:NPM_VERSION --no-git-tag-version --allow-same-version
+      - name: Pin windows-napi binary packages
+        if: ${{ matrix.kind == 'napi-root' }}
+        shell: pwsh
+        working-directory: ${{ matrix.dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          foreach ($dep in @($pkg.optionalDependencies.PSObject.Properties)) {
+            $dep.Value = $env:NPM_VERSION
+          }
+          $pkg | ConvertTo-Json -Depth 10 | Set-Content package.json -Encoding utf8NoBOM
+          Get-Content package.json
+      - name: Build ${{ matrix.napi_target }} binding
+        if: ${{ matrix.kind == 'napi-binding' }}
+        shell: pwsh
+        working-directory: windows-napi
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+          npx napi build --platform --release --target $env:NAPI_TARGET
+          if ($LASTEXITCODE -ne 0) { throw "napi build failed for $env:NAPI_TARGET" }
+          # The binary package directory is named after the platform part of the file name.
+          $node = "windows.$(Split-Path $env:PACKAGE_DIR -Leaf).node"
+          if (-not (Test-Path $node)) { throw "Build output missing: windows-napi/$node" }
+          Copy-Item $node (Join-Path $env:GITHUB_WORKSPACE $env:PACKAGE_DIR)
       - name: Build ${{ matrix.engine }} framework
+        if: ${{ matrix.kind == 'framework' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
