@@ -9,7 +9,8 @@
 //! `key_mode = 1` (custom key); the app must call `runtime_set_bundle_key(sameHex)` before
 //! `runtime_init`, or the sealed bundle cannot be opened at startup. `--write-key` seals with a
 //! fresh random key and writes its hex to `<file>`, which the app template compiles into the
-//! exe and passes to `runtime_set_bundle_key`.
+//! exe and passes to `runtime_set_bundle_key`. `NS_BUNDLE_KEY_HEX` works like `--key-hex` and
+//! keeps the key out of process lists and command-line audit logs.
 //!
 //! This is the packer half of the CLI contract documented for the NativeScript CLI's
 //! `ns build windows`/`ns deploy windows`: invoke this after webpack finishes, pointing `--input`
@@ -23,7 +24,8 @@ use runtime::source_protect;
 
 fn print_usage() {
     eprintln!(
-        "Usage: nsbundle_pack --input <dir> --output <file> [--key-hex <64 hex chars> | --write-key <file>]"
+        "Usage: nsbundle_pack --input <dir> --output <file> [--key-hex <64 hex chars> | --write-key <file>]\n\
+         The key can also come from %NS_BUNDLE_KEY_HEX% (command lines are logged and visible)."
     );
 }
 
@@ -60,6 +62,12 @@ fn main() -> ExitCode {
     if !input.is_dir() {
         eprintln!("--input {} is not a directory", input.display());
         return ExitCode::FAILURE;
+    }
+
+    if key_hex.is_none() && write_key.is_none() {
+        key_hex = std::env::var("NS_BUNDLE_KEY_HEX")
+            .ok()
+            .filter(|k| !k.is_empty());
     }
 
     if let Some(path) = write_key {
