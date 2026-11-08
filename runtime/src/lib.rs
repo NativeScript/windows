@@ -2298,7 +2298,8 @@ fn js_error_value<'s>(scope: &mut v8::PinScope<'s, '_>, msg: &str) -> v8::Local<
 const NS_MODULE_SOURCE: &str = "const m = globalThis.__nsModuleBuiltin;\n\
 export default m;\n\
 export const configureLoader = m.configureLoader, invalidateModules = m.invalidateModules, \
-getLoadedModuleUrls = m.getLoadedModuleUrls, createRequire = m.createRequire;\n";
+getLoadedModuleUrls = m.getLoadedModuleUrls, createRequire = m.createRequire, \
+setDevBootComplete = m.setDevBootComplete;\n";
 
 /// Registry key for a URL handed in by JS (`invalidateModules`): canonical for HTTP, a path for
 /// `file://`, verbatim otherwise.
@@ -2342,6 +2343,16 @@ pub(crate) fn handle_ns_module_configure_loader(
     if let Err(e) = crate::esm_http::configure_loader(&json) {
         throw_type_error(scope, &e);
     }
+}
+
+/// `ns:module` `setDevBootComplete(done)`.
+#[cfg(feature = "classic")]
+pub(crate) fn handle_ns_module_set_dev_boot_complete(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    crate::esm_http::set_dev_boot_complete(args.get(0).boolean_value(scope));
 }
 
 /// `ns:module` `invalidateModules(urls)`: registry eviction plus a one-shot cache-bust nonce on
@@ -2525,6 +2536,10 @@ pub mod esm_loader {
 
     pub fn configure_loader(json: &str) -> Result<(), String> {
         crate::esm_http::configure_loader(json)
+    }
+
+    pub fn set_dev_boot_complete(done: bool) {
+        crate::esm_http::set_dev_boot_complete(done)
     }
 
     pub fn mark_keys_for_cache_bust(keys: &[String]) {

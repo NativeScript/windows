@@ -280,6 +280,9 @@ pub const PRELUDE: &str = r#"
       getLoadedModuleUrls: function getLoadedModuleUrls() {
         return g.__nsModuleLoadedUrls();
       },
+      setDevBootComplete: function setDevBootComplete(done) {
+        if (typeof g.__nsModuleSetDevBootComplete === 'function') { g.__nsModuleSetDevBootComplete(!!done); }
+      },
       createRequire: function createRequire(filenameOrURL) {
         var value = filenameOrURL && typeof filenameOrURL === 'object' ? filenameOrURL.href : filenameOrURL;
         if (typeof value !== 'string') {

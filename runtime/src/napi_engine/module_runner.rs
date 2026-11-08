@@ -227,6 +227,12 @@ pub fn install(env: &Env, eval: EvalScript) -> napi::Result<()> {
     })?;
     global.set_named_property("__nsModuleConfigureLoader", configure)?;
 
+    let boot_complete = env.create_function_from_closure("__nsModuleSetDevBootComplete", |ctx: CallContext| {
+        esm_loader::set_dev_boot_complete(ctx.get::<JsUnknown>(0)?.coerce_to_bool()?.get_value()?);
+        ctx.env.get_undefined()
+    })?;
+    global.set_named_property("__nsModuleSetDevBootComplete", boot_complete)?;
+
     eval(env, RUNNER, "<module-runner>").map_err(|()| {
         napi::Error::from_reason(format!("module runner failed to install: {}", take_exception(env)))
     })?;
