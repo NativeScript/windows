@@ -47,6 +47,9 @@ mod property_call;
 #[cfg(feature = "classic")]
 mod proxy_manifest_loader;
 pub mod source_protect;
+mod subtle;
+#[cfg(feature = "classic")]
+mod subtle_v8;
 mod struct_reference;
 #[cfg(feature = "classic")]
 mod struct_value;

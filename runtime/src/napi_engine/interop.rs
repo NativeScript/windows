@@ -345,6 +345,9 @@ pub fn install_interop(env: &Env) -> napi::Result<()> {
     })?;
     global.set_named_property("__nsRandomFill", random_fn)?;
 
+    let subtle_fn = env.create_function_from_closure("__nsSubtle", crate::napi_engine::subtle::call)?;
+    global.set_named_property("__nsSubtle", subtle_fn)?;
+
     let func_ctor: JsFunction = global.get_named_property("Function")?;
     let sources = [
         INTEROP_HELPERS_JS,

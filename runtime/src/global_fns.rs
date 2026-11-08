@@ -4403,6 +4403,7 @@ pub(crate) fn init_async_helpers(
     register!("__tns_uptime", handle_tns_uptime);
     register!("__nsUUID", handle_ns_uuid);
     register!("__nsRandomFill", handle_ns_random_fill);
+    register!("__nsSubtle", crate::subtle_v8::subtle);
     register!("__nsIsUiThread", handle_is_ui_thread);
     register!("__nsThreadInfo", handle_thread_info);
     register!("__nsGetLastJsError", handle_get_last_js_error);

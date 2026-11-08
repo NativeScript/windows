@@ -22,6 +22,7 @@ pub mod module_natives;
 pub mod module_runner;
 pub mod ns_hostobject;
 pub mod ns_proxy;
+pub mod subtle;
 pub mod timers;
 pub mod url;
 pub mod value;

@@ -1,9 +1,28 @@
-// Web Crypto's random source, filled from the OS RNG by `__nsRandomFill`. Hosts that already have
+// Web Crypto: the OS RNG via `__nsRandomFill`, `subtle` via `__nsSubtle`. Hosts that already have
 // `crypto` (Node, Deno, Bun) keep their own.
 (function () {
     var fill = globalThis.__nsRandomFill;
-    if (typeof fill !== 'function') return;
+    var subtleNative = globalThis.__nsSubtle;
+    if (typeof fill !== 'function' && typeof subtleNative !== 'function') return;
     var crypto = globalThis.crypto || (globalThis.crypto = {});
+
+    if (typeof subtleNative === 'function' && !crypto.subtle) {
+        var CryptoKey = function CryptoKey() {
+            throw new TypeError('Illegal constructor');
+        };
+        var subtle = {};
+        ['digest', 'generateKey', 'importKey', 'exportKey', 'sign', 'verify', 'encrypt', 'decrypt',
+            'deriveBits', 'deriveKey', 'wrapKey', 'unwrapKey'].forEach(function (op) {
+            subtle[op] = function () {
+                var args = Array.prototype.slice.call(arguments);
+                return new Promise(function (resolve) {
+                    resolve(subtleNative(op, args, CryptoKey.prototype));
+                });
+            };
+        });
+        crypto.subtle = subtle;
+        globalThis.CryptoKey = CryptoKey;
+    }
 
     function isIntegerArray(array) {
         return array instanceof Int8Array || array instanceof Uint8Array ||
@@ -14,7 +33,7 @@
                 (array instanceof BigInt64Array || array instanceof BigUint64Array));
     }
 
-    if (typeof crypto.getRandomValues !== 'function') {
+    if (typeof fill === 'function' && typeof crypto.getRandomValues !== 'function') {
         crypto.getRandomValues = function getRandomValues(array) {
             var prefix = "Failed to execute 'getRandomValues' on 'Crypto': ";
             if (!isIntegerArray(array)) {
