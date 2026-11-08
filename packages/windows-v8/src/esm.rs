@@ -118,6 +118,12 @@ pub fn install_ns_module(env: &napi::Env) -> napi::Result<()> {
     })?;
     global.set_named_property("__nsModuleConfigureLoader", configure)?;
 
+    let boot_complete = env.create_function_from_closure("__nsModuleSetDevBootComplete", |ctx: CallContext| {
+        esm_loader::set_dev_boot_complete(ctx.get::<JsUnknown>(0)?.coerce_to_bool()?.get_value()?);
+        ctx.env.get_undefined()
+    })?;
+    global.set_named_property("__nsModuleSetDevBootComplete", boot_complete)?;
+
     // Registry eviction plus a one-shot cache-bust nonce on each evicted URL's next fetch.
     let invalidate = env.create_function_from_closure("__nsModuleInvalidate", |ctx: CallContext| {
         let list = ctx.get::<JsUnknown>(0)?;

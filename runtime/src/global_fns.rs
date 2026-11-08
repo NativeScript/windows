@@ -2656,6 +2656,9 @@ include_str!("js/crypto.js"), r#"
                     getLoadedModuleUrls: function getLoadedModuleUrls() {
                         return globalThis.__nsModuleLoadedUrls();
                     },
+                    setDevBootComplete: function setDevBootComplete(done) {
+                        if (typeof globalThis.__nsModuleSetDevBootComplete === 'function') globalThis.__nsModuleSetDevBootComplete(!!done);
+                    },
                     createRequire: function createRequire(filenameOrURL) {
                         var value = filenameOrURL && typeof filenameOrURL === 'object' ? filenameOrURL.href : filenameOrURL;
                         if (typeof value !== 'string') {
@@ -4415,6 +4418,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsModuleConfigureLoader", crate::handle_ns_module_configure_loader);
     register!("__nsModuleInvalidate", crate::handle_ns_module_invalidate);
     register!("__nsModuleLoadedUrls", crate::handle_ns_module_loaded_urls);
+    register!("__nsModuleSetDevBootComplete", crate::handle_ns_module_set_dev_boot_complete);
 
     // DevTools host hooks: allow JS to register domain dispatchers and
     // post events/timestamps to the DevTools server when enabled.

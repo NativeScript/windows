@@ -11,7 +11,7 @@
 //!
 //! Mechanism mirrors ios/NativeScript/runtime/HttpLoader.mm + ModuleInternalCallbacks.mm.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
@@ -348,10 +348,63 @@ fn fetch_once(url: &str, key: &str) -> Result<crate::winhttp::Response, String> 
     Ok(response)
 }
 
+static DEV_BOOT_COMPLETE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static PUMPING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `ns:module` `setDevBootComplete`: stops pumping messages during HTTP imports.
+pub fn set_dev_boot_complete(done: bool) {
+    DEV_BOOT_COMPLETE.store(done, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Until dev boot completes, runs `fetch` off-thread and pumps messages meanwhile.
+fn pumping<R: Send>(fetch: impl FnOnce() -> R + Send) -> R {
+    if !is_debug_build() || DEV_BOOT_COMPLETE.load(std::sync::atomic::Ordering::Relaxed) || PUMPING.get() {
+        return fetch();
+    }
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
+    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT};
+
+    let Ok(done) = (unsafe { CreateEventW(None, true, false, PCWSTR::null()) }) else {
+        return fetch();
+    };
+    let event = done.0 as usize;
+    PUMPING.set(true);
+    let result = std::thread::scope(|s| {
+        let handle = s.spawn(move || {
+            let result = fetch();
+            unsafe {
+                let _ = SetEvent(HANDLE(event as *mut _));
+            }
+            result
+        });
+        // WAIT_OBJECT_0 + 1: messages arrived; the event or a failure ends the wait
+        while unsafe { MsgWaitForMultipleObjectsEx(Some(&[done]), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) }.0
+            == WAIT_OBJECT_0.0 + 1
+        {
+            crate::pump_messages();
+        }
+        handle.join()
+    });
+    PUMPING.set(false);
+    unsafe {
+        let _ = CloseHandle(done);
+    }
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+pub(crate) fn fetch_module(url: &str, key: &str) -> Result<FetchedModule, String> {
+    pumping(|| fetch_module_now(url, key))
+}
+
 /// Fetch one module over HTTP (one retry on transport error) and classify the response the way
 /// the iOS runtime does: 2xx JavaScript (an empty body is the empty module) or JSON; anything else
 /// is an import error naming the URL.
-pub(crate) fn fetch_module(url: &str, key: &str) -> Result<FetchedModule, String> {
+fn fetch_module_now(url: &str, key: &str) -> Result<FetchedModule, String> {
     if !remote_url_allowed(url) {
         return Err(format!(
             "HTTP import blocked: remote module loading is not allowed for {url} (set security.allowRemoteModules in the app's package.json)"
@@ -399,16 +452,20 @@ pub(crate) fn fetch_module(url: &str, key: &str) -> Result<FetchedModule, String
 
 /// Fetch several modules concurrently (bounded), preserving input order.
 pub(crate) fn fetch_modules(items: &[(String, String)]) -> Vec<Result<FetchedModule, String>> {
+    pumping(|| fetch_modules_now(items))
+}
+
+fn fetch_modules_now(items: &[(String, String)]) -> Vec<Result<FetchedModule, String>> {
     const MAX_PARALLEL: usize = 8;
     if items.len() <= 1 {
-        return items.iter().map(|(u, k)| fetch_module(u, k)).collect();
+        return items.iter().map(|(u, k)| fetch_module_now(u, k)).collect();
     }
     let mut out: Vec<Option<Result<FetchedModule, String>>> = (0..items.len()).map(|_| None).collect();
     for (chunk_index, chunk) in items.chunks(MAX_PARALLEL).enumerate() {
         std::thread::scope(|s| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|(u, k)| s.spawn(move || fetch_module(u, k)))
+                .map(|(u, k)| s.spawn(move || fetch_module_now(u, k)))
                 .collect();
             for (i, h) in handles.into_iter().enumerate() {
                 out[chunk_index * MAX_PARALLEL + i] =
