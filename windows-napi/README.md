@@ -42,6 +42,19 @@ The host executable's manifest must declare `<maxversiontested Id="10.0.18362.0"
 `electron.exe` does and `node.exe` doesn't, so `XamlWindow` throws in plain Node. XAML events run
 from the host's message loop, so a host with its own UI loop needs no `pumpMessages`.
 
+## Embedding outside Node
+
+Any host that provides Node-API can load the addon: load the `.node` file as a DLL and call its
+`napi_register_module_v1(env, exports)`. The addon takes its `napi_*` functions from the host
+executable, as in Node. A host whose executable doesn't export them sets `NAPI_HOST_MODULES`
+before loading the addon: the modules that do, separated by `;`, in priority order. Each function
+comes from the first module that exports it.
+
+React Native for Windows is one: `@nativescript/react-native` runs the addon in a Hermes runtime,
+where `hermes.dll` has the engine half of Node-API (`js_native_api.h`) and the module itself
+implements Node's half (`node_api.h`: threadsafe functions, cleanup hooks, buffers). It sets
+`NAPI_HOST_MODULES=<its DLL>;<hermes.dll>`.
+
 ## Development
 
 ```sh
