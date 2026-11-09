@@ -212,3 +212,9 @@ pub fn install_interop(env: Env) -> napi::Result<()> {
 pub fn install_dotnet(env: Env) -> napi::Result<()> {
     runtime::napi_engine::dotnet::install_dotnet(&env)
 }
+
+/// Installs `NSWinRT.win32`. Idempotent.
+#[napi]
+pub fn install_win32(env: Env) -> napi::Result<()> {
+    runtime::napi_engine::win32::install_win32(&env)
+}

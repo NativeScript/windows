@@ -154,3 +154,5 @@ export declare function installInterop(): void
  * `dotnet-bridge/publish/DotNetBridge.dll` exists next to the app.
  */
 export declare function installDotnet(): void
+/** Installs `NSWinRT.win32`. Idempotent. */
+export declare function installWin32(): void

@@ -59,7 +59,7 @@ pub mod timers;
 mod type_description;
 pub mod ui_dispatcher;
 mod value;
-#[cfg(feature = "classic")]
+#[cfg(any(feature = "classic", feature = "napi_engine"))]
 pub(crate) mod win32;
 #[cfg(feature = "classic")]
 pub(crate) mod win32_fast;

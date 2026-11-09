@@ -113,6 +113,9 @@ const interop = globalThis.NSWinRT.interop;
 native.installDotnet();
 const dotnet = globalThis.NSWinRT.dotnet;
 
+native.installWin32();
+const win32 = globalThis.NSWinRT.win32;
+
 // Windows.UI.Xaml content in a Win32 window (XAML Islands). Needs a thread that pumps messages.
 let xamlManager = null;
 
@@ -213,5 +216,6 @@ module.exports = {
   disableAutoPump,
   interop,
   dotnet,
+  win32,
   XamlWindow,
 };
