@@ -27,6 +27,14 @@ thread_local! {
     static KEEP_ALIVE: Cell<i64> = const { Cell::new(0) };
 }
 
+pub(crate) fn retain() {
+    KEEP_ALIVE.with(|k| k.set(k.get() + 1));
+}
+
+pub(crate) fn release() {
+    KEEP_ALIVE.with(|k| k.set((k.get() - 1).max(0)));
+}
+
 /// Install `__nsLoopRetain` / `__nsLoopRelease` on the global object (install-if-missing; on
 /// Node these are never consulted because nswinrt.js manages its own pump lifecycle).
 pub fn install_loop_natives(env: &Env) -> napi::Result<()> {
@@ -40,16 +48,16 @@ pub fn install_loop_natives(env: &Env) -> napi::Result<()> {
     if present {
         return Ok(());
     }
-    let retain = env.create_function_from_closure("__nsLoopRetain", |_ctx| {
-        KEEP_ALIVE.with(|k| k.set(k.get() + 1));
+    let retain_fn = env.create_function_from_closure("__nsLoopRetain", |_ctx| {
+        retain();
         Ok(())
     })?;
-    global.set_named_property("__nsLoopRetain", retain)?;
-    let release = env.create_function_from_closure("__nsLoopRelease", |_ctx| {
-        KEEP_ALIVE.with(|k| k.set((k.get() - 1).max(0)));
+    global.set_named_property("__nsLoopRetain", retain_fn)?;
+    let release_fn = env.create_function_from_closure("__nsLoopRelease", |_ctx| {
+        release();
         Ok(())
     })?;
-    global.set_named_property("__nsLoopRelease", release)?;
+    global.set_named_property("__nsLoopRelease", release_fn)?;
     Ok(())
 }
 

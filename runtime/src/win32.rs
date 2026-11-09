@@ -1,3 +1,6 @@
+// The napi engines only use the typed path.
+#![cfg_attr(not(feature = "classic"), allow(dead_code))]
+
 use ahash::AHashMap;
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use parking_lot::Mutex;
@@ -87,6 +90,7 @@ fn get_or_build(
 /// Pre-build CIFs for all entries in `win32_known_fns::KNOWN_FNS`.
 /// Called once from `Runtime::new`; silently skips entries whose DLL
 /// is not installed on the current machine.
+#[cfg(feature = "classic")]
 pub(crate) fn prewarm_known_fns() {
     use crate::win32_known_fns::KNOWN_FNS;
     for f in KNOWN_FNS {
@@ -252,31 +256,39 @@ pub(crate) enum RawArgValue {
     Number(f64),
     /// String-typed args (wstr / str) carry the already-decoded UTF-8 text.
     Str(String),
+    /// A BigInt or an address.
+    #[cfg_attr(not(feature = "napi_engine"), allow(dead_code))]
+    Word(u64),
 }
 
 fn marshal_raw(ty: &str, val: &RawArgValue) -> Result<StoredArg, String> {
     let n = || match val {
         RawArgValue::Number(f) => *f,
+        RawArgValue::Word(w) => *w as i64 as f64,
         RawArgValue::Str(_) => 0.0,
+    };
+    let word = |f: fn(f64) -> u64| match val {
+        RawArgValue::Word(w) => *w,
+        _ => f(n()),
     };
     let s = || match val {
         RawArgValue::Str(s) => s.as_str(),
-        RawArgValue::Number(_) => "",
+        RawArgValue::Number(_) | RawArgValue::Word(_) => "",
     };
     Ok(match ty {
         "i8" => StoredArg::I8(n() as i8),
         "i16" => StoredArg::I16(n() as i16),
-        "i32" => StoredArg::I32(n() as i32),
-        "i64" => StoredArg::I64(n() as i64),
+        "i32" => StoredArg::I32(word(|f| f as i32 as u64) as i32),
+        "i64" => StoredArg::I64(word(|f| f as i64 as u64) as i64),
         "u8" => StoredArg::U8(n() as u8),
         "u16" => StoredArg::U16(n() as u16),
-        "u32" => StoredArg::U32(n() as u32),
-        "u64" => StoredArg::U64(n() as u64),
+        "u32" => StoredArg::U32(word(|f| f as u32 as u64) as u32),
+        "u64" => StoredArg::U64(word(|f| f as u64)),
         "f32" => StoredArg::F32(n() as f32),
         "f64" => StoredArg::F64(n()),
         "bool" => StoredArg::I32(if n() != 0.0 { 1 } else { 0 }),
         "pointer" => StoredArg::Ptr {
-            ptr_val: n() as usize as *const c_void,
+            ptr_val: word(|f| f as usize as u64) as usize as *const c_void,
         },
         "wstr" => {
             let buf: Vec<u16> = s().encode_utf16().chain(std::iter::once(0)).collect();

@@ -42,6 +42,74 @@ The host executable's manifest must declare `<maxversiontested Id="10.0.18362.0"
 `electron.exe` does and `node.exe` doesn't, so `XamlWindow` throws in plain Node. XAML events run
 from the host's message loop, so a host with its own UI loop needs no `pumpMessages`.
 
+## Win32
+
+`win32` calls exported functions of any DLL:
+
+```js
+const { win32 } = require('@nativescript/windows-napi');
+
+win32.call('user32.dll', 'MessageBeep', 'bool', { type: 'u32', value: 0 });
+
+const { lstrlenW } = win32.bind('kernel32.dll'); // arguments typed from their JS values
+lstrlenW('hello'); // 5
+
+const user32 = win32.define('user32.dll', {
+  GetSystemMetrics: ['i32'], // argument types; returns the default (i32)
+  IsWindow: { args: ['pointer'], ret: 'bool' },
+});
+```
+
+- Types: `void`, `bool`, `i8`–`i64`, `u8`–`u64`, `f32`, `f64`, `pointer`, `wstr` (UTF-16 string),
+  `str` (UTF-8 string). 64-bit values beyond 2^53 come back as `BigInt`; arguments take numbers or
+  `BigInt`s.
+- A `pointer` argument also takes an `ArrayBuffer`, a typed array or `DataView` (its memory, for
+  structs and out-parameters) or a pointer object. `null` is a null pointer, also for strings.
+- `win32.import(dll)` installs every export of the DLL as a global function.
+
+### Callbacks and window messages
+
+`win32.callback(retType, argTypes, fn)` returns `{ pointer, release() }`: a native function
+pointer that calls `fn` synchronously, for APIs that take one (`EnumWindows`, a `WNDPROC`). Keep it
+until native code no longer uses it, then `release()` it.
+
+`win32.messageWindow(listener)` returns `{ hwnd, close() }`, a hidden window whose messages are
+delivered to `listener(msg, wParam, lParam)`. Use it as the window of a tray icon (its callback
+message), `RegisterHotKey` (`WM_HOTKEY`) or a popup menu (`WM_COMMAND`). It is a top-level window,
+so it also receives broadcasts such as `TaskbarCreated`.
+
+```js
+const shell32 = win32.define('shell32.dll', { Shell_NotifyIconW: { args: ['u32', 'pointer'], ret: 'bool' } });
+const user32 = win32.define('user32.dll', {
+  LoadIconW: { args: ['pointer', 'pointer'], ret: 'pointer' },
+  RegisterHotKey: { args: ['pointer', 'i32', 'u32', 'u32'], ret: 'bool' },
+});
+
+const WM_TRAY = 0x8001; // WM_APP + 1
+const WM_HOTKEY = 0x0312, WM_LBUTTONUP = 0x0202;
+
+const window = win32.messageWindow((msg, wParam, lParam) => {
+  if (msg === WM_TRAY && lParam === WM_LBUTTONUP) console.log('tray icon clicked');
+  if (msg === WM_HOTKEY && wParam === 1) console.log('Ctrl+Alt+S');
+});
+
+// NOTIFYICONDATAW, 64-bit layout
+const nid = new DataView(new ArrayBuffer(976));
+nid.setUint32(0, 976, true); // cbSize
+nid.setBigUint64(8, BigInt(window.hwnd), true); // hWnd
+nid.setUint32(16, 1, true); // uID
+nid.setUint32(20, 0x1 | 0x2 | 0x4, true); // NIF_MESSAGE | NIF_ICON | NIF_TIP
+nid.setUint32(24, WM_TRAY, true); // uCallbackMessage
+nid.setBigUint64(32, BigInt(user32.LoadIconW(null, 32512)), true); // hIcon: IDI_APPLICATION
+[...'My app'].forEach((c, i) => nid.setUint16(40 + i * 2, c.charCodeAt(0), true)); // szTip
+shell32.Shell_NotifyIconW(0, nid); // NIM_ADD
+
+user32.RegisterHotKey(window.hwnd, 1, 0x2 | 0x1 | 0x4000, 0x53); // Ctrl+Alt+S, MOD_NOREPEAT
+```
+
+Messages arrive while the thread pumps them: Electron's main process does; in plain Node call
+`enableAutoPump()`. In the standalone runtimes an open message window keeps the event loop running.
+
 ## Embedding outside Node
 
 Any host that provides Node-API can load the addon: load the `.node` file as a DLL and call its

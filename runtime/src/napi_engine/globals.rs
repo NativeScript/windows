@@ -89,6 +89,8 @@ pub fn install_globals(env: &Env) -> napi::Result<()> {
     // NSWinRT.asDelegate(typeName, fn): wraps a JS function as a COM-backed WinRT delegate.
     crate::napi_engine::delegate::install_as_delegate(env)?;
 
+    crate::napi_engine::win32::install_win32(env)?;
+
     // NSWinRT.makeItemsSource/extendItemsSource/insertItemsSource/removeItemsSource/
     // updateItemsSource/resetItemsSource: the native IObservableVector<IInspectable> ItemsSource
     // core's ListView (ui/list-view/index.windows.js) requires on Windows.
