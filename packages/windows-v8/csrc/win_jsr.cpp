@@ -456,6 +456,11 @@ napi_status js_execute_pending_jobs(napi_env env) {
     return napi_ok;
 }
 
+// Lets Rust pump the V8 platform.
+void* js_get_isolate(napi_env env) {
+    return env ? static_cast<void*>(env->isolate) : nullptr;
+}
+
 // Run `source` as the entry ES module registered under `key`. Failures (compile, link, a throw
 // during evaluation, a rejected top-level await) are reported through ns_esm_report_error.
 napi_status js_run_module(napi_env env, const char* source, const char* key) {

@@ -33,8 +33,9 @@ pub mod ffi {
             file: *const c_char,
             result: *mut napi_value,
         ) -> i32;
-        /// Microtask checkpoint (PerformMicrotaskCheckpoint): the event loop's drain hook.
+        /// Microtask checkpoint (PerformMicrotaskCheckpoint).
         pub fn js_execute_pending_jobs(env: napi_env) -> i32;
+        pub fn js_get_isolate(env: napi_env) -> *mut std::ffi::c_void;
         /// Run an entry ES module; errors are reported through `esm::ns_esm_report_error`.
         pub fn js_run_module(env: napi_env, source: *const c_char, key: *const c_char) -> i32;
         pub fn js_esm_evict(key: *const c_char) -> i32;
@@ -47,6 +48,49 @@ pub mod ffi {
 
 /// The module loader's Rust callbacks (see `csrc/win_jsr.cpp`).
 pub mod esm;
+
+/// Foreground tasks (FinalizationRegistry cleanup, GC finalization) only run when pumped.
+pub mod platform {
+    use std::sync::OnceLock;
+
+    static PLATFORM: OnceLock<v8::SharedRef<v8::Platform>> = OnceLock::new();
+
+    /// The shim's C++ can't link NewDefaultPlatform, so V8 is initialized from Rust.
+    pub fn initialize() {
+        PLATFORM.get_or_init(|| {
+            let platform = v8::new_default_platform(0, false).make_shared();
+            v8::V8::initialize_platform(platform.clone());
+            v8::V8::initialize();
+            platform
+        });
+    }
+
+    /// Returns whether any task ran.
+    pub fn pump(env: napi::sys::napi_env) -> bool {
+        let Some(platform) = PLATFORM.get() else {
+            return false;
+        };
+        let raw = unsafe { crate::ffi::js_get_isolate(env) };
+        if raw.is_null() {
+            return false;
+        }
+        // A non-owning handle: the shim owns the isolate.
+        let isolate = unsafe { v8::Isolate::from_raw_ptr_unchecked(raw as *mut _) };
+        let mut ran = false;
+        while v8::Platform::pump_message_loop(platform, &isolate, false) {
+            ran = true;
+        }
+        ran
+    }
+}
+
+/// The event loop's drain hook.
+pub fn drain(env: napi::sys::napi_env) {
+    unsafe { ffi::js_execute_pending_jobs(env) };
+    if platform::pump(env) {
+        unsafe { ffi::js_execute_pending_jobs(env) };
+    }
+}
 
 /// Runs a script named `file`, through the code cache once the app's local folder is known.
 unsafe fn execute(env: napi::sys::napi_env, source: napi::sys::napi_value, file: &std::ffi::CStr, result: *mut napi::sys::napi_value) -> i32 {
@@ -121,11 +165,7 @@ pub mod host {
                 return cur;
             }
             unsafe {
-                // The shim's C++ can't link NewDefaultPlatform's libc++ unique_ptr, so drive the
-                // V8 platform init from rusty_v8: before js_create_runtime creates an isolate.
-                let platform = v8::new_default_platform(0, false).make_shared();
-                v8::V8::initialize_platform(platform);
-                v8::V8::initialize();
+                crate::platform::initialize();
 
                 let mut runtime: ffi::NapiRuntime = std::ptr::null_mut();
                 let mut env_raw: napi::sys::napi_env = std::ptr::null_mut();
@@ -193,10 +233,7 @@ pub mod host {
         unsafe { ffi::js_run_module(raw as napi::sys::napi_env, code.as_ptr(), key.as_ptr()) == 0 }
     }
 
-    /// Run V8's microtask checkpoint (promise reactions): the event loop's drain hook.
     pub fn drain_microtasks(raw: *mut c_void) {
-        unsafe {
-            ffi::js_execute_pending_jobs(raw as napi::sys::napi_env);
-        }
+        crate::drain(raw as napi::sys::napi_env);
     }
 }
