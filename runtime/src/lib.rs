@@ -63,6 +63,8 @@ mod value;
 pub(crate) mod win32;
 pub(crate) mod win32_call;
 #[cfg(feature = "classic")]
+pub(crate) mod win32_callback;
+#[cfg(feature = "classic")]
 pub(crate) mod win32_fast;
 #[cfg(feature = "classic")]
 pub(crate) mod win32_known_fns;

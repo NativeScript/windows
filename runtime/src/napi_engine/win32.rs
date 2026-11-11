@@ -589,9 +589,11 @@ unsafe extern "system" fn wnd_proc(
     if msg == WM_NCDESTROY {
         forget(key);
     } else if LISTENERS.with(|l| l.borrow().contains_key(&key)) {
-        // JS never runs inside the window procedure.
+        // Off the UI thread, the listener runs on the window's own thread.
         let (w, l) = (wparam.0, lparam.0);
-        if !crate::ui_dispatcher::enqueue_on_ui_thread(move || deliver(key, msg, w, l)) {
+        if !crate::ui_dispatcher::is_ui_thread()
+            || !crate::ui_dispatcher::enqueue_on_ui_thread(move || deliver(key, msg, w, l))
+        {
             deliver(key, msg, w, l);
         }
     }
