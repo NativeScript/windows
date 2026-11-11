@@ -310,7 +310,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, xamlHostCreate, xamlHostSetListener, xamlHostPlace, xamlHostShow, xamlHostHide, xamlHostIsVisible, xamlHostDestroy, foregroundWindow, activateWindow, enableWindow, windowProcessId, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet } = nativeBinding
+const { formatValue, tableFor, makeDelegate, invokeDelegate, releaseDelegate, callStaticMethod, callInstanceMethod, makeNativeProxy, ffiRoundtrip, pointerValue, makeExternal, bufferInfo, structPtr, writeReadPtr, outParamValue, setOutParam, structFieldBytes, boxTyped, pumpMessages, lastError, installGlobals, getNamespace, nsUuid, createWindow, attachCompositorToWindow, pollWindowEvents, getWindowSize, setWindowTitle, xamlHostCreate, xamlHostSetListener, xamlHostPlace, xamlHostShow, xamlHostHide, xamlHostIsVisible, xamlHostDestroy, foregroundWindow, activateWindow, enableWindow, windowProcessId, classIsSealed, registerWinmd, scanWinmdDir, arrayBufferFromBuffer, installInterop, installDotnet, installWin32 } = nativeBinding
 
 module.exports.formatValue = formatValue
 module.exports.tableFor = tableFor
@@ -357,3 +357,4 @@ module.exports.scanWinmdDir = scanWinmdDir
 module.exports.arrayBufferFromBuffer = arrayBufferFromBuffer
 module.exports.installInterop = installInterop
 module.exports.installDotnet = installDotnet
+module.exports.installWin32 = installWin32

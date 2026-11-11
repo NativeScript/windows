@@ -2358,7 +2358,41 @@ include_str!("js/crypto.js"), r#"
                 if (typeof v === 'boolean') return { type: 'bool', value: v };
                 if (typeof v === 'number')
                     return { type: Number.isInteger(v) ? 'i32' : 'f64', value: v };
+                if (typeof v === 'bigint') return { type: 'i64', value: v };
+                if (typeof v === 'object') return { type: 'pointer', value: v };
                 return { type: 'i32', value: Number(v) };
+            }
+
+            var _bindFast = globalThis.__nsWin32BindFast;
+
+            // Binds a native function on the first call, typed from its values. Forwards by
+            // position: apply with `arguments` would block inlining.
+            function _lazyBound(dll, name, ret, fallback, onBound) {
+                var bound = null;
+                var tried = typeof _bindFast !== 'function';
+                return function (a, b, c, d, e, f, g, h) {
+                    if (bound === null && !tried) {
+                        tried = true;
+                        var types = [];
+                        for (var i = 0; i < arguments.length; i++) {
+                            types.push(_autoType(arguments[i]).type);
+                        }
+                        bound = _bindFast(dll, name, ret, types);
+                        if (bound !== null && onBound) onBound(bound);
+                    }
+                    if (bound === null) return fallback.apply(null, arguments);
+                    switch (arguments.length) {
+                        case 0: return bound();
+                        case 1: return bound(a);
+                        case 2: return bound(a, b);
+                        case 3: return bound(a, b, c);
+                        case 4: return bound(a, b, c, d);
+                        case 5: return bound(a, b, c, d, e);
+                        case 6: return bound(a, b, c, d, e, f);
+                        case 7: return bound(a, b, c, d, e, f, g);
+                        default: return bound(a, b, c, d, e, f, g, h);
+                    }
+                };
             }
 
             globalThis.NSWinRT.win32 = {
@@ -2383,7 +2417,11 @@ include_str!("js/crypto.js"), r#"
                 /**
                  * Returns a Proxy where every property is a callable Win32 function.
                  * Args are auto-typed from their JS values; strings become wstr,
-                 * numbers become i32 (or f64 if non-integer), null becomes pointer(0).
+                 * numbers become i32 (or f64 if non-integer), null becomes pointer(0),
+                 * BigInts become i64, buffers become pointers.
+                 *
+                 * The first call's argument types lock in: the property becomes a bound
+                 * native function with a V8 fast-call overload for that signature.
                  *
                  *   const user32 = NSWinRT.win32.bind('user32.dll');
                  *   const { MessageBoxW } = NSWinRT.win32.bind('user32.dll');
@@ -2391,8 +2429,6 @@ include_str!("js/crypto.js"), r#"
                  */
                 bind: function (dll, returnType) {
                     var ret = returnType || 'i32';
-                    var raw = globalThis.__nsWin32CallRaw;
-                    var bindFast = globalThis.__nsWin32BindFast;
                     var win32 = globalThis.NSWinRT.win32;
                     // One closure per name: a fresh closure per property access
                     // defeats V8's inline caches at the call sites.
@@ -2402,50 +2438,10 @@ include_str!("js/crypto.js"), r#"
                             if (typeof name !== 'string') return undefined;
                             var hit = fns[name];
                             if (hit !== undefined) return hit;
-                            var fn;
-                            if (typeof raw === 'function') {
-                                // Numeric signatures upgrade to a V8 Fast API Function
-                                // on first call; types derived from the call site lock
-                                // in, matching the native CIF cache. The wrapper keeps
-                                // delegating so captured references (import() globals,
-                                // destructuring) get the fast path too.
-                                var tryFast = typeof bindFast === 'function';
-                                var fastFn = null;
-                                fn = function () {
-                                    if (fastFn !== null) return fastFn.apply(null, arguments);
-                                    if (tryFast) {
-                                        tryFast = false;
-                                        var types = [];
-                                        var ok = arguments.length <= 4;
-                                        for (var i = 0; ok && i < arguments.length; i++) {
-                                            var v = arguments[i];
-                                            if (typeof v === 'number') types.push(Number.isInteger(v) ? 'i32' : 'f64');
-                                            else if (typeof v === 'boolean') types.push('bool');
-                                            else if (v === null || v === undefined) types.push('pointer');
-                                            else ok = false;
-                                        }
-                                        if (ok) {
-                                            var f = bindFast(dll, name, ret, types);
-                                            if (f) {
-                                                fastFn = f;
-                                                fns[name] = f;
-                                                return f.apply(null, arguments);
-                                            }
-                                        }
-                                    }
-                                    var rawArgs = [dll, name, ret];
-                                    for (var i = 0; i < arguments.length; i++) {
-                                        var t = _autoType(arguments[i]);
-                                        rawArgs.push(t.type, t.value);
-                                    }
-                                    return raw.apply(null, rawArgs);
-                                };
-                            } else {
-                                fn = function () {
-                                    var args = Array.prototype.slice.call(arguments).map(_autoType);
-                                    return win32.call.apply(win32, [dll, name, ret].concat(args));
-                                };
-                            }
+                            var fn = _lazyBound(dll, name, ret, function () {
+                                return win32.call.apply(win32, [dll, name, ret].concat(
+                                    Array.prototype.map.call(arguments, _autoType)));
+                            }, function (bound) { fns[name] = bound; });
                             fns[name] = fn;
                             return fn;
                         },
@@ -2454,22 +2450,24 @@ include_str!("js/crypto.js"), r#"
 
                 /**
                  * Returns an object with typed function wrappers from explicit signatures.
+                 * A signature is an argument type list, or { args, ret }.
                  *
                  *   const api = NSWinRT.win32.define('user32.dll', {
                  *       MessageBoxW:      ['pointer','wstr','wstr','u32'],
-                 *       GetSystemMetrics: ['i32'],
+                 *       GetSystemMetrics: { args: ['i32'], ret: 'i32' },
                  *   }, 'i32');
                  *   api.MessageBoxW(null, 'Hello', 'Title', 0);
                  */
                 define: function (dll, signatures, defaultReturnType) {
-                    var ret = defaultReturnType || 'i32';
                     var win32 = globalThis.NSWinRT.win32;
                     var obj = {};
                     Object.keys(signatures).forEach(function (name) {
-                        var argTypes = signatures[name];
-                        obj[name] = function () {
-                            var jsArgs = Array.prototype.slice.call(arguments);
-                            var typedArgs = jsArgs.map(function (v, i) {
+                        var sig = signatures[name];
+                        var argTypes = Array.isArray(sig) ? sig : (sig.args || []);
+                        var ret = (!Array.isArray(sig) && sig.ret) || defaultReturnType || 'i32';
+                        var bound = typeof _bindFast === 'function' ? _bindFast(dll, name, ret, argTypes) : null;
+                        obj[name] = bound !== null ? bound : function () {
+                            var typedArgs = Array.prototype.map.call(arguments, function (v, i) {
                                 var ty = argTypes[i];
                                 return ty ? { type: ty, value: v } : _autoType(v);
                             });
@@ -2497,6 +2495,7 @@ include_str!("js/crypto.js"), r#"
                             });
                     });
                 },
+
             };
         })();
 
@@ -4213,42 +4212,43 @@ pub(crate) fn handle_win32_call_raw(
 
     let pair_count = ((args.length() - 3) / 2) as usize;
     let mut type_strs: Vec<String> = Vec::with_capacity(pair_count);
-    let mut raw_vals: Vec<crate::win32::RawArgValue> = Vec::with_capacity(pair_count);
-
     let mut i: i32 = 3;
     while i + 1 < args.length() {
         let Some(ty_v) = args.get(i).to_string(scope) else {
             break;
         };
-        let ty_str = ty_v.to_rust_string_lossy(scope);
-        let v8_val = args.get(i + 1);
-        let raw_val = if ty_str == "wstr" || ty_str == "str" {
-            let s = v8_val
-                .to_string(scope)
-                .map(|sv| sv.to_rust_string_lossy(scope))
-                .unwrap_or_default();
-            crate::win32::RawArgValue::Str(s)
-        } else {
-            let n = v8_val.number_value(scope).unwrap_or(0.0);
-            crate::win32::RawArgValue::Number(n)
-        };
-        type_strs.push(ty_str);
-        raw_vals.push(raw_val);
+        type_strs.push(ty_v.to_rust_string_lossy(scope));
         i += 2;
     }
+    let prepared = crate::win32_call::parse_signature(&ret_type, &type_strs)
+        .and_then(|(ret, kinds)| crate::win32_call::prepare(&dll, &fn_name, ret, &kinds));
+    let prepared = match prepared {
+        Ok(p) => p,
+        Err(e) => {
+            throw_js_error(scope, &e);
+            return;
+        }
+    };
 
-    let arg_pairs: Vec<(&str, crate::win32::RawArgValue)> =
-        type_strs.iter().map(|s| s.as_str()).zip(raw_vals).collect();
+    let mut arena = crate::win32_call::TextArena::new();
+    let mut words = crate::win32_call::Words::new();
+    for (i, kind) in prepared.args.iter().enumerate() {
+        let value = args.get(4 + 2 * i as i32);
+        match crate::win32_fast::marshal_arg(scope, *kind, value, &mut arena) {
+            Ok(w) => words.push(w),
+            Err(e) => {
+                throw_js_error(scope, &format!("{fn_name}() argument {}: {e}", i + 1));
+                return;
+            }
+        }
+    }
 
-    match crate::win32::call_win32_direct(&dll, &fn_name, &ret_type, &arg_pairs) {
-        Ok(result) => match result {
-            crate::win32::Win32Result::Null => retval.set(v8::null(scope).into()),
-            crate::win32::Win32Result::Bool(b) => retval.set_bool(b),
-            crate::win32::Win32Result::I64(v) => retval.set_double(v as f64),
-            crate::win32::Win32Result::U64(v) => retval.set_double(v as f64),
-            crate::win32::Win32Result::F64(v) => retval.set_double(v),
-        },
-        Err(e) => throw_js_error(scope, &e),
+    match unsafe { prepared.call(&words) } {
+        crate::win32::Win32Result::Null => retval.set(v8::null(scope).into()),
+        crate::win32::Win32Result::Bool(b) => retval.set_bool(b),
+        crate::win32::Win32Result::I64(v) => retval.set_double(v as f64),
+        crate::win32::Win32Result::U64(v) => retval.set_double(v as f64),
+        crate::win32::Win32Result::F64(v) => retval.set_double(v),
     }
 }
 

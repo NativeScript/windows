@@ -54,6 +54,33 @@ const user32 = win32.define('user32.dll', {
 
   check('null wstr is a null pointer', user32.FindWindowW(null, `ns-win32-test-${process.pid}-${Date.now()}`), 0);
 
+  // Bound functions: floats, stack arguments, lock-in and errors
+  const msvcrt = win32.define('msvcrt.dll', {
+    pow: { args: ['f64', 'f64'], ret: 'f64' },
+    abs: { args: ['i32'], ret: 'i32' },
+    memchr: { args: ['pointer', 'i32', 'u64'], ret: 'pointer' },
+  });
+  check('f64 arguments and result', msvcrt.pow(2, 10), 1024);
+  const ucrt = win32.define('ucrtbase.dll', { sqrtf: { args: ['f32'], ret: 'f32' } });
+  check('f32 argument and result', ucrt.sqrtf(2.25), 1.5);
+  check('i32 from a bool', msvcrt.abs(true), 1);
+  check('i32 from a numeric string', msvcrt.abs('-7'), 7);
+  const haystack = new Uint8Array([1, 2, 3, 4]);
+  check('pointer result arithmetic', msvcrt.memchr(haystack, 3, 4) - msvcrt.memchr(haystack, 1, 4), 2);
+  check('pointer from an object throws', (() => {
+    try { msvcrt.memchr({}, 1, 4); return false; } catch (e) { return /argument 1/.test(e.message); }
+  })(), true);
+  const mb = win32.define('kernel32.dll', {
+    MultiByteToWideChar: { args: ['u32', 'u32', 'pointer', 'i32', 'pointer', 'i32'], ret: 'i32' },
+  });
+  const wide = new Uint16Array(8);
+  check('six arguments (two on the stack)', mb.MultiByteToWideChar(65001, 0, new Uint8Array([104, 105]), 2, wide, 8), 2);
+  check('stack arguments reached the callee', String.fromCharCode(wide[0], wide[1]), 'hi');
+  const locked = win32.bind('kernel32.dll').lstrlenW;
+  check('bind locks the first call types in', locked('abc'), 3);
+  check('a locked wstr takes null', locked(null), 0);
+  check('define returns the same function each time', kernel32.GetCurrentProcessId, kernel32.GetCurrentProcessId);
+
   check('unknown export throws', (() => {
     try { win32.call('kernel32.dll', 'NoSuchExport', 'i32'); return false; } catch { return true; }
   })(), true);

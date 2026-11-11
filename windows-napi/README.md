@@ -66,6 +66,9 @@ const user32 = win32.define('user32.dll', {
 - A `pointer` argument also takes an `ArrayBuffer`, a typed array or `DataView` (its memory, for
   structs and out-parameters) or a pointer object. `null` is a null pointer, also for strings.
 - `win32.import(dll)` installs every export of the DLL as a global function.
+- `define` and `bind` resolve a function once and call it through the platform's argument
+  registers; `bind` locks a function's argument types in from its first call. `call` parses the
+  signature on every call: use it for one-offs.
 
 ### Callbacks and window messages
 
