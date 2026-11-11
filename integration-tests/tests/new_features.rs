@@ -357,6 +357,69 @@ fn win32_pointer_argument_rejects_plain_objects() {
 }
 
 #[test]
+fn win32_callback_runs_during_the_call() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"(function () {
+            var user32 = NSWinRT.win32.define('user32.dll', { EnumWindows: { args: ['pointer', 'pointer'], ret: 'bool' } });
+            var seen = 0, lparam = -1;
+            var proc = NSWinRT.win32.callback('bool', ['pointer', 'pointer'], function (hwnd, lp) {
+                seen++; lparam = lp; return seen < 3;
+            });
+            if (typeof proc.pointer !== 'number' || proc.pointer === 0) return 'no pointer';
+            user32.EnumWindows(proc.pointer, 42);
+            proc.release();
+            proc.release();
+            var throwing = NSWinRT.win32.callback('bool', ['pointer', 'pointer'], function () { throw new Error('boom'); });
+            var r = user32.EnumWindows(throwing.pointer, 0);
+            throwing.release();
+            return seen >= 1 && seen <= 3 && lparam === 42 && r === false ? true : 'seen ' + seen + ' lparam ' + lparam + ' r ' + r;
+        })()"#,
+        "win32.callback",
+    );
+    assert!(runtime::get_last_js_error().unwrap_or_default().contains("boom"));
+}
+
+#[test]
+fn win32_message_window_delivers_messages() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"(function () {
+            var user32 = NSWinRT.win32.define('user32.dll', {
+                IsWindow: { args: ['pointer'], ret: 'bool' },
+                PostMessageW: { args: ['pointer', 'u32', 'pointer', 'pointer'], ret: 'bool' },
+            });
+            globalThis.__received = [];
+            globalThis.__win = NSWinRT.win32.messageWindow(function (msg, w, l) { __received.push([msg, w, l]); });
+            return user32.IsWindow(__win.hwnd) && user32.PostMessageW(__win.hwnd, 0x8001, 7, 9);
+        })()"#,
+        "win32.messageWindow create + post",
+    );
+    // The listener runs from the message loop (a dispatcher work item when one exists).
+    for _ in 0..20 {
+        runtime::pump_messages();
+        if eval(&mut rt, "__received.length > 0") == "true" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_js(
+        &mut rt,
+        r#"(function () {
+            var user32 = NSWinRT.win32.define('user32.dll', { IsWindow: { args: ['pointer'], ret: 'bool' } });
+            var hit = __received.filter(function (m) { return m[0] === 0x8001; })[0];
+            __win.close();
+            var closed = !user32.IsWindow(__win.hwnd);
+            __win.close();
+            return hit && hit[1] === 7 && hit[2] === 9 && closed ? true : JSON.stringify(__received) + ' closed ' + closed;
+        })()"#,
+        "win32.messageWindow delivery + close",
+    );
+}
+
+#[test]
 fn win32_exports_returns_array() {
     let mut rt = Runtime::new(".");
     assert_js(&mut rt,

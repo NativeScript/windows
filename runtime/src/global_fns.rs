@@ -2496,6 +2496,29 @@ include_str!("js/crypto.js"), r#"
                     });
                 },
 
+                /**
+                 * A native function pointer that calls `fn`:
+                 *   const proc = NSWinRT.win32.callback('bool', ['pointer', 'pointer'], (hwnd, lp) => true);
+                 *   user32.EnumWindows(proc.pointer, 0);
+                 *   proc.release(); // only once native code can no longer call it
+                 */
+                callback: function (ret, argTypes, fn) {
+                    if (typeof fn !== 'function') throw new TypeError('win32.callback: fn must be a function');
+                    return globalThis.__nsWin32Callback(ret, argTypes || [], fn);
+                },
+
+                /**
+                 * A hidden window whose messages go to listener(msg, wParam, lParam): for tray
+                 * icons, hotkeys and menus. Returns { hwnd, close() }.
+                 */
+                messageWindow: function (listener) {
+                    if (typeof listener !== 'function') throw new TypeError('win32.messageWindow: listener must be a function');
+                    var hwnd = globalThis.__nsWin32MessageWindow(listener);
+                    return {
+                        hwnd: hwnd,
+                        close: function () { globalThis.__nsWin32MessageWindowClose(hwnd); },
+                    };
+                },
             };
         })();
 
@@ -4394,6 +4417,12 @@ pub(crate) fn init_async_helpers(
     register!("__nsWin32CallRaw", handle_win32_call_raw);
     register!("__nsWin32BindFast", handle_win32_bind_fast);
     register!("__nsWin32Exports", handle_win32_exports);
+    register!("__nsWin32Callback", crate::win32_callback::handle_win32_callback);
+    register!("__nsWin32MessageWindow", crate::win32_callback::handle_win32_message_window);
+    register!(
+        "__nsWin32MessageWindowClose",
+        crate::win32_callback::handle_win32_message_window_close
+    );
     register!("__ns__setTimeout", crate::timers::handle_ns_set_timeout);
     register!("__ns__setInterval", crate::timers::handle_ns_set_interval);
     register!("__ns__clearTimeout", crate::timers::handle_ns_clear_timeout);
