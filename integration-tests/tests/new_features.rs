@@ -282,6 +282,81 @@ fn win32_bind_pattern() {
 }
 
 #[test]
+fn win32_define_bound_functions() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"(function () {
+            var msvcrt = NSWinRT.win32.define('msvcrt.dll', {
+                pow: { args: ['f64', 'f64'], ret: 'f64' },
+                abs: { args: ['i32'], ret: 'i32' },
+                memchr: { args: ['pointer', 'i32', 'u64'], ret: 'pointer' },
+                wcslen: { args: ['wstr'], ret: 'u64' },
+                strlen: { args: ['str'], ret: 'u64' },
+            });
+            var kernel32 = NSWinRT.win32.define('kernel32.dll', {
+                SetLastError: { args: ['u32'], ret: 'void' },
+                GetLastError: { args: [], ret: 'u32' },
+                MultiByteToWideChar: { args: ['u32', 'u32', 'pointer', 'i32', 'pointer', 'i32'], ret: 'i32' },
+            });
+            var user32 = NSWinRT.win32.define('user32.dll', { IsWindow: { args: ['pointer'], ret: 'bool' } });
+            var ucrt = NSWinRT.win32.define('ucrtbase.dll', { sqrtf: { args: ['f32'], ret: 'f32' } });
+            var bytes = new Uint8Array([1, 2, 3, 4]);
+            var wide = new Uint16Array(8);
+            var n = kernel32.MultiByteToWideChar(65001, 0, new Uint8Array([104, 105]), 2, wide, 8);
+            var checks = [
+                msvcrt.pow(2, 10) === 1024,
+                ucrt.sqrtf(2.25) === 1.5,
+                msvcrt.abs(-7) === 7,
+                msvcrt.abs(true) === 1,
+                msvcrt.abs('-7') === 7,
+                msvcrt.memchr(bytes, 3, 4) - msvcrt.memchr(bytes, 1, 4) === 2,
+                msvcrt.wcslen('nativescript') === 12,
+                msvcrt.strlen('abc') === 3,
+                kernel32.SetLastError(1234) === undefined,
+                kernel32.GetLastError() === 1234,
+                user32.IsWindow(null) === false,
+                n === 2 && String.fromCharCode(wide[0], wide[1]) === 'hi',
+            ];
+            // Call again so TurboFan takes the fast overloads.
+            for (var i = 0; i < 20000; i++) {
+                if (msvcrt.abs(-i) !== i || msvcrt.pow(i, 1) !== i || msvcrt.wcslen('ab') !== 2) return 'fast path ' + i;
+            }
+            var failed = [];
+            for (var j = 0; j < checks.length; j++) if (!checks[j]) failed.push(j);
+            return failed.length === 0 ? true : 'failed checks ' + failed.join(',');
+        })()"#,
+        "win32.define bound functions",
+    );
+}
+
+#[test]
+fn win32_bind_locks_argument_types() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"(function () {
+            var lstrlenW = NSWinRT.win32.bind('kernel32.dll').lstrlenW;
+            return lstrlenW('abc') === 3 && lstrlenW(null) === 0 && lstrlenW('hello') === 5;
+        })()"#,
+        "win32.bind locks the first call's types in",
+    );
+}
+
+#[test]
+fn win32_pointer_argument_rejects_plain_objects() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"(function () {
+            var msvcrt = NSWinRT.win32.define('msvcrt.dll', { memchr: { args: ['pointer', 'i32', 'u64'], ret: 'pointer' } });
+            try { msvcrt.memchr({}, 1, 4); return 'no throw'; } catch (e) { return e instanceof TypeError && /argument 1/.test(e.message); }
+        })()"#,
+        "a plain object is not a pointer",
+    );
+}
+
+#[test]
 fn win32_exports_returns_array() {
     let mut rt = Runtime::new(".");
     assert_js(&mut rt,

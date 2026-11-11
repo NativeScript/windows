@@ -61,6 +61,7 @@ pub mod ui_dispatcher;
 mod value;
 #[cfg(any(feature = "classic", feature = "napi_engine"))]
 pub(crate) mod win32;
+pub(crate) mod win32_call;
 #[cfg(feature = "classic")]
 pub(crate) mod win32_fast;
 #[cfg(feature = "classic")]
@@ -8692,6 +8693,10 @@ impl Runtime {
             // --expose-gc makes gc() available as a global JS function so callers
             // can trigger a full GC sweep (useful for debugging and test harnesses).
             v8::V8::set_flags_from_string("--expose-gc");
+            // Extra V8 flags, e.g. --trace-deopt.
+            if let Ok(flags) = std::env::var("NSWIN_V8_FLAGS") {
+                v8::V8::set_flags_from_string(&flags);
+            }
             let platform = v8::new_default_platform(0, false).make_shared();
             let _ = V8_PLATFORM.set(platform.clone());
             v8::V8::initialize_platform(platform);

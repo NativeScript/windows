@@ -24,7 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::napi_engine::value::{
     as_unknown, buffer_data, external_ptr_raw, js_to_rust_string, try_get_external_handle,
 };
-use crate::win32::{call_win32_direct, ffi_type_for, list_exports, RawArgValue, Win32Result};
+use crate::win32::{ffi_type_for, list_exports, Win32Result};
+use crate::win32_call::{parse_signature, prepare, Kind, Prepared, TextArena, Words, MAX_ARGS};
 
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
@@ -68,37 +69,72 @@ fn pointer_of(env: &Env, value: &JsUnknown) -> napi::Result<Option<u64>> {
     }
 }
 
-/// A null string becomes a null pointer.
-fn raw_arg(env: &Env, ty: String, value: &JsUnknown) -> napi::Result<(String, RawArgValue)> {
-    let kind = value.get_type()?;
-    if matches!(kind, ValueType::Null | ValueType::Undefined) {
-        let ty = if ty == "wstr" || ty == "str" {
-            "pointer".to_string()
+fn text_arg(env: &Env, kind: Kind, value: &JsUnknown, arena: &mut TextArena) -> napi::Result<u64> {
+    let (env, raw) = (env.raw(), unsafe { value.raw() });
+    let mut len = 0usize;
+    unsafe {
+        if kind == Kind::WStr {
+            if sys::napi_get_value_string_utf16(env, raw, std::ptr::null_mut(), 0, &mut len)
+                != sys::Status::napi_ok
+            {
+                return Err(err("not a string"));
+            }
+            let (out, address) = arena.wide(len);
+            let mut written = 0usize;
+            sys::napi_get_value_string_utf16(env, raw, out.as_mut_ptr(), len + 1, &mut written);
+            Ok(address)
         } else {
-            ty
-        };
-        return Ok((ty, RawArgValue::Word(0)));
-    }
-    if ty == "wstr" || ty == "str" {
-        return Ok((ty, RawArgValue::Str(js_to_rust_string(env, value))));
-    }
-    let raw = match kind {
-        ValueType::Number => RawArgValue::Number(unsafe { value.cast::<JsNumber>() }.get_double()?),
-        ValueType::Boolean => {
-            RawArgValue::Number(unsafe { value.cast::<JsBoolean>() }.get_value()? as u8 as f64)
+            if sys::napi_get_value_string_utf8(env, raw, std::ptr::null_mut(), 0, &mut len)
+                != sys::Status::napi_ok
+            {
+                return Err(err("not a string"));
+            }
+            let (out, address) = arena.narrow(len);
+            let mut written = 0usize;
+            sys::napi_get_value_string_utf8(
+                env,
+                raw,
+                out.as_mut_ptr().cast(),
+                len + 1,
+                &mut written,
+            );
+            Ok(address)
         }
-        ValueType::BigInt => RawArgValue::Word(bigint_word(env, value)),
-        ValueType::String => RawArgValue::Number(
+    }
+}
+
+/// A null string becomes a null pointer.
+fn arg_word(env: &Env, kind: Kind, value: &JsUnknown, arena: &mut TextArena) -> napi::Result<u64> {
+    let ty = value.get_type()?;
+    Ok(match ty {
+        ValueType::Null | ValueType::Undefined => match kind {
+            Kind::F64 if ty == ValueType::Undefined => f64::NAN.to_bits(),
+            Kind::F32 if ty == ValueType::Undefined => f32::NAN.to_bits() as u64,
+            _ => 0,
+        },
+        ValueType::Number => kind.word_from_f64(unsafe { value.cast::<JsNumber>() }.get_double()?),
+        ValueType::Boolean => {
+            kind.word_from_i64(unsafe { value.cast::<JsBoolean>() }.get_value()? as i64)
+        }
+        ValueType::BigInt => kind.word_from_i64(bigint_word(env, value) as i64),
+        ValueType::String if kind.is_text() => text_arg(env, kind, value, arena)?,
+        ValueType::String => kind.word_from_f64(
             unsafe { JsUnknown::from_raw_unchecked(env.raw(), value.raw()) }
                 .coerce_to_number()?
                 .get_double()?,
         ),
         _ => match pointer_of(env, value)? {
-            Some(address) => RawArgValue::Word(address),
-            None => return Err(err(format!("win32: cannot pass this value as '{ty}'"))),
+            Some(address) => kind.word_from_i64(address as i64),
+            None if kind.is_text() || kind == Kind::Pointer => {
+                return Err(err(format!("cannot pass this value as '{}'", kind.name())))
+            }
+            None => kind.word_from_f64(
+                unsafe { JsUnknown::from_raw_unchecked(env.raw(), value.raw()) }
+                    .coerce_to_number()?
+                    .get_double()?,
+            ),
         },
-    };
-    Ok((ty, raw))
+    })
 }
 
 fn number_or_bigint_i64(env: &Env, v: i64) -> napi::Result<JsUnknown> {
@@ -117,32 +153,75 @@ fn number_or_bigint_u64(env: &Env, v: u64) -> napi::Result<JsUnknown> {
     }
 }
 
-/// `__nsWin32CallRaw(dll, fn, retType, type0, value0, ...)`
-fn call(ctx: CallContext) -> napi::Result<JsUnknown> {
-    if ctx.length < 3 {
-        return Err(err("__nsWin32CallRaw(dll, fn, retType, ...typeValuePairs)"));
-    }
-    let env: &Env = &ctx.env;
-    let dll = string_arg(&ctx, 0);
-    let name = string_arg(&ctx, 1);
-    let ret = string_arg(&ctx, 2);
-    let mut types = Vec::with_capacity((ctx.length - 3) / 2);
-    let mut values = Vec::with_capacity(types.capacity());
-    let mut i = 3;
-    while i + 1 < ctx.length {
-        let (ty, value) = raw_arg(env, string_arg(&ctx, i), &ctx.get::<JsUnknown>(i + 1)?)?;
-        types.push(ty);
-        values.push(value);
-        i += 2;
-    }
-    let pairs: Vec<(&str, RawArgValue)> = types.iter().map(String::as_str).zip(values).collect();
-    match call_win32_direct(&dll, &name, &ret, &pairs).map_err(err)? {
+fn result_value(env: &Env, result: Win32Result) -> napi::Result<JsUnknown> {
+    match result {
         Win32Result::Null => Ok(as_unknown(env, env.get_null()?)),
         Win32Result::Bool(b) => Ok(as_unknown(env, env.get_boolean(b)?)),
         Win32Result::I64(v) => number_or_bigint_i64(env, v),
         Win32Result::U64(v) => number_or_bigint_u64(env, v),
         Win32Result::F64(v) => Ok(as_unknown(env, env.create_double(v)?)),
     }
+}
+
+/// Calls `prepared` with the JS arguments at `first`, `first + stride`, ...
+fn call_prepared(
+    ctx: &CallContext,
+    prepared: &Prepared,
+    first: usize,
+    stride: usize,
+) -> napi::Result<JsUnknown> {
+    let env: &Env = &ctx.env;
+    let mut arena = TextArena::new();
+    let mut words = Words::with_capacity(prepared.arity());
+    for (i, kind) in prepared.args.iter().enumerate() {
+        let value = ctx.get::<JsUnknown>(first + i * stride)?;
+        words.push(arg_word(env, *kind, &value, &mut arena).map_err(|e| {
+            err(format!(
+                "{}() argument {}: {}",
+                prepared.name,
+                i + 1,
+                e.reason
+            ))
+        })?);
+    }
+    result_value(env, unsafe { prepared.call(&words) })
+}
+
+/// `__nsWin32CallRaw(dll, fn, retType, type0, value0, ...)`
+fn call(ctx: CallContext) -> napi::Result<JsUnknown> {
+    if ctx.length < 3 {
+        return Err(err("__nsWin32CallRaw(dll, fn, retType, ...typeValuePairs)"));
+    }
+    let dll = string_arg(&ctx, 0);
+    let name = string_arg(&ctx, 1);
+    let ret = string_arg(&ctx, 2);
+    let mut types: smallvec::SmallVec<[String; MAX_ARGS]> = smallvec::SmallVec::new();
+    let mut i = 3;
+    while i + 1 < ctx.length {
+        types.push(string_arg(&ctx, i));
+        i += 2;
+    }
+    let (ret, kinds) = parse_signature(&ret, &types).map_err(err)?;
+    let prepared = prepare(&dll, &name, ret, &kinds).map_err(err)?;
+    call_prepared(&ctx, prepared, 4, 2)
+}
+
+/// `__nsWin32Bind(dll, fn, retType, argTypes)`: a function bound to one signature.
+fn bind(ctx: CallContext) -> napi::Result<JsFunction> {
+    let env: &Env = &ctx.env;
+    let dll = string_arg(&ctx, 0);
+    let name = string_arg(&ctx, 1);
+    let ret = string_arg(&ctx, 2);
+    let mut types: Vec<String> = Vec::new();
+    if ctx.length > 3 {
+        let list: JsObject = ctx.get(3)?;
+        for i in 0..list.get_array_length()? {
+            types.push(js_to_rust_string(env, &list.get_element::<JsUnknown>(i)?));
+        }
+    }
+    let (ret, kinds) = parse_signature(&ret, &types).map_err(err)?;
+    let prepared = prepare(&dll, &name, ret, &kinds).map_err(err)?;
+    env.create_function_from_closure(&name, move |ctx| call_prepared(&ctx, prepared, 0, 1))
 }
 
 fn exports(ctx: CallContext) -> napi::Result<JsUnknown> {
@@ -602,6 +681,10 @@ fn message_window_close(ctx: CallContext) -> napi::Result<JsUnknown> {
 
 pub fn install_win32(env: &Env) -> napi::Result<()> {
     let mut global = env.get_global()?;
+    global.set_named_property(
+        "__nsWin32Bind",
+        env.create_function_from_closure("__nsWin32Bind", bind)?,
+    )?;
     let natives: [(&str, fn(CallContext) -> napi::Result<JsUnknown>); 4] = [
         ("__nsWin32CallRaw", call),
         ("__nsWin32Exports", exports),
@@ -630,6 +713,7 @@ var g = globalThis;
 g.NSWinRT = g.NSWinRT || {};
 if (g.NSWinRT.win32) return;
 var raw = g.__nsWin32CallRaw;
+var bindNative = g.__nsWin32Bind;
 
 function autoType(v) {
     if (v === null || v === undefined) return { type: 'pointer', value: 0 };
@@ -648,22 +732,49 @@ function invoke(dll, name, ret, descriptors) {
     return raw.apply(null, args);
 }
 
+// Binds a native function on the first call, typed from its values. Forwards by position:
+// apply with `arguments` would block inlining.
+function lazyBound(dll, name, ret, onBound) {
+    var bound = null;
+    var tried = typeof bindNative !== 'function';
+    return function (a, b, c, d, e, f, g, h) {
+        if (bound === null && !tried) {
+            tried = true;
+            var types = [];
+            for (var i = 0; i < arguments.length; i++) types.push(autoType(arguments[i]).type);
+            try { bound = bindNative(dll, name, ret, types); } catch (e) { bound = null; }
+            if (bound !== null && onBound) onBound(bound);
+        }
+        if (bound === null) {
+            return invoke(dll, name, ret, Array.prototype.map.call(arguments, autoType));
+        }
+        switch (arguments.length) {
+            case 0: return bound();
+            case 1: return bound(a);
+            case 2: return bound(a, b);
+            case 3: return bound(a, b, c);
+            case 4: return bound(a, b, c, d);
+            case 5: return bound(a, b, c, d, e);
+            case 6: return bound(a, b, c, d, e, f);
+            case 7: return bound(a, b, c, d, e, f, g);
+            default: return bound(a, b, c, d, e, f, g, h);
+        }
+    };
+}
+
 var win32 = {
     call: function (dll, name, ret) {
         return invoke(dll, name, ret, Array.prototype.slice.call(arguments, 3));
     },
 
+    /** The first call's argument types lock in. */
     bind: function (dll, ret) {
         ret = ret || 'i32';
         var fns = Object.create(null);
         return new Proxy({}, {
             get: function (_, name) {
                 if (typeof name !== 'string') return undefined;
-                if (!fns[name]) {
-                    fns[name] = function () {
-                        return invoke(dll, name, ret, Array.prototype.map.call(arguments, autoType));
-                    };
-                }
+                if (!fns[name]) fns[name] = lazyBound(dll, name, ret, function (bound) { fns[name] = bound; });
                 return fns[name];
             },
         });
@@ -676,7 +787,10 @@ var win32 = {
             var sig = signatures[name];
             var argTypes = Array.isArray(sig) ? sig : sig.args || [];
             var ret = (!Array.isArray(sig) && sig.ret) || defaultRet || 'i32';
-            api[name] = function () {
+            // Unresolved functions report the error when called.
+            var bound = null;
+            try { bound = bindNative(dll, name, ret, argTypes); } catch (e) { bound = null; }
+            api[name] = bound !== null ? bound : function () {
                 var descriptors = Array.prototype.map.call(arguments, function (v, i) {
                     return argTypes[i] ? { type: argTypes[i], value: v } : autoType(v);
                 });
