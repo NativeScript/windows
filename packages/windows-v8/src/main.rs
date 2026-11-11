@@ -39,11 +39,7 @@ fn run_script(env: &Env, code: &str) -> Result<String, String> {
 fn main() {
     crash::install();
 
-    // Initialize the V8 platform via rusty_v8 (the shim's C++ can't link NewDefaultPlatform's
-    // libc++ unique_ptr). Must happen before js_create_runtime creates an isolate.
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
+    windows_v8::platform::initialize();
 
     unsafe {
         std::mem::forget(napi::sys::setup());
@@ -100,9 +96,7 @@ fn main() {
 
         let _ = run_script(&env, ns_windows_common::url_polyfill::POLYFILL); // URL/URLSearchParams
         let _ = run_script(&env, ns_windows_common::prelude::PRELUDE); // queueMicrotask + NSWinRT
-        let drain = || {
-            ffi::js_execute_pending_jobs(env_raw);
-        };
+        let drain = || windows_v8::drain(env_raw);
 
         // App mode: `nativescript-windows <script.js>`: run the script, then drive the event
         // loop (timers, WinRT async completions, microtasks) until the app goes idle.
