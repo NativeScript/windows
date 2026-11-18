@@ -205,6 +205,15 @@ struct napi_env__ {
     return type_tag_key.Get(isolate);
   }
 
+  // Where napi_wrap keeps the wrap of an object without internal fields (as Node does for all).
+  v8::Global<v8::Private> wrapper_key;
+  inline v8::Local<v8::Private> WrapperKey() {
+    if (wrapper_key.IsEmpty()) {
+      wrapper_key.Reset(isolate, v8::Private::ForApi(isolate, v8::String::NewFromUtf8Literal(isolate, "napi:wrapper")));
+    }
+    return wrapper_key.Get(isolate);
+  }
+
   v8impl::Persistent<v8::Value> last_exception;
   // Cache the template for NapiHostObject
   v8::Persistent<v8::ObjectTemplate> host_object_template;
