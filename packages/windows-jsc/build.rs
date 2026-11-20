@@ -32,8 +32,7 @@ fn main() {
         let libdir = vendor.join("x64");
         println!("cargo:rustc-link-search=native={}", libdir.display());
         println!("cargo:rustc-link-lib=dylib=JavaScriptCore");
-        let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-        if let Some(profile_dir) = out.ancestors().nth(3) {
+        if let Some(profile_dir) = profile_dir() {
             for dll in ["JavaScriptCore.dll", "icuin77.dll", "icuuc77.dll", "icudt77.dll"] {
                 let _ = std::fs::copy(libdir.join(dll), profile_dir.join(dll));
             }
@@ -42,4 +41,13 @@ fn main() {
 
     println!("cargo:rerun-if-changed=vendor/shim/jsc-api.cpp");
     println!("cargo:rerun-if-changed=vendor/shim/jsr.cpp");
+}
+
+/// `target/<profile>`, where the exe is built: the parent of OUT_DIR's `build` ancestor. A fixed
+/// depth breaks across Cargo versions: 1.100 moved OUT_DIR from `build/<pkg>-<hash>/out` to
+/// `build/<pkg>/<hash>/out`.
+fn profile_dir() -> Option<PathBuf> {
+    let out = PathBuf::from(std::env::var("OUT_DIR").ok()?);
+    let build = out.ancestors().find(|p| p.file_name() == Some("build".as_ref()))?;
+    build.parent().map(PathBuf::from)
 }

@@ -30,9 +30,7 @@ fn main() {
     }
 
     // Copy the runtime DLL(s) next to the produced exe (target/<profile>/).
-    // OUT_DIR = target/<profile>/build/<pkg>-<hash>/out → three parents up is target/<profile>.
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    if let Some(profile_dir) = out.ancestors().nth(3) {
+    if let Some(profile_dir) = profile_dir() {
         // hermes-icu.dll only exists in the `icu` variant; the uwp/no-icu build has no such file.
         let dlls: &[&str] = if cfg!(feature = "icu") {
             &["hermes.dll", "hermes-icu.dll"]
@@ -48,4 +46,13 @@ fn main() {
 
     println!("cargo:rerun-if-changed=vendor/x64/icu/napi_symbols.txt");
     println!("cargo:rerun-if-changed=vendor/x64/no-icu/napi_symbols.txt");
+}
+
+/// `target/<profile>`, where the exe is built: the parent of OUT_DIR's `build` ancestor. A fixed
+/// depth breaks across Cargo versions: 1.100 moved OUT_DIR from `build/<pkg>-<hash>/out` to
+/// `build/<pkg>/<hash>/out`.
+fn profile_dir() -> Option<PathBuf> {
+    let out = PathBuf::from(std::env::var("OUT_DIR").ok()?);
+    let build = out.ancestors().find(|p| p.file_name() == Some("build".as_ref()))?;
+    build.parent().map(PathBuf::from)
 }
