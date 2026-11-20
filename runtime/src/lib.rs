@@ -1305,7 +1305,15 @@ pub(crate) fn return_value_from_kind<'a>(
             let data = (result as *const u8).add(8) as *const c_void;
             received_array_from_slots(kind, result, data, scope)
         },
-        ReturnKind::InterfaceObject { decl, type_name } => {
+        // Wrap by the runtime class: an interface such as IPropertySet declares no members itself
+        // and only requires the generic IMap/IIterable instances, and an unsealed class may be a
+        // subclass (VisualTreeHelper.GetParent declares DependencyObject and returns a Grid).
+        ReturnKind::InterfaceObject { decl, type_name }
+        | ReturnKind::Object {
+            decl,
+            type_name,
+            sealed: false,
+        } => {
             if result.is_null() {
                 v8::null(scope).into()
             } else {
@@ -1314,8 +1322,6 @@ pub(crate) fn return_value_from_kind<'a>(
                 if let Some(local) = crate::wrapper_cache::get_for(scope, &instance) {
                     return local.into();
                 }
-                // Wrap by the runtime class: an interface such as IPropertySet declares no
-                // members itself and only requires the generic IMap/IIterable instances.
                 match crate::ns_proxy::resolve_runtime_class(&instance, type_name.as_ref()) {
                     Some((name, class)) => {
                         let instance = Some(instance);
@@ -1949,6 +1955,88 @@ pub(crate) fn class_activation_factory(full_name: &str) -> windows::core::Result
             .insert(full_name.to_string(), factory.clone())
     });
     Ok(factory)
+}
+
+/// One call of a static method bound to `dec` (see `create_ns_ctor_object`).
+#[cfg(feature = "classic")]
+fn call_static_method(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments,
+    retval: &mut v8::ReturnValue,
+    dec: &DeclarationFFI,
+) {
+    let lock = dec.read();
+
+    let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else {
+        return;
+    };
+
+    // The class activation factory is a process-lifetime singleton, so the
+    // call is resolved (factory lookup + QueryInterface + vtable slot) once
+    // per static method and every invocation borrows that resolution.
+    let mut method = match dec.prepared_method.get() {
+        Some(prepared) => MethodCall::from_prepared(prepared),
+        None => {
+            let factory = match resolve_class_factory_from_parent(dec) {
+                Ok(factory) => factory,
+                Err(error) => {
+                    throw_js_error(
+                        scope,
+                        format!(
+                            "Failed to resolve WinRT static method factory for {}: {}",
+                            method.name(),
+                            error.message()
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+            };
+            match MethodCall::prepare(method, method.is_sealed(), factory.clone(), false) {
+                Some(prepared) => {
+                    let _ = dec.prepared_method.set(prepared);
+                    MethodCall::from_prepared(dec.prepared_method.get().unwrap())
+                }
+                // The owned path reports the interface error.
+                None => MethodCall::new(method, method.is_sealed(), factory, false),
+            }
+        }
+    };
+
+    let (ret, result, outs) = method.call(scope, args);
+
+    if ret.is_ok() {
+        if !outs.is_empty() {
+            let mut arr_len = outs.len();
+            if !method.is_void() {
+                arr_len += 1;
+            }
+            let arr = v8::Array::new(scope, arr_len as i32);
+            let mut idx = 0u32;
+
+            if !method.is_void() {
+                let rv =
+                    return_value_from_kind(method.return_kind(), result, dec.parent.clone(), scope);
+                arr.set_index(scope, idx, rv);
+                idx += 1;
+            }
+
+            for outv in outs.into_iter() {
+                arr.set_index(scope, idx, outv);
+                idx += 1;
+            }
+            retval.set(arr.into());
+            return;
+        }
+
+        let v = return_value_from_kind(method.return_kind(), result, dec.parent.clone(), scope);
+        retval.set(v);
+    } else {
+        let detail = crate::error::format_hresult_message(ret);
+        let message = v8::String::new(scope, &detail).unwrap();
+        let error = v8::Exception::error(scope, message.into());
+        scope.throw_exception(error);
+    }
 }
 
 #[cfg(feature = "classic")]
@@ -6926,135 +7014,80 @@ fn create_ns_ctor_object<'a>(
             return v8::undefined(scope).into();
         };
         let mut added_names: AHashSet<String> = AHashSet::new();
-
-        for method in clazz.methods().iter() {
-            let name = v8::String::new(scope, method.name());
-            let is_static = method.is_static();
-
-            if !is_static {
-                continue;
+        // Statics grouped by public name, in metadata order. Overloads with an [Overload] name
+        // are also reachable by it, as instance methods are.
+        let mut statics: Vec<(String, Vec<MethodDeclaration>)> = Vec::new();
+        for method in clazz.methods().iter().filter(|m| m.is_static()) {
+            match statics.iter_mut().find(|(n, _)| n == method.name()) {
+                Some((_, group)) => group.push(method.clone()),
+                None => statics.push((method.name().to_string(), vec![method.clone()])),
             }
-
-            // Skip duplicate method/property names to avoid adding the same
-            // descriptor multiple times to the FunctionTemplate which can
-            // corrupt V8 internal descriptor arrays.
-            let m_name = method.name();
-            if added_names.contains(m_name) {
-                continue;
+        }
+        let mut entries = statics.clone();
+        for (_, group) in statics.iter().filter(|(_, g)| g.len() > 1) {
+            for method in group {
+                let overload = method.overload_name();
+                if !overload.is_empty() && !entries.iter().any(|(n, _)| n == overload) {
+                    entries.push((overload.to_string(), vec![method.clone()]));
+                }
             }
-            added_names.insert(m_name.to_string());
+        }
 
-            let parent = Arc::clone(&declaration);
+        for (js_name, group) in entries.iter() {
+            added_names.insert(js_name.clone());
+            let name = v8::String::new(scope, js_name);
+            let decs: Vec<*mut DeclarationFFI> = group
+                .iter()
+                .map(|method| {
+                    let mut ffi = DeclarationFFI::new_with_instance(
+                        Arc::new(RwLock::new(method.clone())),
+                        None,
+                    );
+                    ffi.parent = Some(Arc::clone(&declaration));
+                    Box::into_raw(Box::new(ffi))
+                })
+                .collect();
 
-            let mut declaration =
-                DeclarationFFI::new_with_instance(Arc::new(RwLock::new(method.clone())), None);
-
-            declaration.parent = Some(parent);
-
-            let declaration = Box::into_raw(Box::new(declaration));
-
-            let ext = v8::External::new(scope, declaration as _);
-
-            let func = v8::FunctionTemplate::builder(
-                |scope: &mut v8::PinScope<'_, '_>,
-                 args: v8::FunctionCallbackArguments,
-                 mut retval: v8::ReturnValue| {
-                    let dec = unsafe { args.data().cast::<v8::External>() };
-
-                    let dec = dec.value() as *mut DeclarationFFI;
-
-                    let dec = unsafe { &*dec };
-
-                    let lock = dec.read();
-
-                    let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else {
-                        return;
-                    };
-
-                    // The class activation factory is a process-lifetime singleton, so the
-                    // call is resolved (factory lookup + QueryInterface + vtable slot) once
-                    // per static method and every invocation borrows that resolution.
-                    let mut method = match dec.prepared_method.get() {
-                        Some(prepared) => MethodCall::from_prepared(prepared),
-                        None => {
-                            let factory = match resolve_class_factory_from_parent(dec) {
-                                Ok(factory) => factory,
-                                Err(error) => {
-                                    throw_js_error(
-                                        scope,
-                                        format!(
-                                            "Failed to resolve WinRT static method factory for {}: {}",
-                                            method.name(),
-                                            error.message()
-                                        )
-                                        .as_str(),
-                                    );
-                                    return;
-                                }
-                            };
-                            match MethodCall::prepare(
-                                method,
-                                method.is_sealed(),
-                                factory.clone(),
-                                false,
-                            ) {
-                                Some(prepared) => {
-                                    let _ = dec.prepared_method.set(prepared);
-                                    MethodCall::from_prepared(dec.prepared_method.get().unwrap())
-                                }
-                                // The owned path reports the interface error.
-                                None => MethodCall::new(method, method.is_sealed(), factory, false),
-                            }
-                        }
-                    };
-
-                    let (ret, result, outs) = method.call(scope, &args);
-
-                    if ret.is_ok() {
-                        if !outs.is_empty() {
-                            let mut arr_len = outs.len();
-                            if !method.is_void() {
-                                arr_len += 1;
-                            }
-                            let arr = v8::Array::new(scope, arr_len as i32);
-                            let mut idx = 0u32;
-
-                            if !method.is_void() {
-                                let rv = return_value_from_kind(
-                                    method.return_kind(),
-                                    result,
-                                    dec.parent.clone(),
-                                    scope,
-                                );
-                                arr.set_index(scope, idx, rv);
-                                idx += 1;
-                            }
-
-                            for outv in outs.into_iter() {
-                                arr.set_index(scope, idx, outv);
-                                idx += 1;
-                            }
-                            retval.set(arr.into());
+            let func = if let [dec] = decs.as_slice() {
+                let ext = v8::External::new(scope, *dec as _);
+                v8::FunctionTemplate::builder(
+                    |scope: &mut v8::PinScope<'_, '_>,
+                     args: v8::FunctionCallbackArguments,
+                     mut retval: v8::ReturnValue| {
+                        let dec = unsafe { args.data().cast::<v8::External>() };
+                        let dec = unsafe { &*(dec.value() as *mut DeclarationFFI) };
+                        call_static_method(scope, &args, &mut retval, dec);
+                    },
+                )
+                .data(ext.into())
+                .build(scope)
+            } else {
+                let ext = v8::External::new(scope, Box::into_raw(Box::new(decs)) as _);
+                v8::FunctionTemplate::builder(
+                    |scope: &mut v8::PinScope<'_, '_>,
+                     args: v8::FunctionCallbackArguments,
+                     mut retval: v8::ReturnValue| {
+                        let decs = unsafe { args.data().cast::<v8::External>() };
+                        let decs = unsafe { &*(decs.value() as *const Vec<*mut DeclarationFFI>) };
+                        let methods: Vec<MethodDeclaration> = decs
+                            .iter()
+                            .filter_map(|d| {
+                                let d = unsafe { &**d };
+                                let lock = d.read();
+                                lock.as_any().downcast_ref::<MethodDeclaration>().cloned()
+                            })
+                            .collect();
+                        if methods.len() != decs.len() {
                             return;
                         }
-
-                        let v = return_value_from_kind(
-                            method.return_kind(),
-                            result,
-                            dec.parent.clone(),
-                            scope,
-                        );
-                        retval.set(v);
-                    } else {
-                        let detail = crate::error::format_hresult_message(ret);
-                        let message = v8::String::new(scope, &detail).unwrap();
-                        let error = v8::Exception::error(scope, message.into());
-                        scope.throw_exception(error);
-                    }
-                },
-            )
-            .data(ext.into())
-            .build(scope);
+                        let i = crate::class_helpers::pick_static_overload(&methods, scope, &args);
+                        let dec = unsafe { &*decs[i] };
+                        call_static_method(scope, &args, &mut retval, dec);
+                    },
+                )
+                .data(ext.into())
+                .build(scope)
+            };
 
             tmpl.set(name.unwrap().into(), func.into());
         }

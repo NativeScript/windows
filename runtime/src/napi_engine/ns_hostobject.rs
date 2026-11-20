@@ -165,6 +165,15 @@ pub fn is_interface(declaration: &Decl) -> bool {
     )
 }
 
+/// True iff `declaration` is a class other types can derive from, so an object declared as it
+/// may be a subclass (`VisualTreeHelper.GetParent` declares `DependencyObject` and returns a Grid).
+pub fn is_unsealed_class(declaration: &Decl) -> bool {
+    let lock = declaration.read();
+    lock.as_any()
+        .downcast_ref::<ClassDeclaration>()
+        .is_some_and(|class| !class.is_sealed())
+}
+
 /// The metadata class named by `instance`'s GetRuntimeClassName.
 pub fn runtime_class(instance: &IUnknown) -> Option<(String, Decl)> {
     let inspectable = instance.cast::<IInspectable>().ok()?;
@@ -291,13 +300,20 @@ fn collect_args(ctx: &CallContext) -> napi::Result<SmallVec<[JsUnknown; 4]>> {
     Ok(args)
 }
 
-/// The overload whose parameter count matches the supplied argument count, by index into
-/// `overloads`; the first overload when none matches (the call then raises a JS error).
-fn pick_overload(overloads: &[MethodDeclaration], argc: usize) -> usize {
-    overloads
-        .iter()
-        .position(|m| m.number_of_parameters() == argc)
-        .unwrap_or(0)
+/// The overload a call with `args` means, by index into `overloads` (see
+/// `class_helpers::pick_overload`: argument count, then the shape of struct arguments).
+fn pick_overload(overloads: &[MethodDeclaration], args: &[JsUnknown]) -> usize {
+    crate::class_helpers::pick_overload(overloads, args.len(), |j, name| {
+        let arg = args.get(j)?;
+        if arg.get_type().ok()? != napi::ValueType::Object
+            || arg.is_typedarray().unwrap_or(false)
+            || arg.is_dataview().unwrap_or(false)
+        {
+            return None;
+        }
+        let object: JsObject = unsafe { arg.cast() };
+        object.has_named_property(name).ok()
+    })
 }
 
 /// The value in `cell`, filling it through `prepare` on the first call. `None` when the cell
@@ -468,7 +484,7 @@ fn class_prototype(env: &Env, class_name: &str) -> napi::Result<JsObject> {
             let env = &ctx.env;
             let handle = this_handle(&ctx)?;
             let args = collect_args(&ctx)?;
-            let method = &overloads[pick_overload(&overloads, args.len())];
+            let method = &overloads[pick_overload(&overloads, &args)];
             invoke_host_method(env, handle, method, is_sealed, &args).map_err(napi_err)
         })?;
         proto.set_named_property(js_name, f)?;
@@ -771,7 +787,7 @@ pub fn build_host_ctor(env: &Env, class_name: &str, declaration: Decl) -> napi::
             let env = &ctx.env;
             crate::napi_engine::invoke::ensure_winrt_initialized();
             let args = collect_args(&ctx)?;
-            let idx = pick_overload(&overloads, args.len());
+            let idx = pick_overload(&overloads, &args);
             let method = &overloads[idx];
             let prepared = get_or_prepare(&cells[idx], || {
                 let factory = crate::class_activation_factory(&cls).ok()?;
