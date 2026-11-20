@@ -376,22 +376,35 @@ namespace v8impl {
             RETURN_STATUS_IF_FALSE(env, value->IsObject(), napi_invalid_arg);
             v8::Local<v8::Object> obj = value.As<v8::Object>();
 
-            // [windows port] Speculative callers may call napi_unwrap on a never-wrapped object
-            // (0 internal fields); without this check GetAlignedPointerFromInternalField hits an
-            // uncatchable V8 CHECK failure instead of returning an error.
-            RETURN_STATUS_IF_FALSE(env, obj->InternalFieldCount() > 0, napi_invalid_arg);
-
-            // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
-            Reference *reference =
-                    static_cast<v8impl::Reference *>(obj->GetAlignedPointerFromInternalField(0, v8::kEmbedderDataTypeTagDefault));
+            // [windows port] An object without internal fields keeps its wrap under a private
+            // symbol (see Wrap). Reading internal field 0 of such an object is an uncatchable V8
+            // CHECK failure, and a never-wrapped object must return an error.
+            const bool in_field = obj->InternalFieldCount() > 0;
+            Reference *reference = nullptr;
+            if (in_field) {
+                // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
+                reference = static_cast<v8impl::Reference *>(
+                        obj->GetAlignedPointerFromInternalField(0, v8::kEmbedderDataTypeTagDefault));
+            } else {
+                v8::Local<v8::Value> wrap;
+                if (obj->GetPrivate(context, env->WrapperKey()).ToLocal(&wrap) && wrap->IsExternal()) {
+                    reference = static_cast<v8impl::Reference *>(
+                            wrap.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
+                }
+            }
+            RETURN_STATUS_IF_FALSE(env, reference != nullptr, napi_invalid_arg);
 
             if (result) {
                 *result = reference->Data();
             }
 
             if (action == RemoveWrap) {
-                // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
-                obj->SetAlignedPointerInInternalField(0, nullptr, v8::kEmbedderDataTypeTagDefault);
+                if (in_field) {
+                    // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
+                    obj->SetAlignedPointerInInternalField(0, nullptr, v8::kEmbedderDataTypeTagDefault);
+                } else {
+                    obj->DeletePrivate(context, env->WrapperKey()).FromMaybe(false);
+                }
                 if (reference->ownership() == Ownership::kUserland) {
                     // When the wrap is been removed, the finalizer should be reset.
                     reference->ResetFinalizer();
@@ -595,6 +608,15 @@ namespace v8impl {
             RETURN_STATUS_IF_FALSE(env, value->IsObject(), napi_invalid_arg);
             v8::Local<v8::Object> obj = value.As<v8::Object>();
 
+            // [windows port] Only instances of napi_define_class have the internal field. Node
+            // wraps any object, so the rest keep the wrap under a private symbol, as Node does.
+            const bool in_field = obj->InternalFieldCount() > 0;
+            if (!in_field) {
+                auto maybe_has = obj->HasPrivate(context, env->WrapperKey());
+                CHECK_MAYBE_NOTHING(env, maybe_has, napi_generic_failure);
+                RETURN_STATUS_IF_FALSE(env, !maybe_has.FromJust(), napi_invalid_arg);
+            }
+
             v8impl::Reference *reference = nullptr;
             if (result != nullptr) {
                 // The returned reference should be deleted via napi_delete_reference()
@@ -622,8 +644,14 @@ namespace v8impl {
                         finalize_cb == nullptr ? nullptr : finalize_hint);
             }
 
-            // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
-            obj->SetAlignedPointerInInternalField(0, reference, v8::kEmbedderDataTypeTagDefault);
+            if (in_field) {
+                // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
+                obj->SetAlignedPointerInInternalField(0, reference, v8::kEmbedderDataTypeTagDefault);
+            } else {
+                v8::Local<v8::Value> wrap =
+                        v8::External::New(env->isolate, reference, v8::kExternalPointerTypeTagDefault);
+                obj->SetPrivate(context, env->WrapperKey(), wrap).FromMaybe(false);
+            }
 
             return GET_RETURN_STATUS(env);
         }
