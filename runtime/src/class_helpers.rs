@@ -383,6 +383,112 @@ pub(crate) fn overload_for_argc(bound: &MethodDeclaration, argc: usize) -> Optio
     })
 }
 
+/// Whether `p` is an in parameter. Out parameters keep their argument position, but a call may
+/// leave trailing ones out (they come back in the result).
+fn is_input_param(p: &metadata::declarations::parameter_declaration::ParameterDeclaration) -> bool {
+    !p.is_out()
+        && !p.metadata().map_or(false, |md| {
+            metadata::signature::Signature::to_string(md, &p.type_())
+                .trim()
+                .starts_with("ByRef ")
+        })
+}
+
+fn arity_matches(m: &MethodDeclaration, argc: usize) -> bool {
+    argc == m.number_of_parameters()
+        || argc == m.parameters().iter().filter(|p| is_input_param(p)).count()
+}
+
+/// Field names of the struct a parameter takes, or None for any other type.
+fn struct_param_fields(
+    p: &metadata::declarations::parameter_declaration::ParameterDeclaration,
+) -> Option<Vec<String>> {
+    use metadata::declarations::declaration::DeclarationKind;
+    use metadata::declarations::struct_declaration::StructDeclaration;
+    let sig = metadata::signature::Signature::to_string(p.metadata()?, &p.type_());
+    let sig = sig.trim();
+    if !sig.contains('.') {
+        return None;
+    }
+    let decl = MetadataReader::find_by_name(crate::helpers::strip_generic_suffix(sig))?;
+    let lock = decl.read();
+    if lock.kind() != DeclarationKind::Struct {
+        return None;
+    }
+    let sd = lock.as_any().downcast_ref::<StructDeclaration>()?;
+    Some(sd.fields().iter().map(|f| f.name().to_string()).collect())
+}
+
+/// Index of the overload in `candidates` (methods sharing a public name) that a call with `argc`
+/// arguments means. The argument count decides first. Overloads can share it
+/// (VisualTreeHelper.FindElementsInHostCoordinates takes a Point or a Rect), so then the one whose
+/// struct parameters' fields an object argument all has, matching the most fields, wins; then
+/// [DefaultOverload]; then metadata order. `has(j, name)` is whether argument `j` has property
+/// `name`, or None when it is not a plain object (a buffer, a primitive).
+pub(crate) fn pick_overload(
+    candidates: &[MethodDeclaration],
+    argc: usize,
+    mut has: impl FnMut(usize, &str) -> Option<bool>,
+) -> usize {
+    let same_arity: Vec<usize> = (0..candidates.len())
+        .filter(|&i| arity_matches(&candidates[i], argc))
+        .collect();
+    match same_arity.len() {
+        0 => {
+            return candidates
+                .iter()
+                .position(|m| m.is_default_overload())
+                .unwrap_or(0)
+        }
+        1 => return same_arity[0],
+        _ => {}
+    }
+    let mut best: Option<(usize, (bool, usize, bool))> = None;
+    for &i in &same_arity {
+        let m = &candidates[i];
+        let (mut fits, mut fields) = (true, 0usize);
+        for (j, p) in m.parameters().iter().enumerate() {
+            if j >= argc || !is_input_param(p) {
+                continue;
+            }
+            let Some(names) = struct_param_fields(p).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            if has(j, &names[0]).is_none() {
+                continue;
+            }
+            if names.iter().all(|n| has(j, n) == Some(true)) {
+                fields += names.len();
+            } else {
+                fits = false;
+            }
+        }
+        let key = (fits, fields, m.is_default_overload());
+        if best.as_ref().map_or(true, |(_, k)| key > *k) {
+            best = Some((i, key));
+        }
+    }
+    best.map_or(same_arity[0], |(i, _)| i)
+}
+
+/// [`pick_overload`] for a classic-engine call.
+#[cfg(feature = "classic")]
+pub(crate) fn pick_static_overload(
+    candidates: &[MethodDeclaration],
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments,
+) -> usize {
+    pick_overload(candidates, args.length() as usize, |j, name| {
+        let arg = args.get(j as i32);
+        if !arg.is_object() || arg.is_array_buffer() || arg.is_array_buffer_view() {
+            return None;
+        }
+        let obj = arg.to_object(scope)?;
+        let key = v8::String::new(scope, name)?;
+        obj.has(scope, key.into())
+    })
+}
+
 pub(crate) fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
     let method_match = |m: &MethodDeclaration| {
         let on = m.overload_name();

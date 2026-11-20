@@ -1223,10 +1223,14 @@ pub fn create_instance_proxy(
 ) -> napi::Result<JsObject> {
     let identity = com_identity_key(&instance);
 
-    // An interface-typed return of an object that already has a class wrapper reuses it
-    // without asking for the runtime class again.
+    // The object may be of a more derived class than declared: an interface, or a class others
+    // derive from (`VisualTreeHelper.GetParent` declares `DependencyObject` and returns a Grid).
+    let interface = crate::napi_engine::ns_hostobject::is_interface(&declaration);
+    let open = interface || crate::napi_engine::ns_hostobject::is_unsealed_class(&declaration);
+
+    // One that already has a class wrapper reuses it without asking for the runtime class again.
     if let Some(id) = identity {
-        if crate::napi_engine::ns_hostobject::is_interface(&declaration) {
+        if open {
             if let Some(existing) = cached_class_instance(env, id) {
                 return Ok(existing);
             }
@@ -1234,18 +1238,18 @@ pub fn create_instance_proxy(
     }
 
     // Hybrid fast path: wrap non-collection *class* instances as host objects (shared prototype,
-    // no Proxy trap). The effective type is the class from the declaration when it is itself a
-    // host-eligible class (`new` path), or — for interface-typed returns like `IJsonValue` whose
-    // concrete object is a class (`JsonValue`) — resolved from the runtime class name. Interfaces
-    // proper and indexable collections fall through to the Proxy below.
-    let host_target: Option<(String, Decl)> =
-        if crate::napi_engine::ns_hostobject::should_host(class_name, &declaration) {
-            Some((class_name.to_string(), declaration.clone()))
-        } else if crate::napi_engine::ns_hostobject::is_interface(&declaration) {
-            crate::napi_engine::ns_hostobject::runtime_class_host_target(&instance)
-        } else {
-            None
-        };
+    // no Proxy trap). The effective type is the runtime class when the declared type is open and
+    // metadata has it, else the declared class when it is itself host-eligible (`new` path).
+    // Interfaces proper and indexable collections fall through to the Proxy below.
+    let host_target: Option<(String, Decl)> = if interface {
+        crate::napi_engine::ns_hostobject::runtime_class_host_target(&instance)
+    } else if crate::napi_engine::ns_hostobject::should_host(class_name, &declaration) {
+        open.then(|| crate::napi_engine::ns_hostobject::runtime_class_host_target(&instance))
+            .flatten()
+            .or_else(|| Some((class_name.to_string(), declaration.clone())))
+    } else {
+        None
+    };
     if let Some((eff_name, _eff_decl)) = host_target {
         if let Some(id) = identity {
             if let Some(existing) = cached_instance(env, id, &eff_name) {
@@ -1264,9 +1268,7 @@ pub fn create_instance_proxy(
 
     // An interface such as IPropertySet declares no members itself (only the generic IMap and
     // IIterable it requires), so proxy the runtime class when metadata has it.
-    let resolved = if !class_name.contains('<')
-        && crate::napi_engine::ns_hostobject::is_interface(&declaration)
-    {
+    let resolved = if !class_name.contains('<') && open {
         crate::napi_engine::ns_hostobject::runtime_class(&instance)
     } else {
         None
