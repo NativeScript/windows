@@ -55,7 +55,6 @@ pub const PRELUDE: &str = r#"
       this.protocol = '';
       this.extensions = '';
       this.readyState = 0;
-      this.bufferedAmount = 0;
       this.binaryType = 'arraybuffer';
       this.onopen = null;
       this.onmessage = null;
@@ -65,6 +64,7 @@ pub const PRELUDE: &str = r#"
       var self = this;
       this._id = g.__nsWebSocketOpen(href, list, function (type, a, b, c) {
         if (type === 'open') {
+          if (self.readyState !== 0) { return; }
           self.readyState = 1;
           self.protocol = a || '';
           self._emit({ type: 'open', target: self });
@@ -73,6 +73,7 @@ pub const PRELUDE: &str = r#"
         } else if (type === 'error') {
           self._emit({ type: 'error', message: a, target: self });
         } else if (type === 'close') {
+          self._bufferedFinal = self.bufferedAmount;
           self.readyState = 3;
           self._emit({ type: 'close', code: a, reason: b || '', wasClean: !!c, target: self });
         }
@@ -82,6 +83,15 @@ pub const PRELUDE: &str = r#"
     WebSocket.OPEN = WebSocket.prototype.OPEN = 1;
     WebSocket.CLOSING = WebSocket.prototype.CLOSING = 2;
     WebSocket.CLOSED = WebSocket.prototype.CLOSED = 3;
+    // Bytes queued by send() and not yet written; kept after the close event.
+    Object.defineProperty(WebSocket.prototype, 'bufferedAmount', {
+      configurable: true,
+      enumerable: true,
+      get: function () {
+        if (this._bufferedFinal !== undefined) { return this._bufferedFinal; }
+        return typeof g.__nsWebSocketBufferedAmount === 'function' ? g.__nsWebSocketBufferedAmount(this._id) : 0;
+      }
+    });
     WebSocket.prototype._emit = function (event) {
       var handler = this['on' + event.type];
       if (typeof handler === 'function') { handler.call(this, event); }

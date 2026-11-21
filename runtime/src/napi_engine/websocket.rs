@@ -1,8 +1,9 @@
 //! Node-API bindings for the native WebSocket (`crate::websocket`, shared with the classic
-//! runtime): `__nsWebSocketOpen` / `__nsWebSocketSend` / `__nsWebSocketClose`, plus `pump`, which
-//! the event loop runs each turn to deliver socket events on the JS thread. The WHATWG `WebSocket`
-//! class over these natives lives in the shared JS prelude. The Vite HMR client needs it, and
-//! `@valor/nativescript-websockets` has no Windows implementation.
+//! runtime): `__nsWebSocketOpen` / `__nsWebSocketSend` / `__nsWebSocketClose` /
+//! `__nsWebSocketBufferedAmount`, plus `pump`, which the event loop runs each turn to deliver
+//! socket events on the JS thread. The WHATWG `WebSocket` class over these natives lives in the
+//! shared JS prelude. The Vite HMR client needs it, and `@valor/nativescript-websockets` has no
+//! Windows implementation.
 //!
 //! Install-if-missing: a host that already has `WebSocket` (Node 22+, Bun, Deno) keeps its own.
 
@@ -132,8 +133,8 @@ pub fn install_websocket(env: &Env) -> napi::Result<()> {
             _ => None,
         };
         let sent = match binary {
-            Some(bytes) => socket::send(id, &bytes, true),
-            None => socket::send(id, arg_string(&ctx, 1)?.as_bytes(), false),
+            Some(bytes) => socket::send(id, bytes, true),
+            None => socket::send(id, arg_string(&ctx, 1)?.into_bytes(), false),
         };
         ctx.env.get_boolean(sent)
     })?;
@@ -152,6 +153,13 @@ pub fn install_websocket(env: &Env) -> napi::Result<()> {
         ctx.env.get_undefined()
     })?;
     global.set_named_property("__nsWebSocketClose", close)?;
+
+    // `__nsWebSocketBufferedAmount(id)`: bytes queued by send and not yet written.
+    let buffered = env.create_function_from_closure("__nsWebSocketBufferedAmount", |ctx: CallContext| {
+        let id = ctx.get::<JsUnknown>(0)?.coerce_to_number()?.get_int32()?;
+        ctx.env.create_double(socket::buffered_amount(id) as f64)
+    })?;
+    global.set_named_property("__nsWebSocketBufferedAmount", buffered)?;
     Ok(())
 }
 
@@ -162,13 +170,17 @@ pub fn pump(env: &Env) {
         return;
     }
     for (id, event) in events {
+        let closing = matches!(event, Event::Close { .. });
         let Some((cb_env, callback_ref)) = CALLBACKS.with(|c| c.borrow().get(&id).copied()) else {
+            if closing {
+                socket::forget(id);
+            }
             continue;
         };
-        let closing = matches!(event, Event::Close { .. });
         unsafe { deliver(env, callback_ref, event) };
         if closing {
             CALLBACKS.with(|c| c.borrow_mut().remove(&id));
+            socket::forget(id);
             unsafe {
                 let _ = sys::napi_delete_reference(cb_env, callback_ref);
             }

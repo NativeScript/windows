@@ -1368,7 +1368,6 @@ const HELPER_SOURCE: &str = concat!(r#"
                     this.protocol = '';
                     this.extensions = '';
                     this.readyState = 0;
-                    this.bufferedAmount = 0;
                     this.binaryType = 'arraybuffer';
                     this.onopen = null;
                     this.onmessage = null;
@@ -1378,6 +1377,7 @@ const HELPER_SOURCE: &str = concat!(r#"
                     var self = this;
                     this._id = globalThis.__nsWebSocketOpen(href, list, function (type, a, b, c) {
                         if (type === 'open') {
+                            if (self.readyState !== 0) return;
                             self.readyState = 1;
                             self.protocol = a || '';
                             self._emit({ type: 'open', target: self });
@@ -1386,6 +1386,7 @@ const HELPER_SOURCE: &str = concat!(r#"
                         } else if (type === 'error') {
                             self._emit({ type: 'error', message: a, target: self });
                         } else if (type === 'close') {
+                            self._bufferedFinal = self.bufferedAmount;
                             self.readyState = 3;
                             self._emit({ type: 'close', code: a, reason: b || '', wasClean: !!c, target: self });
                         }
@@ -1395,6 +1396,15 @@ const HELPER_SOURCE: &str = concat!(r#"
                 WebSocket.OPEN = WebSocket.prototype.OPEN = 1;
                 WebSocket.CLOSING = WebSocket.prototype.CLOSING = 2;
                 WebSocket.CLOSED = WebSocket.prototype.CLOSED = 3;
+                // Bytes queued by send() and not yet written; kept after the close event.
+                Object.defineProperty(WebSocket.prototype, 'bufferedAmount', {
+                    configurable: true,
+                    enumerable: true,
+                    get: function () {
+                        if (this._bufferedFinal !== undefined) return this._bufferedFinal;
+                        return typeof globalThis.__nsWebSocketBufferedAmount === 'function' ? globalThis.__nsWebSocketBufferedAmount(this._id) : 0;
+                    }
+                });
                 WebSocket.prototype._emit = function (event) {
                     var handler = this['on' + event.type];
                     if (typeof handler === 'function') handler.call(this, event);
@@ -4445,6 +4455,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsWebSocketOpen", crate::websocket::handle_open);
     register!("__nsWebSocketSend", crate::websocket::handle_send);
     register!("__nsWebSocketClose", crate::websocket::handle_close);
+    register!("__nsWebSocketBufferedAmount", crate::websocket::handle_buffered_amount);
     register!("__nsModuleConfigureLoader", crate::handle_ns_module_configure_loader);
     register!("__nsModuleInvalidate", crate::handle_ns_module_invalidate);
     register!("__nsModuleLoadedUrls", crate::handle_ns_module_loaded_urls);
