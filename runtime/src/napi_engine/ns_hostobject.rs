@@ -301,19 +301,33 @@ fn collect_args(ctx: &CallContext) -> napi::Result<SmallVec<[JsUnknown; 4]>> {
 }
 
 /// The overload a call with `args` means, by index into `overloads` (see
-/// `class_helpers::pick_overload`: argument count, then the shape of struct arguments).
+/// `class_helpers::pick_overload`: argument count, then the kinds and shapes of the arguments).
 fn pick_overload(overloads: &[MethodDeclaration], args: &[JsUnknown]) -> usize {
-    crate::class_helpers::pick_overload(overloads, args.len(), |j, name| {
-        let arg = args.get(j)?;
-        if arg.get_type().ok()? != napi::ValueType::Object
-            || arg.is_typedarray().unwrap_or(false)
-            || arg.is_dataview().unwrap_or(false)
-        {
-            return None;
-        }
-        let object: JsObject = unsafe { arg.cast() };
-        object.has_named_property(name).ok()
-    })
+    use crate::class_helpers::ArgKind;
+    crate::class_helpers::pick_overload(
+        overloads,
+        args.len(),
+        |j, name| {
+            let arg = args.get(j)?;
+            if arg.get_type().ok()? != napi::ValueType::Object
+                || arg.is_typedarray().unwrap_or(false)
+                || arg.is_dataview().unwrap_or(false)
+            {
+                return None;
+            }
+            let object: JsObject = unsafe { arg.cast() };
+            object.has_named_property(name).ok()
+        },
+        |j| match args.get(j).and_then(|a| a.get_type().ok()) {
+            Some(napi::ValueType::Number | napi::ValueType::BigInt) => ArgKind::Number,
+            Some(napi::ValueType::String) => ArgKind::String,
+            Some(napi::ValueType::Boolean) => ArgKind::Boolean,
+            Some(napi::ValueType::Function) => ArgKind::Function,
+            Some(napi::ValueType::Object | napi::ValueType::External) => ArgKind::Object,
+            Some(napi::ValueType::Null | napi::ValueType::Undefined) | None => ArgKind::Nullish,
+            Some(_) => ArgKind::Other,
+        },
+    )
 }
 
 /// The value in `cell`, filling it through `prepare` on the first call. `None` when the cell
