@@ -66,8 +66,20 @@ pub fn install_loop_natives(env: &Env) -> napi::Result<()> {
 /// `run_event_loop` repeats; hosts that own their own frame loop (e.g. the WinUI 3 DLL, driven
 /// from `CompositionTarget.Rendering`) call it directly once per frame instead.
 pub fn pump_once<F: FnMut()>(env: &Env, drain_microtasks: &mut F) {
+    pump_iteration(env, drain_microtasks, true);
+}
+
+/// `pump_once` for a host that calls it from its own message loop: Win32 messages are left to that
+/// loop when it is XAML's (see `ui_dispatcher::host_pumps_messages`).
+pub fn pump_once_from_host<F: FnMut()>(env: &Env, drain_microtasks: &mut F) {
+    pump_iteration(env, drain_microtasks, !crate::ui_dispatcher::host_pumps_messages());
+}
+
+fn pump_iteration<F: FnMut()>(env: &Env, drain_microtasks: &mut F, pump_messages: bool) {
     drain_microtasks();
-    crate::pump_messages();
+    if pump_messages {
+        crate::pump_messages();
+    }
     drain_microtasks();
     crate::napi_engine::websocket::pump(env);
     drain_microtasks();

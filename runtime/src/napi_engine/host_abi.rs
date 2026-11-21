@@ -59,7 +59,7 @@ pub fn initialize_runtime(env: &Env, app_root: &str) -> napi::Result<()> {
 /// call this once per frame from `CompositionTarget.Rendering`; it never blocks. `drain_microtasks`
 /// is the engine's microtask pump (e.g. `js_execute_pending_jobs` / `jsr_drain_microtasks`).
 pub fn pump_once<F: FnMut()>(env: &Env, drain_microtasks: &mut F) {
-    event_loop::pump_once(env, drain_microtasks);
+    event_loop::pump_once_from_host(env, drain_microtasks);
 }
 
 /// True when the loop has no outstanding work (no timers, zero keep-alive count) — a self-hosted
