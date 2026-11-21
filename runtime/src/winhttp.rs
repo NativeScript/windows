@@ -1,19 +1,20 @@
-//! Minimal WinHTTP client: blocking GETs for the HTTP ES-module loader and the upgrade handshake
-//! behind the native `WebSocket`. WinHTTP rather than a Rust HTTP stack so https dev servers use
-//! the system TLS/certificate store with no extra dependencies.
+//! Minimal WinHTTP client: blocking GETs for the HTTP ES-module loader and the upgrade request
+//! behind the native `WebSocket` (which `websocket.rs` drives in async mode). WinHTTP rather than
+//! a Rust HTTP stack so https dev servers use the system TLS/certificate store with no extra
+//! dependencies.
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
     WinHttpQueryHeaders, WinHttpQueryOption, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, WinHttpWebSocketCompleteUpgrade,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
     WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_COOKIES, WINHTTP_FLAG_REFRESH,
     WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_DISABLE_FEATURE,
-    WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, WINHTTP_OPTION_URL, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, WINHTTP_OPTION_URL, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_QUERY_CUSTOM,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
 /// A WinHTTP handle, closed on drop.
@@ -28,7 +29,7 @@ impl Handle {
     pub(crate) fn raw(&self) -> *mut c_void {
         self.0
     }
-    fn new(raw: *mut c_void, what: &str) -> Result<Self, String> {
+    pub(crate) fn new(raw: *mut c_void, what: &str) -> Result<Self, String> {
         if raw.is_null() {
             Err(format!("{what} failed: {}", windows::core::Error::from_thread().message()))
         } else {
@@ -45,29 +46,29 @@ impl Drop for Handle {
     }
 }
 
+/// A WinHTTP session (`flags`: 0 or `WINHTTP_FLAG_ASYNC`).
+pub(crate) fn new_session(flags: u32) -> Result<Handle, String> {
+    let raw = unsafe {
+        WinHttpOpen(
+            &HSTRING::from("NativeScript-Windows"),
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            flags,
+        )
+    };
+    let h = Handle::new(raw, "WinHttpOpen")?;
+    // Connect/send/receive timeouts: a dev server that stops answering must surface as an
+    // import error, not a UI thread blocked forever.
+    unsafe {
+        let _ = WinHttpSetTimeouts(h.raw(), 5_000, 5_000, 15_000, 30_000);
+    }
+    Ok(h)
+}
+
 fn session() -> Result<&'static Handle, String> {
     static SESSION: OnceLock<Result<Handle, String>> = OnceLock::new();
-    SESSION
-        .get_or_init(|| {
-            let raw = unsafe {
-                WinHttpOpen(
-                    &HSTRING::from("NativeScript-Windows"),
-                    WINHTTP_ACCESS_TYPE_NO_PROXY,
-                    PCWSTR::null(),
-                    PCWSTR::null(),
-                    0,
-                )
-            };
-            let h = Handle::new(raw, "WinHttpOpen")?;
-            // Connect/send/receive timeouts: a dev server that stops answering must surface as an
-            // import error, not a UI thread blocked forever.
-            unsafe {
-                let _ = WinHttpSetTimeouts(h.raw(), 5_000, 5_000, 15_000, 30_000);
-            }
-            Ok(h)
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+    SESSION.get_or_init(|| new_session(0)).as_ref().map_err(|e| e.clone())
 }
 
 pub(crate) struct Response {
@@ -78,8 +79,8 @@ pub(crate) struct Response {
     pub final_url: String,
 }
 
-/// Open a GET request (connected, not yet sent) for `url` with `extra_headers` (CRLF-separated).
-fn open_get(url: &str) -> Result<(Handle, Handle), String> {
+/// Open a GET request (connected, not yet sent) for `url` on `session`.
+fn open_get(session: &Handle, url: &str) -> Result<(Handle, Handle), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL '{url}': {e}"))?;
     let secure = match parsed.scheme() {
         "http" | "ws" => false,
@@ -94,7 +95,7 @@ fn open_get(url: &str) -> Result<(Handle, Handle), String> {
         object.push_str(q);
     }
     let connect = Handle::new(
-        unsafe { WinHttpConnect(session()?.raw(), &HSTRING::from(host), port, 0) },
+        unsafe { WinHttpConnect(session.raw(), &HSTRING::from(host), port, 0) },
         "WinHttpConnect",
     )?;
     let flags = WINHTTP_OPEN_REQUEST_FLAGS(
@@ -156,14 +157,20 @@ fn status_code(request: &Handle) -> u32 {
 }
 
 fn content_type(request: &Handle) -> String {
+    query_header(request, WINHTTP_QUERY_CONTENT_TYPE, PCWSTR::null())
+}
+
+/// A response header (`info`: a `WINHTTP_QUERY_*` level, or `WINHTTP_QUERY_CUSTOM` with `name`);
+/// empty when absent.
+fn query_header(request: &Handle, info: u32, name: PCWSTR) -> String {
     let mut buf = [0u16; 256];
     let mut len = std::mem::size_of_val(&buf) as u32;
     let mut index = 0u32;
     let ok = unsafe {
         WinHttpQueryHeaders(
             request.raw(),
-            WINHTTP_QUERY_CONTENT_TYPE,
-            PCWSTR::null(),
+            info,
+            name,
             Some(buf.as_mut_ptr() as *mut c_void),
             &mut len,
             &mut index,
@@ -204,7 +211,7 @@ fn final_url(request: &Handle) -> String {
 
 /// Blocking GET. `headers` are extra request headers, CRLF-separated.
 pub(crate) fn get(url: &str, headers: &str) -> Result<Response, String> {
-    let (_connect, request) = open_get(url)?;
+    let (_connect, request) = open_get(session()?, url)?;
     send_and_receive(&request, headers)?;
     let status = status_code(&request);
     let content_type = content_type(&request);
@@ -243,14 +250,19 @@ pub(crate) fn is_http_token(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-/// Perform the WebSocket upgrade handshake for a `ws://`/`wss://` URL and return the socket
-/// handle (plus the connection handle, which must outlive it).
-pub(crate) fn websocket_connect(url: &str, protocols: &[String]) -> Result<(Handle, Handle), String> {
+/// Open the upgrade request for a `ws://`/`wss://` URL on `session` (not yet sent): returns the
+/// connection handle (which must outlive the socket), the request, and the extra request headers
+/// to send with it.
+pub(crate) fn websocket_request(
+    session: &Handle,
+    url: &str,
+    protocols: &[String],
+) -> Result<(Handle, Handle, Vec<u16>), String> {
     // Subprotocols go into a request header, so anything but an HTTP token could inject headers.
     if let Some(bad) = protocols.iter().find(|p| !is_http_token(p)) {
         return Err(format!("invalid WebSocket subprotocol {bad:?}"));
     }
-    let (connect, request) = open_get(url)?;
+    let (connect, request) = open_get(session, url)?;
     unsafe { WinHttpSetOption(Some(request.raw()), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, None) }
         .map_err(|e| format!("WebSocket upgrade option failed: {}", e.message()))?;
     let headers = if protocols.is_empty() {
@@ -258,15 +270,11 @@ pub(crate) fn websocket_connect(url: &str, protocols: &[String]) -> Result<(Hand
     } else {
         format!("Sec-WebSocket-Protocol: {}\r\n", protocols.join(", "))
     };
-    send_and_receive(&request, &headers)?;
-    let status = status_code(&request);
-    if status != 101 {
-        return Err(format!("WebSocket handshake failed: HTTP {status}"));
-    }
-    let socket = Handle::new(
-        unsafe { WinHttpWebSocketCompleteUpgrade(request.raw(), None) },
-        "WinHttpWebSocketCompleteUpgrade",
-    )?;
-    drop(request);
-    Ok((socket, connect))
+    Ok((connect, request, headers.encode_utf16().collect()))
+}
+
+/// The upgrade response's status code and the subprotocol the server selected.
+pub(crate) fn websocket_response(request: &Handle) -> (u32, String) {
+    let protocol = query_header(request, WINHTTP_QUERY_CUSTOM, w!("Sec-WebSocket-Protocol"));
+    (status_code(request), protocol.trim().to_string())
 }

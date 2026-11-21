@@ -72,45 +72,87 @@ fn serve(stream: TcpStream, routes: &Routes, requests: &Arc<Mutex<Vec<String>>>)
     );
 }
 
-fn websocket_echo(mut stream: TcpStream, mut reader: BufReader<TcpStream>, key: &str) {
+fn websocket_accept(stream: &mut TcpStream, key: &str) {
     let accept = base64(&sha1(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes()));
     let _ = write!(
         stream,
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    loop {
-        let mut head = [0u8; 2];
-        if reader.read_exact(&mut head).is_err() {
-            return;
-        }
-        let opcode = head[0] & 0x0f;
-        let mut len = (head[1] & 0x7f) as usize;
-        if len == 126 {
-            let mut b = [0u8; 2];
-            reader.read_exact(&mut b).unwrap();
-            len = u16::from_be_bytes(b) as usize;
-        }
-        let mut mask = [0u8; 4];
-        reader.read_exact(&mut mask).unwrap();
-        let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload).unwrap();
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i % 4];
-        }
+}
+
+/// One masked client frame: (opcode, unmasked payload). None at EOF.
+fn read_frame(reader: &mut BufReader<TcpStream>) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0u8; 2];
+    reader.read_exact(&mut head).ok()?;
+    let opcode = head[0] & 0x0f;
+    let mut len = (head[1] & 0x7f) as usize;
+    if len == 126 {
+        let mut b = [0u8; 2];
+        reader.read_exact(&mut b).ok()?;
+        len = u16::from_be_bytes(b) as usize;
+    } else if len == 127 {
+        let mut b = [0u8; 8];
+        reader.read_exact(&mut b).ok()?;
+        len = u64::from_be_bytes(b) as usize;
+    }
+    let mut mask = [0u8; 4];
+    reader.read_exact(&mut mask).ok()?;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).ok()?;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
+    Some((opcode, payload))
+}
+
+/// An unmasked server frame.
+fn server_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0x80 | opcode];
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn websocket_echo(mut stream: TcpStream, mut reader: BufReader<TcpStream>, key: &str) {
+    websocket_accept(&mut stream, key);
+    while let Some((opcode, payload)) = read_frame(&mut reader) {
         let reply = if opcode == 1 { [b"echo:".as_slice(), &payload].concat() } else { payload };
-        let mut frame = vec![0x80 | opcode];
-        if reply.len() < 126 {
-            frame.push(reply.len() as u8);
-        } else {
-            frame.push(126);
-            frame.extend_from_slice(&(reply.len() as u16).to_be_bytes());
-        }
-        frame.extend_from_slice(&reply);
-        let _ = stream.write_all(&frame);
+        let _ = stream.write_all(&server_frame(opcode, &reply));
         if opcode == 8 {
             return;
         }
     }
+}
+
+/// A WebSocket server for one connection: accepts the upgrade, then hands the socket to `run`.
+/// Returns its ws:// URL.
+fn websocket_server(run: impl FnOnce(TcpStream, BufReader<TcpStream>) + Send + 'static) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("ws://127.0.0.1:{}/ws", listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut key = String::new();
+        loop {
+            let mut h = String::new();
+            if reader.read_line(&mut h).is_err() || h == "\r\n" || h.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("sec-websocket-key") {
+                    key = v.trim().to_string();
+                }
+            }
+        }
+        websocket_accept(&mut stream, &key);
+        run(stream, reader);
+    });
+    url
 }
 
 fn sha1(data: &[u8]) -> [u8; 20] {
@@ -293,6 +335,129 @@ fn native_websocket_round_trip() {
         "new Promise((resolve) => { const s = new WebSocket('ws://127.0.0.1:1/x'); s.onclose = (e) => resolve(e.code + ':' + e.wasClean); })",
     );
     assert_eq!(refused, "ok:1006:false");
+}
+
+/// The server never reads: `send` returns at once, reads keep arriving, and the server's FIN
+/// surfaces as an error and one close (1006).
+#[test]
+fn native_websocket_reads_while_writes_stall() {
+    let url = websocket_server(|mut stream, _reader| {
+        for i in 0..20 {
+            if stream.write_all(&server_frame(1, format!("tick {i}").as_bytes())).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // FIN without a close frame; keep the socket so no RST unblocks the client's writes
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    let mut runtime = Runtime::new(".");
+    runtime.register_delegate_isolate_ptr();
+    let got = await_js(
+        &mut runtime,
+        &format!(
+            "new Promise((resolve, reject) => {{
+                const s = new WebSocket('{url}');
+                let got = 0, stalled = 0, sendMs = -1, closes = 0, errors = 0;
+                s.onopen = () => {{
+                    const t0 = Date.now();
+                    s.send('hi');
+                    // far more than the socket buffers take while the server isn't reading
+                    const big = new Uint8Array(1 << 20);
+                    for (let i = 0; i < 48; i++) s.send(big);
+                    sendMs = Date.now() - t0;
+                }};
+                s.onmessage = () => {{ got++; if (s.bufferedAmount > 0) stalled++; }};
+                s.onerror = () => errors++;
+                s.onclose = (e) => {{
+                    closes++;
+                    s.send('after close');
+                    __ns__setTimeout(() => resolve([got, stalled, sendMs >= 0 && sendMs < 1000, e.code, e.wasClean, errors, closes, s.bufferedAmount > 0, s.readyState].join(':')), 300);
+                }};
+                __ns__setTimeout(() => reject(new Error('timeout ' + got)), 4500);
+            }})"
+        ),
+    );
+    assert_eq!(got, "ok:20:20:true:1006:false:1:1:true:3");
+}
+
+/// close() the server never answers: one close (1006) after the timeout, no messages after it.
+#[test]
+fn native_websocket_close_timeout_and_no_messages_after_close() {
+    let url = websocket_server(|mut stream, _reader| {
+        // keeps sending and never reads (so never sees, or answers, the close frame)
+        for i in 0..200 {
+            if stream.write_all(&server_frame(1, format!("tick {i}").as_bytes())).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+    let mut runtime = Runtime::new(".");
+    runtime.register_delegate_isolate_ptr();
+    let got = await_js(
+        &mut runtime,
+        &format!(
+            "new Promise((resolve, reject) => {{
+                const s = new WebSocket('{url}');
+                let closedAt = 0, closeCallMs = -1, after = 0, closes = 0;
+                s.onmessage = () => {{
+                    if (closedAt) {{ after++; return; }}
+                    closedAt = Date.now();
+                    s.close(1000, 'bye');
+                    closeCallMs = Date.now() - closedAt;
+                    s.send('ignored');
+                }};
+                s.onclose = (e) => {{
+                    closes++;
+                    const waited = Date.now() - closedAt;
+                    __ns__setTimeout(() => resolve([after, e.code, e.wasClean, closes, closeCallMs < 100, waited >= 1500 && waited < 4000].join(':')), 300);
+                }};
+                __ns__setTimeout(() => reject(new Error('timeout')), 4500);
+            }})"
+        ),
+    );
+    assert_eq!(got, "ok:0:1006:false:1:true:true");
+}
+
+#[link(name = "ws2_32")]
+extern "system" {
+    fn getpeername(socket: usize, name: *mut u8, len: *mut i32) -> i32;
+    fn getsockopt(socket: usize, level: i32, name: i32, value: *mut u8, len: *mut i32) -> i32;
+}
+
+/// WinHTTP has no TCP_NODELAY option but sets it itself: finds the client socket among the
+/// process's handles (by its peer port) and checks.
+#[test]
+fn native_websocket_uses_tcp_nodelay() {
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let url = websocket_server(move |stream, _reader| {
+        let _ = port_tx.send(stream.local_addr().unwrap().port());
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    });
+    let mut runtime = Runtime::new(".");
+    runtime.register_delegate_isolate_ptr();
+    let got = await_js(
+        &mut runtime,
+        &format!("new Promise((resolve) => {{ const s = new WebSocket('{url}'); s.onopen = () => resolve('open'); }})"),
+    );
+    assert_eq!(got, "ok:open");
+    let port = port_rx.recv().unwrap();
+    let mut nodelay = Vec::new();
+    for handle in (4usize..0x10000).step_by(4) {
+        let mut addr = [0u8; 128];
+        let mut len = addr.len() as i32;
+        // fails (WSAENOTSOCK) for handles that aren't sockets
+        if unsafe { getpeername(handle, addr.as_mut_ptr(), &mut len) } != 0 || u16::from_be_bytes([addr[2], addr[3]]) != port {
+            continue;
+        }
+        let mut value = [0u8; 4];
+        let mut len = 4i32;
+        let ok = unsafe { getsockopt(handle, 6 /* IPPROTO_TCP */, 1 /* TCP_NODELAY */, value.as_mut_ptr(), &mut len) } == 0;
+        nodelay.push(ok && value[0] != 0);
+    }
+    assert_eq!(nodelay, [true]);
 }
 
 #[test]
