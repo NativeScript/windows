@@ -217,6 +217,33 @@ pub fn needs_win32_pump() -> bool {
     UI_DQ_CONTROLLER.get().is_some()
 }
 
+/// True when a XAML host runs the UI thread's message loop, so the runtime's pump must not drain
+/// Win32 messages itself.
+///
+/// WinUI 3's own dispatcher is a `Microsoft.UI.Dispatching.DispatcherQueue`, so
+/// `init_ui_dispatcher` finds no `Windows.System.DispatcherQueue` there and makes its own
+/// controller, which makes `needs_win32_pump` true even under XAML. XAML's loop dispatches that
+/// controller's work as well.
+///
+/// The host calls the pump from inside a `DispatcherQueue` work item. Pumping messages there
+/// dispatches the queues' wake messages re-entrantly, and a wake can be lost: XAML's queue, its
+/// timers and the runtime's own queue then never run again. Timers, frames and native callbacks
+/// all stop while the UI thread sits idle in `GetMessage`. Console hosts have no such loop and
+/// keep pumping.
+///
+/// Settled on the first call. Every caller is a pump, and a WinUI host only starts pumping from
+/// inside `Application.Start`, after XAML has loaded.
+pub fn host_pumps_messages() -> bool {
+    static XAML_HOST: OnceLock<bool> = OnceLock::new();
+    *XAML_HOST.get_or_init(xaml_loaded)
+}
+
+fn xaml_loaded() -> bool {
+    use windows::core::w;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    unsafe { GetModuleHandleW(w!("Microsoft.UI.Xaml.dll")) }.is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +257,12 @@ mod tests {
         // Test threads are MTA — GetForCurrentThread returns an error.
         assert!(!is_initialized());
         assert!(UI_THREAD_ID.get().is_none());
+    }
+
+    #[test]
+    fn console_host_keeps_pumping_messages() {
+        // No XAML in a test process: the runtime's pump still drains Win32 messages.
+        assert!(!host_pumps_messages());
     }
 
     #[test]

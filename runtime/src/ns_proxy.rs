@@ -2039,6 +2039,12 @@ pub(crate) fn create_ns_object<'a>(
 
 /// The metadata class named by `instance`'s GetRuntimeClassName, when it differs from
 /// `declared` and neither name is a generic instance.
+///
+/// An interface name only replaces a declared interface (or an undeclared type), never a declared
+/// class. A type authored outside WinMD, like the app template's C# `App : Application`, can't
+/// name itself, so CsWinRT reports one of its interfaces, e.g.
+/// `Microsoft.UI.Xaml.IApplicationOverrides`. Wrapping `Application.Current` as that interface
+/// would drop every `Application` member, such as `Exit`, `Resources` and `RequestedTheme`.
 pub(crate) fn resolve_runtime_class(
     instance: &IUnknown,
     declared: &str,
@@ -2053,7 +2059,18 @@ pub(crate) fn resolve_runtime_class(
         .map(|cn| cn.to_string_lossy())
         .filter(|cn| !cn.is_empty() && cn != declared && !cn.contains('<'))
         .and_then(|cn| MetadataReader::find_by_name(&cn).map(|d| (cn, d)))
-        .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
+        .filter(|(_, d)| match d.read().kind() {
+            DeclarationKind::Struct => false,
+            DeclarationKind::Interface | DeclarationKind::GenericInterfaceInstance => {
+                !declared_is_class(declared)
+            }
+            _ => true,
+        })
+}
+
+fn declared_is_class(declared: &str) -> bool {
+    MetadataReader::find_by_name(declared)
+        .is_some_and(|d| matches!(d.read().kind(), DeclarationKind::Class))
 }
 
 pub(crate) fn create_ns_ctor_instance_object<'a>(
