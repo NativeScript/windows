@@ -443,8 +443,7 @@ pub extern "C" fn runtime_pump_timers() {
         runtime::node_api::drain();
         // This frame's requestAnimationFrame callbacks, then their microtasks.
         runtime::animation_frames::pump();
-        // (a WinUI host has a runtime-made dispatcher too: see `host_pumps_messages`)
-        if runtime::ui_dispatcher::needs_win32_pump() && !runtime::ui_dispatcher::host_pumps_messages() {
+        if runtime::ui_dispatcher::needs_win32_pump() {
             runtime::pump_messages();
         } else {
             runtime::pump_dispatcher();

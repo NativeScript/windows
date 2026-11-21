@@ -210,11 +210,14 @@ pub fn get_ui_thread_rust_tid() -> Option<String> {
     UI_THREAD_ID.get().map(|id| format!("{:?}", id))
 }
 
-/// Returns true when the runtime owns its own `DispatcherQueueController` (i.e. no XAML
-/// host is present). In that case the caller is responsible for pumping Win32 messages
-/// so that WinRT async `Completed` callbacks can fire.
+/// Returns true when the runtime owns its own `DispatcherQueueController` and no XAML host
+/// runs the thread's message loop (console hosts, tests). In that case the caller is responsible
+/// for pumping Win32 messages so that WinRT async `Completed` callbacks can fire.
+///
+/// Under WinUI the runtime owns a controller too (see `host_pumps_messages`), but XAML's loop
+/// dispatches its work: the deferred microtask drain and pushed worker replies rely on that.
 pub fn needs_win32_pump() -> bool {
-    UI_DQ_CONTROLLER.get().is_some()
+    UI_DQ_CONTROLLER.get().is_some() && !host_pumps_messages()
 }
 
 /// True when a XAML host runs the UI thread's message loop, so the runtime's pump must not drain
@@ -231,8 +234,8 @@ pub fn needs_win32_pump() -> bool {
 /// all stop while the UI thread sits idle in `GetMessage`. Console hosts have no such loop and
 /// keep pumping.
 ///
-/// Settled on the first call. Every caller is a pump, and a WinUI host only starts pumping from
-/// inside `Application.Start`, after XAML has loaded.
+/// Settled on the first call. A WinUI host creates the runtime inside `Application.Start` (the
+/// template does it in `OnLaunched`), so XAML has loaded before anything asks.
 pub fn host_pumps_messages() -> bool {
     static XAML_HOST: OnceLock<bool> = OnceLock::new();
     *XAML_HOST.get_or_init(xaml_loaded)
