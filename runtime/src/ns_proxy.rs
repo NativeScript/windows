@@ -720,7 +720,7 @@ pub(crate) fn handle_named_property_getter(
                                     let method =
                                         lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                     let instance = dec.instance.clone().unwrap();
-                                    let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                    let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                                     let method = alt.as_ref().unwrap_or(method);
                                     let mut method = MethodCall::new(
                                         method,
@@ -1064,7 +1064,7 @@ fn instance_method_dispatch(
             }
         },
     };
-    let alt = crate::class_helpers::overload_for_argc(method_decl, args.length() as usize);
+    let alt = crate::class_helpers::overload_for_call(method_decl, scope, &args);
     let method_decl = alt.as_ref().unwrap_or(method_decl);
     let mut method = MethodCall::new(method_decl, method_decl.is_sealed(), instance, false);
     let (ret, result, _outs) = method.call(scope, &args);
@@ -2202,8 +2202,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                        let argc = args.length() as usize;
-                        let alt = crate::class_helpers::overload_for_argc(method, argc);
+                        let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                         let method = alt.as_ref().unwrap_or(method);
                         let Some(mut method) = receiver_method_call(scope, args.this(), dec, method, method.is_sealed()) else {
                             return;

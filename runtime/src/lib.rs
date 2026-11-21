@@ -3914,7 +3914,7 @@ fn create_ns_ctor_instance_object<'a>(
                                 else {
                                     return;
                                 };
-                                let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                                 let method = alt.as_ref().unwrap_or(method);
                                 let Some(mut method) = crate::ns_proxy::receiver_method_call(scope, args.this_object(), dec, method, method.is_sealed()) else {
                                     return;
@@ -4352,7 +4352,7 @@ fn create_ns_ctor_instance_object<'a>(
                         };
 
                         let _nam = method.name();
-                        let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                        let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                         let method = alt.as_ref().unwrap_or(method);
                         let Some(mut method) = crate::ns_proxy::receiver_method_call(scope, args.this_object(), dec, method, method.is_sealed()) else {
                             return;
@@ -5453,7 +5453,7 @@ fn create_ns_ctor_instance_object<'a>(
                                     return;
                                 };
 
-                                let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                                 let method = alt.as_ref().unwrap_or(method);
                                 let Some(mut method) = crate::ns_proxy::receiver_method_call(scope, args.this_object(), dec, method, method.is_sealed()) else {
                                     return;
@@ -6815,7 +6815,7 @@ fn create_ns_ctor_object<'a>(
                                 else {
                                     return;
                                 };
-                                let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                                 let method = alt.as_ref().unwrap_or(method);
                                 let Some(mut method) = crate::ns_proxy::receiver_method_call(scope, args.this_object(), dec, method, method.is_sealed()) else {
                                     return;
@@ -7627,7 +7627,7 @@ fn handle_named_property_getter(
                                     return;
                                 };
 
-                                let alt = crate::class_helpers::overload_for_argc(method, args.length() as usize);
+                                let alt = crate::class_helpers::overload_for_call(method, scope, &args);
                                 let method = alt.as_ref().unwrap_or(method);
                                 let Some(mut method) = crate::ns_proxy::receiver_method_call(scope, args.this_object(), dec, method, method.is_sealed()) else {
                                     return;

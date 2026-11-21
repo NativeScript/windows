@@ -315,10 +315,9 @@ pub(crate) fn find_class_method_by_arity(
 }
 
 thread_local! {
-    // Bound method (metadata scope, token) → every overload sharing its public name, for methods
-    // whose overloads differ in arity. See `register_overload_siblings`.
-    // `None` records a method with no arity siblings, so the class scan runs once per method
-    // either way.
+    // Bound method (metadata scope, token) → every overload sharing its public name. See
+    // `register_overload_siblings`. `None` records a method with no siblings, so the class scan
+    // runs once per method either way.
     static OVERLOAD_SIBLINGS: std::cell::RefCell<ahash::AHashMap<(usize, i32), Option<std::rc::Rc<[MethodDeclaration]>>>> =
         std::cell::RefCell::new(ahash::AHashMap::new());
 }
@@ -332,7 +331,9 @@ fn method_identity(m: &MethodDeclaration) -> (usize, i32) {
 /// The classic engine binds one `MethodDeclaration` per JS function when a member is first read,
 /// before any arguments exist. WinRT same-interface overloads carry distinct `[Overload]` names
 /// (`CreateColorBrush(Color)` is `CreateColorBrushWithColor`), so a lookup of the public name binds
-/// only one of them. Record the others so the call can switch arity (`overload_for_argc`).
+/// only one of them. Record the others so the call can switch to the one its arguments mean
+/// (`overload_for_call`): by count, or by type when counts match (`AppWindow.SetPresenter` takes
+/// an `AppWindowPresenter` or an `AppWindowPresenterKind`).
 /// Only public-name lookups register; an `[Overload]`-name lookup stays bound to exactly that method.
 #[cfg(feature = "classic")]
 pub(crate) fn register_overload_siblings(
@@ -348,15 +349,16 @@ pub(crate) fn register_overload_siblings(
         return;
     }
     let candidates = find_class_methods(class_declaration, js_name);
+    // (a method can be listed by the class and by its interface: the same parameters are one)
+    let mut seen = vec![parameter_types(bound)];
     let mut siblings: Vec<&MethodDeclaration> = vec![bound];
     for m in &candidates {
-        if m.name() == js_name
-            && m.is_static() == bound.is_static()
-            && !siblings
-                .iter()
-                .any(|s| s.number_of_parameters() == m.number_of_parameters())
-        {
-            siblings.push(m);
+        if m.name() == js_name && m.is_static() == bound.is_static() {
+            let types = parameter_types(m);
+            if !seen.contains(&types) {
+                seen.push(types);
+                siblings.push(m);
+            }
         }
     }
     let entry = if siblings.len() > 1 {
@@ -367,11 +369,40 @@ pub(crate) fn register_overload_siblings(
     OVERLOAD_SIBLINGS.with(|m| m.borrow_mut().insert(key, entry));
 }
 
+#[cfg(feature = "classic")]
+fn parameter_types(m: &MethodDeclaration) -> Vec<String> {
+    m.parameters()
+        .iter()
+        .map(|p| {
+            p.metadata()
+                .map(|md| metadata::signature::Signature::to_string(md, &p.type_()))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The overload of `bound` a call with `args` means, when it isn't `bound` itself (see
+/// `register_overload_siblings`). `None` means call `bound` as-is.
+#[cfg(feature = "classic")]
+pub(crate) fn overload_for_call(
+    bound: &MethodDeclaration,
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments,
+) -> Option<MethodDeclaration> {
+    let argc = args.length() as usize;
+    let siblings = OVERLOAD_SIBLINGS.with(|m| m.borrow().get(&method_identity(bound)).cloned().flatten())?;
+    if siblings.iter().filter(|c| arity_matches(c, argc)).count() < 2 {
+        return overload_for_argc(bound, argc);
+    }
+    let chosen = &siblings[pick_static_overload(&siblings, scope, args)];
+    (method_identity(chosen) != method_identity(bound)).then(|| chosen.clone())
+}
+
 /// The overload of `bound` matching `argc`, when `bound` itself doesn't (see
 /// `register_overload_siblings`). `None` means call `bound` as-is.
 #[cfg(feature = "classic")]
 #[inline]
-pub(crate) fn overload_for_argc(bound: &MethodDeclaration, argc: usize) -> Option<MethodDeclaration> {
+fn overload_for_argc(bound: &MethodDeclaration, argc: usize) -> Option<MethodDeclaration> {
     if bound.number_of_parameters() == argc {
         return None;
     }
@@ -419,16 +450,97 @@ fn struct_param_fields(
     Some(sd.fields().iter().map(|f| f.name().to_string()).collect())
 }
 
+/// What a call argument is, for telling apart overloads that take the same number of arguments.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArgKind {
+    Number,
+    String,
+    Boolean,
+    Function,
+    Object,
+    Nullish,
+    Other,
+}
+
+/// What a parameter takes, as far as `ArgKind` can tell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParamKind {
+    /// Integers, floats and enums (which signatures spell as `Int32`).
+    Number,
+    String,
+    Boolean,
+    /// A runtime class, interface or delegate.
+    Reference,
+    Struct,
+    Array,
+    /// Anything else: `Object`, `Guid`, `Char16`, generic instances (`IReference<T>` takes a
+    /// primitive), type parameters, by-ref.
+    Any,
+}
+
+fn param_kind(p: &metadata::declarations::parameter_declaration::ParameterDeclaration) -> ParamKind {
+    match p.metadata() {
+        Some(md) => param_kind_of(metadata::signature::Signature::to_string(md, &p.type_()).trim()),
+        None => ParamKind::Any,
+    }
+}
+
+fn param_kind_of(sig: &str) -> ParamKind {
+    use metadata::declarations::declaration::DeclarationKind;
+    match sig {
+        "Boolean" => ParamKind::Boolean,
+        "Int8" | "UInt8" | "Int16" | "UInt16" | "Int32" | "UInt32" | "Int64" | "UInt64" | "Single"
+        | "Double" => ParamKind::Number,
+        "String" => ParamKind::String,
+        _ if sig.ends_with("[]") => ParamKind::Array,
+        _ if sig.contains('<') || !sig.contains('.') || sig.starts_with("ByRef ") => ParamKind::Any,
+        _ => match MetadataReader::find_by_name(sig).map(|d| d.read().kind()) {
+            Some(DeclarationKind::Struct) => ParamKind::Struct,
+            Some(DeclarationKind::Class | DeclarationKind::Interface | DeclarationKind::Delegate) => {
+                ParamKind::Reference
+            }
+            _ => ParamKind::Any,
+        },
+    }
+}
+
+/// Whether an `arg` can be passed as a `param`: `None` when it can't, `Some(true)` when it is
+/// exactly that kind. Only clear mismatches rule an overload out; conversions the call might
+/// still make (a string for a `Uri`, a number for a `TimeSpan`) don't.
+fn arg_fits(param: ParamKind, arg: ArgKind) -> Option<bool> {
+    use ArgKind as A;
+    use ParamKind as P;
+    match (param, arg) {
+        (P::Any, _) => Some(false),
+        (P::Number, A::Number) | (P::Boolean, A::Boolean) | (P::String, A::String) => Some(true),
+        (P::Number | P::Boolean, _) => None,
+        (P::String, A::Nullish) => Some(false),
+        (P::String, _) => None,
+        (P::Reference, A::Object | A::Function | A::Nullish) => Some(true),
+        (P::Reference, A::Number | A::Boolean) => None,
+        (P::Struct | P::Array, A::Object) => Some(true),
+        (P::Struct, A::Boolean | A::Function | A::Nullish) => None,
+        (P::Array, A::Number | A::Boolean | A::String) => None,
+        _ => Some(false),
+    }
+}
+
 /// Index of the overload in `candidates` (methods sharing a public name) that a call with `argc`
-/// arguments means. The argument count decides first. Overloads can share it
-/// (VisualTreeHelper.FindElementsInHostCoordinates takes a Point or a Rect), so then the one whose
-/// struct parameters' fields an object argument all has, matching the most fields, wins; then
-/// [DefaultOverload]; then metadata order. `has(j, name)` is whether argument `j` has property
-/// `name`, or None when it is not a plain object (a buffer, a primitive).
+/// arguments means. The argument count decides first. Overloads can share it, and then:
+/// - arguments of a kind a parameter can't take rule an overload out (`AppWindow.SetPresenter`
+///   takes an `AppWindowPresenter` or an `AppWindowPresenterKind`: a number is the kind);
+/// - an object argument that has every field of a struct parameter, matching the most fields
+///   (VisualTreeHelper.FindElementsInHostCoordinates takes a Point or a Rect);
+/// - the most arguments of exactly the parameter's kind;
+/// - [DefaultOverload]; then metadata order.
+///
+/// `has(j, name)` is whether argument `j` has property `name`, or None when it is not a plain
+/// object (a buffer, a primitive); `kind(j)` is what argument `j` is.
 pub(crate) fn pick_overload(
     candidates: &[MethodDeclaration],
     argc: usize,
     mut has: impl FnMut(usize, &str) -> Option<bool>,
+    mut kind: impl FnMut(usize) -> ArgKind,
 ) -> usize {
     let same_arity: Vec<usize> = (0..candidates.len())
         .filter(|&i| arity_matches(&candidates[i], argc))
@@ -443,13 +555,19 @@ pub(crate) fn pick_overload(
         1 => return same_arity[0],
         _ => {}
     }
-    let mut best: Option<(usize, (bool, usize, bool))> = None;
+    let mut best: Option<(usize, (bool, bool, usize, usize, bool))> = None;
     for &i in &same_arity {
         let m = &candidates[i];
+        let (mut typed, mut exact) = (true, 0usize);
         let (mut fits, mut fields) = (true, 0usize);
         for (j, p) in m.parameters().iter().enumerate() {
             if j >= argc || !is_input_param(p) {
                 continue;
+            }
+            match arg_fits(param_kind(p), kind(j)) {
+                None => typed = false,
+                Some(true) => exact += 1,
+                Some(false) => {}
             }
             let Some(names) = struct_param_fields(p).filter(|n| !n.is_empty()) else {
                 continue;
@@ -463,7 +581,7 @@ pub(crate) fn pick_overload(
                 fits = false;
             }
         }
-        let key = (fits, fields, m.is_default_overload());
+        let key = (typed, fits, fields, exact, m.is_default_overload());
         if best.as_ref().map_or(true, |(_, k)| key > *k) {
             best = Some((i, key));
         }
@@ -478,15 +596,37 @@ pub(crate) fn pick_static_overload(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments,
 ) -> usize {
-    pick_overload(candidates, args.length() as usize, |j, name| {
-        let arg = args.get(j as i32);
-        if !arg.is_object() || arg.is_array_buffer() || arg.is_array_buffer_view() {
-            return None;
-        }
-        let obj = arg.to_object(scope)?;
-        let key = v8::String::new(scope, name)?;
-        obj.has(scope, key.into())
-    })
+    pick_overload(
+        candidates,
+        args.length() as usize,
+        |j, name| {
+            let arg = args.get(j as i32);
+            if !arg.is_object() || arg.is_array_buffer() || arg.is_array_buffer_view() {
+                return None;
+            }
+            let obj = arg.to_object(scope)?;
+            let key = v8::String::new(scope, name)?;
+            obj.has(scope, key.into())
+        },
+        |j| {
+            let arg = args.get(j as i32);
+            if arg.is_null_or_undefined() {
+                ArgKind::Nullish
+            } else if arg.is_number() || arg.is_big_int() {
+                ArgKind::Number
+            } else if arg.is_string() {
+                ArgKind::String
+            } else if arg.is_boolean() {
+                ArgKind::Boolean
+            } else if arg.is_function() {
+                ArgKind::Function
+            } else if arg.is_object() {
+                ArgKind::Object
+            } else {
+                ArgKind::Other
+            }
+        },
+    )
 }
 
 pub(crate) fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
@@ -697,4 +837,40 @@ pub(crate) fn find_interface_event_methods(
         .iter()
         .find(|e| e.name() == name)
         .map(|e| (e.add_method().clone(), e.remove_method().clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primitive_parameter_kinds() {
+        assert_eq!(param_kind_of("Int32"), ParamKind::Number);
+        assert_eq!(param_kind_of("Double"), ParamKind::Number);
+        assert_eq!(param_kind_of("Boolean"), ParamKind::Boolean);
+        assert_eq!(param_kind_of("String"), ParamKind::String);
+        assert_eq!(param_kind_of("UInt8[]"), ParamKind::Array);
+        assert_eq!(param_kind_of("Object"), ParamKind::Any);
+        assert_eq!(param_kind_of("Guid"), ParamKind::Any);
+        assert_eq!(param_kind_of("Windows.Foundation.IReference<Int32>"), ParamKind::Any);
+        assert_eq!(param_kind_of("ByRef Windows.Foundation.Rect"), ParamKind::Any);
+    }
+
+    #[test]
+    fn enum_number_rules_out_an_object_overload() {
+        // AppWindow.SetPresenter(AppWindowPresenterKind) vs SetPresenter(AppWindowPresenter)
+        assert_eq!(arg_fits(ParamKind::Number, ArgKind::Number), Some(true));
+        assert_eq!(arg_fits(ParamKind::Reference, ArgKind::Number), None);
+        assert_eq!(arg_fits(ParamKind::Reference, ArgKind::Object), Some(true));
+        assert_eq!(arg_fits(ParamKind::Number, ArgKind::Object), None);
+    }
+
+    #[test]
+    fn possible_conversions_stay_open() {
+        // a string may still become a Uri, a number a TimeSpan
+        assert_eq!(arg_fits(ParamKind::Reference, ArgKind::String), Some(false));
+        assert_eq!(arg_fits(ParamKind::Struct, ArgKind::Number), Some(false));
+        assert_eq!(arg_fits(ParamKind::Any, ArgKind::Boolean), Some(false));
+        assert_eq!(arg_fits(ParamKind::String, ArgKind::Nullish), Some(false));
+    }
 }
